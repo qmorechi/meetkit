@@ -603,7 +603,7 @@
                   <button style={{ ...btn('ghost'), padding: '4px 10px', fontSize: 12, color: C.textMut }} onClick={() => { setMeetingDate(''); setMeetingTime(''); saveMeetingInfo('', ''); }}>✕ 清除</button>
                 </>
               )}
-              <button style={{ ...btn('primary'), padding: '8px 16px', fontSize: 13 }} onClick={copyInvite}>📨 複製開會通知</button>
+              <button style={{ ...btn('primary'), padding: '8px 16px', fontSize: 13 }} onClick={copyInvite}>{(() => { const w=['日','一','二','三','四','五','六']; const d=meetingDate?new Date(meetingDate+'T00:00'):null; return `📨 複製 ${d?`${d.getMonth()+1}/${d.getDate()}(${w[d.getDay()]})會議準備室`:'會議準備室'}`; })()}</button>
             </div>
             <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-end', gap: 6, flexShrink: 0 }}>
               <div style={{ display: 'flex', gap: 6 }}>
