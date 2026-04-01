@@ -509,16 +509,7 @@
         const timeStr = meetingTime || '';
         const lines = [
           `📅 ${projectTitle || projectId} ｜ 開會通知`,
-          ``,
           (dateStr || timeStr) ? `🗓 ${[dateStr, timeStr].filter(Boolean).join('　')}` : null,
-          ``,
-          briefing ? `━━━━━━━━━━━━━━━━━━` : null,
-          briefing ? `📌 上次會議前情提要` : null,
-          briefing ? `━━━━━━━━━━━━━━━━━━` : null,
-          briefing ? `` : null,
-          briefing ? briefing.replace(/^>\s?/gm, '').trim() : null,
-          briefing ? `` : null,
-          `━━━━━━━━━━━━━━━━━━`,
           ``,
           `請在開會前上傳提案 👇`,
           url,
