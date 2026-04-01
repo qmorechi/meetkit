@@ -1072,7 +1072,7 @@
     }
 
     // ─── POST-MEETING ────────────────────────────────────────────────────────────
-    function PostMeeting({ proposals, audioBlob, onSaveJournal, projectId }) {
+    function PostMeeting({ proposals, audioBlob, onSaveJournal, projectId, projectTitle }) {
       const [openaiKey,    setOpenaiKey]    = useState(() => localStorage.getItem('mk_openai_key') || '');
       const [anthropicKey, setAnthropicKey] = useState(() => localStorage.getItem('mk_anthropic_key') || '');
       const [uploadFile,   setUploadFile]   = useState(null);
@@ -1274,9 +1274,33 @@ ${txText}
           )}
 
           {status === 'done' && (
-            <div style={{ display: 'flex', gap: 12 }} className="fade-in">
-              <button style={{ ...btn('success'), padding: 14, fontSize: 15, flex: 1 }} onClick={exportMd}>⬇ 匯出 Markdown</button>
-              <button style={{ ...btn('primary'), padding: 14, fontSize: 15, flex: 1 }} onClick={() => onSaveJournal({ proposals, transcript, summary })}>📚 存入日誌</button>
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }} className="fade-in">
+              <div style={{ display: 'flex', gap: 12 }}>
+                <button style={{ ...btn('success'), padding: 14, fontSize: 15, flex: 1 }} onClick={exportMd}>⬇ 匯出 Markdown</button>
+                <button style={{ ...btn('primary'), padding: 14, fontSize: 15, flex: 1 }} onClick={() => onSaveJournal({ proposals, transcript, summary })}>📚 存入日誌</button>
+              </div>
+              <button style={{ ...btn('default'), padding: 14, fontSize: 15, width: '100%', borderColor: C.accent + '66' }} onClick={() => {
+                const base = localStorage.getItem('mk_public_url') || `${window.location.origin}${window.location.pathname}`;
+                const url = `${base}?p=${projectId}`;
+                const date = new Date().toLocaleDateString('zh-TW', { year: 'numeric', month: 'long', day: 'numeric' });
+                const msg = [
+                  `📊 會議摘要已整理完成`,
+                  ``,
+                  `專案：${projectTitle || projectId}`,
+                  `日期：${date}`,
+                  ``,
+                  `AI 已完成本次會議摘要，包含：`,
+                  `• 各提案分析與可行性評估`,
+                  `• 待辦事項清單`,
+                  `• 下次會議前情提要`,
+                  ``,
+                  `請主持人查閱並安排下次開會時間 👇`,
+                  `${url}`,
+                ].join('\n');
+                navigator.clipboard.writeText(msg).then(() => alert('✅ 已複製，請貼到 LINE / Slack 通知主持人'));
+              }}>
+                📨 複製通知主持人訊息
+              </button>
             </div>
           )}
         </div>
@@ -1337,18 +1361,45 @@ ${txText}
                       {m.proposals?.length > 0 && (
                         <div>
                           <div style={{ fontSize: 12, fontWeight: 600, color: C.textSec, marginBottom: 8 }}>議程</div>
-                          {m.proposals.map((p, pi) => (
-                            <div key={pi} style={{ ...S.card, padding: '8px 12px', display: 'flex', gap: 8, marginBottom: 6 }}>
-                              <span style={{ ...badge(C.accent), flexShrink: 0 }}>{pi + 1}</span>
-                              <div><div style={{ fontSize: 13, fontWeight: 500 }}>{p.title}</div><div style={{ fontSize: 12, color: C.textSec }}>{p.author}</div></div>
-                            </div>
-                          ))}
+                          {m.proposals.map((p, pi) => {
+                            let files = [];
+                            try { const u = JSON.parse(p.file_url||'[]'); const n = JSON.parse(p.file_name||'[]'); if (Array.isArray(u)) files = u.map((url,i)=>({url,name:n[i]||url.split('/').pop()})); } catch {}
+                            if (!files.length && p.file_url) files = [{url: p.file_url, name: p.file_name||'附件'}];
+                            return (
+                              <div key={pi} style={{ ...S.card, padding: '8px 12px', marginBottom: 6 }}>
+                                <div style={{ display: 'flex', gap: 8, alignItems: 'flex-start' }}>
+                                  <span style={{ ...badge(C.accent), flexShrink: 0 }}>{pi + 1}</span>
+                                  <div style={{ flex: 1 }}>
+                                    <div style={{ fontSize: 13, fontWeight: 500 }}>{p.title}</div>
+                                    <div style={{ fontSize: 12, color: C.textSec }}>{p.author}</div>
+                                    {files.length > 0 && (
+                                      <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, marginTop: 6 }}>
+                                        {files.map((f, fi) => (
+                                          <a key={fi} href={f.url} target="_blank" rel="noopener noreferrer"
+                                            style={{ fontSize: 11, color: C.accent, background: C.accent+'18', borderRadius: 6, padding: '2px 8px', textDecoration: 'none' }}>
+                                            {fileIcon(f.name)} {f.name}
+                                          </a>
+                                        ))}
+                                      </div>
+                                    )}
+                                  </div>
+                                </div>
+                              </div>
+                            );
+                          })}
                         </div>
                       )}
                       {m.summary && (
                         <div>
-                          <div style={{ fontSize: 12, fontWeight: 600, color: C.textSec, marginBottom: 8 }}>AI 摘要</div>
-                          <div style={{ fontSize: 13, color: C.textSec, lineHeight: 1.9, whiteSpace: 'pre-wrap', background: C.bgCard, borderRadius: 8, padding: 14 }}>{m.summary}</div>
+                          <div style={{ fontSize: 12, fontWeight: 600, color: C.textSec, marginBottom: 8 }}>📝 AI 摘要</div>
+                          <div className="mk-md" style={{ fontSize: 13, lineHeight: 1.85, background: C.bgCard, borderRadius: 8, padding: 16 }}
+                            dangerouslySetInnerHTML={{ __html: (() => {
+                              if (typeof marked === 'undefined') return `<pre>${m.summary}</pre>`;
+                              const r = new marked.Renderer();
+                              r.link = (href, title, text) => `<a href="${href}" target="_blank" rel="noopener noreferrer" style="color:#5b8dee">${text}</a>`;
+                              return marked.parse(m.summary, { renderer: r, gfm: true, breaks: true });
+                            })()} }
+                          />
                         </div>
                       )}
                       {m.transcript && (
@@ -1517,7 +1568,7 @@ ${txText}
           {phase === 1 && <Meeting proposals={proposals} setProposals={setProposals} projectId={projectId} audioBlob={audioBlob} setAudioBlob={setAudioBlob}
             onRecordingChange={(recording, elapsed, stopFn) => { setIsRecording(recording); setRecElapsed(elapsed); if (stopFn) stopRecRef.current = stopFn; }}
             onRegisterStart={(fn) => { startRecRef.current = fn; }} />}
-          {phase === 2 && <PostMeeting proposals={proposals} audioBlob={audioBlob} onSaveJournal={saveToJournal} projectId={projectId} />}
+          {phase === 2 && <PostMeeting proposals={proposals} audioBlob={audioBlob} onSaveJournal={saveToJournal} projectId={projectId} projectTitle={projectTitle} />}
           {phase === 3 && <Journal journal={journal} setJournal={setJournal} projectId={projectId} />}
 
           {/* 常駐錄音指示器 */}
