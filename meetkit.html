@@ -534,24 +534,26 @@
         showToast('✓ 網址已儲存');
       };
 
-      const copyInvite = async () => {
-        const isLocal = window.location.protocol === 'file:' || window.location.hostname === 'localhost';
-        const base = publicUrl || (isLocal ? null : `${window.location.origin}${window.location.pathname}`);
-        const url = base ? `${base}?p=${projectId}` : `meetkit.html?p=${projectId}`;
-        const weekdays = ['日','一','二','三','四','五','六'];
-        const dateObj = meetingDate ? new Date(meetingDate + 'T00:00') : null;
-        const shortDate = dateObj ? `${dateObj.getMonth()+1}/${dateObj.getDate()}(${weekdays[dateObj.getDay()]})` : '';
-        const timeStr = meetingTime ? meetingTime : '';
-        const roomTitle = [shortDate, timeStr].filter(Boolean).join(' ') + '會議準備室';
-        const lines = [roomTitle, url].join('\n');
-        await navigator.clipboard.writeText(lines);
-        // 自動清空提案，開始新梯次
+      const openNewRound = async () => {
         if (proposals.length > 0) {
           await Promise.all(proposals.map(p => db(`proposals?id=eq.${p.id}`, { method: 'DELETE' }).catch(() => {})));
           setProposals([]);
         }
-        if (!base) showToast('⚠ 請先設定公開網址（點 ⚙）');
-        else showToast('✓ 已複製！準備室已開啟，等大家上傳提案 🎉');
+        showToast('✓ 準備室已開啟！');
+      };
+
+      const sendNotice = () => {
+        const isLocal = window.location.protocol === 'file:' || window.location.hostname === 'localhost';
+        const base = publicUrl || (isLocal ? null : `${window.location.origin}${window.location.pathname}`);
+        if (!base) { showToast('⚠ 請先設定公開網址（點 ⚙）'); return; }
+        const url = `${base}?p=${projectId}`;
+        const weekdays = ['日','一','二','三','四','五','六'];
+        const dateObj = meetingDate ? new Date(meetingDate + 'T00:00') : null;
+        const shortDate = dateObj ? `${dateObj.getMonth()+1}/${dateObj.getDate()}(${weekdays[dateObj.getDay()]})` : '';
+        const timeStr = meetingTime || '';
+        const roomTitle = [shortDate, timeStr].filter(Boolean).join(' ') + '會議準備室';
+        navigator.clipboard.writeText(`${roomTitle}\n${url}`)
+          .then(() => showToast('✓ 開會通知已複製！'));
       };
 
       return (
@@ -603,7 +605,7 @@
                   <button style={{ ...btn('ghost'), padding: '4px 10px', fontSize: 12, color: C.textMut }} onClick={() => { setMeetingDate(''); setMeetingTime(''); saveMeetingInfo('', ''); }}>✕ 清除</button>
                 </>
               )}
-              <button style={{ ...btn('primary'), padding: '8px 16px', fontSize: 13 }} onClick={copyInvite}>{(() => { const w=['日','一','二','三','四','五','六']; const d=meetingDate?new Date(meetingDate+'T00:00'):null; return `📨 ${d?`${d.getMonth()+1}/${d.getDate()}(${w[d.getDay()]})會議準備室`:'會議準備室'}`; })()}</button>
+              <button style={{ ...btn('primary'), padding: '8px 16px', fontSize: 13 }} onClick={openNewRound}>{(() => { const w=['日','一','二','三','四','五','六']; const d=meetingDate?new Date(meetingDate+'T00:00'):null; return `📨 ${d?`${d.getMonth()+1}/${d.getDate()}(${w[d.getDay()]})會議準備室`:'會議準備室'}`; })()}</button>
             </div>
             <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-end', gap: 6, flexShrink: 0 }}>
               <div style={{ display: 'flex', gap: 6 }}>
@@ -757,9 +759,10 @@
                 <button style={{ ...btn('ghost'), padding: '6px 12px', fontSize: 13 }} onClick={loadProposals}>↻ 重整</button>
               </div>
               {proposals.length === 0 ? (
-                <div style={{ textAlign: 'center', padding: '56px 0', color: C.textMut }}>
+                <div style={{ textAlign: 'center', padding: '48px 0', color: C.textMut }}>
                   <div style={{ fontSize: 36, marginBottom: 12 }}>📭</div>
-                  <div style={{ fontSize: 14 }}>尚無提案，成為第一個提案者吧！</div>
+                  <div style={{ fontSize: 14, marginBottom: 20 }}>準備室已開啟，等待大家上傳提案</div>
+                  <button style={{ ...btn('primary'), padding: '10px 24px', fontSize: 14 }} onClick={sendNotice}>📢 發出開會通知</button>
                 </div>
               ) : (
                 <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
