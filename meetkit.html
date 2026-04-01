@@ -8,6 +8,9 @@
   <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js" crossorigin></script>
   <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/pdfjs-dist@3.11.174/build/pdf.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/mammoth@1.6.0/mammoth.browser.min.js"></script>
+  <script>if (typeof pdfjsLib !== 'undefined') pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdn.jsdelivr.net/npm/pdfjs-dist@3.11.174/build/pdf.worker.min.js';</script>
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+TC:wght@300;400;500;600&display=swap" rel="stylesheet">
@@ -71,6 +74,40 @@
         },
         ...opts,
       });
+
+    // ─── 附件文字抽取 ─────────────────────────────────────────────────────────────
+    const extractFileText = async (fileUrl, fileName) => {
+      try {
+        const ext = (fileName || fileUrl).split('.').pop().toLowerCase().split('?')[0];
+        const res = await fetch(fileUrl);
+        if (!res.ok) return '';
+
+        if (ext === 'pdf') {
+          if (typeof pdfjsLib === 'undefined') return '';
+          const buf = await res.arrayBuffer();
+          const pdf = await pdfjsLib.getDocument({ data: buf }).promise;
+          const pages = await Promise.all(
+            Array.from({ length: pdf.numPages }, (_, i) =>
+              pdf.getPage(i + 1).then(p => p.getTextContent()).then(tc => tc.items.map(it => it.str).join(' '))
+            )
+          );
+          return pages.join('\n');
+        }
+
+        if (ext === 'docx') {
+          if (typeof mammoth === 'undefined') return '';
+          const buf = await res.arrayBuffer();
+          const result = await mammoth.extractRawText({ arrayBuffer: buf });
+          return result.value || '';
+        }
+
+        if (['txt', 'md', 'rtf'].includes(ext)) {
+          return await res.text();
+        }
+
+        return '';
+      } catch { return ''; }
+    };
 
     const genId = () => Math.random().toString(36).slice(2, 8).toUpperCase();
 
@@ -1125,8 +1162,22 @@
         } catch (e) { setErrMsg('語音轉文字失敗：' + e.message); setStatus('error'); return; }
 
         setStatus('summarizing');
-        const agendaDetail = proposals.length
-          ? proposals.map((p, i) => `${i + 1}. 【${p.title}】提案人：${p.author}\n   ${p.content || '（無提案說明）'}`).join('\n\n')
+        // 抽取每個提案的附件文字
+        const proposalsWithText = await Promise.all(proposals.map(async (p) => {
+          let attachText = '';
+          try {
+            const urls = JSON.parse(p.file_url || '[]');
+            const names = JSON.parse(p.file_name || '[]');
+            const texts = await Promise.all(urls.map((url, i) => extractFileText(url, names[i] || url)));
+            attachText = texts.filter(Boolean).join('\n');
+          } catch {}
+          return { ...p, attachText };
+        }));
+        const agendaDetail = proposalsWithText.length
+          ? proposalsWithText.map((p, i) => {
+              const base = `${i + 1}. 【${p.title}】提案人：${p.author}\n   ${p.content || '（無提案說明）'}`;
+              return p.attachText ? `${base}\n\n   【附件內容摘錄】\n${p.attachText.slice(0, 3000)}` : base;
+            }).join('\n\n')
           : '（無提案議程）';
         const prompt = `你是一位專業的會議記錄與策略分析師。以下是一場會議的完整逐字稿與議程提案，請用繁體中文產出一份結構完整的會後文件。
 
@@ -1188,23 +1239,25 @@ ${txText}
 
 （根據整體會議內容，提出 3-5 點具體可行的策略建議，包含優先順序推薦與注意事項）`;
         try {
+          let summaryText = '';
           if (anthropicKey.trim()) {
             const res = await fetch('https://api.anthropic.com/v1/messages', { method: 'POST', headers: { 'x-api-key': anthropicKey.trim(), 'anthropic-version': '2023-06-01', 'anthropic-dangerous-request-allow-browsers': 'true', 'Content-Type': 'application/json' }, body: JSON.stringify({ model: 'claude-sonnet-4-6', max_tokens: 4096, messages: [{ role: 'user', content: prompt }] }) });
             if (!res.ok) { const e = await res.json(); throw new Error(e.error?.message || `HTTP ${res.status}`); }
-            setSummary((await res.json()).content[0].text);
+            summaryText = (await res.json()).content[0].text;
           } else {
             const res = await fetch('https://api.openai.com/v1/chat/completions', { method: 'POST', headers: { Authorization: `Bearer ${openaiKey.trim()}`, 'Content-Type': 'application/json' }, body: JSON.stringify({ model: 'gpt-4o', messages: [{ role: 'user', content: prompt }] }) });
             if (!res.ok) { const e = await res.json(); throw new Error(e.error?.message || `HTTP ${res.status}`); }
-            setSummary((await res.json()).choices[0].message.content);
+            summaryText = (await res.json()).choices[0].message.content;
+          }
+          setSummary(summaryText);
+          // 自動存前情提要到 Supabase
+          if (projectId) {
+            const date = new Date().toLocaleDateString('zh-TW', { year: 'numeric', month: 'long', day: 'numeric' });
+            const briefingMd = `> 📌 上次會議前情提要（${date}）\n\n${summaryText}`;
+            db(`projects?id=eq.${projectId}`, { method: 'PATCH', body: JSON.stringify({ briefing: briefingMd }) }).catch(() => {});
           }
         } catch (e) { setErrMsg('AI 摘要失敗：' + e.message); setStatus('error'); return; }
         setStatus('done');
-        // 自動存前情提要到 Supabase
-        if (projectId) {
-          const date = new Date().toLocaleDateString('zh-TW', { year: 'numeric', month: 'long', day: 'numeric' });
-          const briefingMd = `> 📌 上次會議前情提要（${date}）\n\n${summary}`;
-          db(`projects?id=eq.${projectId}`, { method: 'PATCH', body: JSON.stringify({ briefing: briefingMd }) }).catch(() => {});
-        }
       };
 
       const exportMd = () => {
@@ -1292,39 +1345,11 @@ ${txText}
 
           {status === 'done' && (
             <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }} className="fade-in">
-              <div style={{ display: 'flex', gap: 12 }}>
-                <button style={{ ...btn('success'), padding: 14, fontSize: 15, flex: 1 }} onClick={exportMd}>⬇ 匯出 Markdown</button>
-                <button style={{ ...btn('primary'), padding: 14, fontSize: 15, flex: 1 }} onClick={() => onSaveJournal({ proposals, transcript, summary })}>📚 存入日誌</button>
-              </div>
-              <button style={{ ...btn('default'), padding: 14, fontSize: 15, width: '100%', borderColor: C.accent + '66' }} onClick={() => {
-                const base = localStorage.getItem('mk_public_url') || `${window.location.origin}${window.location.pathname}`;
-                const url = `${base}?p=${projectId}`;
-                const date = new Date().toLocaleDateString('zh-TW', { year: 'numeric', month: 'long', day: 'numeric' });
-                // 從 summary 中抽出行動事項區段
-                const actionSection = (() => {
-                  const m = summary.match(/#{1,3}\s*[🎯]?\s*行動事項[\s\S]*?(?=\n#{1,3}|$)/i);
-                  return m ? m[0].trim() : '';
-                })();
-                const msg = [
-                  `📅 ${projectTitle || projectId} ｜ 下次開會通知`,
-                  ``,
-                  `大家好！上次會議（${date}）已整理完畢，`,
-                  `請在開會前閱讀以下前情提要 👇`,
-                  ``,
-                  `━━━━━━━━━━━━━━━━━━`,
-                  `📌 前情提要`,
-                  `━━━━━━━━━━━━━━━━━━`,
-                  ``,
-                  ...(actionSection ? [actionSection, ``] : []),
-                  `━━━━━━━━━━━━━━━━━━`,
-                  ``,
-                  `上傳提案 & 查看完整摘要：`,
-                  url,
-                ].join('\n');
-                navigator.clipboard.writeText(msg).then(() => alert('✅ 已複製！可直接貼到 LINE / Slack 發給大家'));
-              }}>
-                📅 預約會議通知（含前情提要）
+              <button style={{ ...btn('primary'), padding: 16, fontSize: 16, width: '100%', letterSpacing: 1 }}
+                onClick={() => onSaveJournal({ proposals, transcript, summary })}>
+                ✅ 完成備忘 & 歸檔
               </button>
+              <button style={{ ...btn('ghost'), padding: 12, fontSize: 14, width: '100%' }} onClick={exportMd}>⬇ 匯出 Markdown</button>
             </div>
           )}
         </div>
