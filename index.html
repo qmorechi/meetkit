@@ -1078,11 +1078,71 @@
         } catch (e) { setErrMsg('語音轉文字失敗：' + e.message); setStatus('error'); return; }
 
         setStatus('summarizing');
-        const agendaList = proposals.length ? proposals.map((p, i) => `${i + 1}. ${p.title}（${p.author}）`).join('\n') : '（無提案議程）';
-        const prompt = `以下是一場會議的逐字稿，議程包含：\n${agendaList}\n\n逐字稿：\n${txText}\n\n請用繁體中文整理出：\n1. 各議程討論重點\n2. 決議事項\n3. 待辦行動（含負責人）\n請用條列方式呈現，清楚分段。`;
+        const agendaDetail = proposals.length
+          ? proposals.map((p, i) => `${i + 1}. 【${p.title}】提案人：${p.author}\n   ${p.content || '（無提案說明）'}`).join('\n\n')
+          : '（無提案議程）';
+        const prompt = `你是一位專業的會議記錄與策略分析師。以下是一場會議的完整逐字稿與議程提案，請用繁體中文產出一份結構完整的會後文件。
+
+━━━ 本次議程提案 ━━━
+${agendaDetail}
+
+━━━ 會議逐字稿 ━━━
+${txText}
+
+━━━ 請依照以下格式輸出 ━━━
+
+# 📋 各提案分析
+
+（針對每一個提案，依下列結構整理）
+
+## 提案 N：{提案標題}（{提案人}）
+
+### 核心想法
+（一段話說明提案人的核心主張）
+
+### 會議 Findings
+- **支持點：** （與會者認同的觀點、正面回饋）
+- **疑慮與挑戰：** （提出的問題、擔憂、障礙）
+
+### 可行性評估
+- **執行面：** （技術、流程、人力的可行度）
+- **資源需求：** （時間、預算、工具）
+- **風險：** （潛在風險與不確定因素）
+
+### 結論
+（本次討論的共識或未解決的分歧）
+
+---
+
+# ✅ 待辦事項清單
+
+（整合會議中、會議後提出的所有待辦，含會議討論中臨時提出的項目）
+
+| 事項 | 負責人 | 建議完成時間 | 優先度 |
+|------|--------|------------|--------|
+（用表格列出，優先度分：🔴 緊急 / 🟡 本週 / 🟢 下週前）
+
+---
+
+# 📌 下次會議前情提要
+
+## 背景摘要
+（給未出席者或下次會議開場用的 2-3 段精簡說明，讓所有人快速進入狀況）
+
+## 尚待確認的問題
+（列出本次未解決、需要在下次會議前釐清的關鍵問題）
+
+## 建議各方提前準備
+（針對各提案負責人，建議下次會議前應準備的資料或評估）
+
+---
+
+# 💡 AI 綜合建議
+
+（根據整體會議內容，提出 3-5 點具體可行的策略建議，包含優先順序推薦與注意事項）`;
         try {
           if (anthropicKey.trim()) {
-            const res = await fetch('https://api.anthropic.com/v1/messages', { method: 'POST', headers: { 'x-api-key': anthropicKey.trim(), 'anthropic-version': '2023-06-01', 'anthropic-dangerous-request-allow-browsers': 'true', 'Content-Type': 'application/json' }, body: JSON.stringify({ model: 'claude-sonnet-4-6', max_tokens: 2048, messages: [{ role: 'user', content: prompt }] }) });
+            const res = await fetch('https://api.anthropic.com/v1/messages', { method: 'POST', headers: { 'x-api-key': anthropicKey.trim(), 'anthropic-version': '2023-06-01', 'anthropic-dangerous-request-allow-browsers': 'true', 'Content-Type': 'application/json' }, body: JSON.stringify({ model: 'claude-sonnet-4-6', max_tokens: 4096, messages: [{ role: 'user', content: prompt }] }) });
             if (!res.ok) { const e = await res.json(); throw new Error(e.error?.message || `HTTP ${res.status}`); }
             setSummary((await res.json()).content[0].text);
           } else {
