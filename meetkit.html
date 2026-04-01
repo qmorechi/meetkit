@@ -608,6 +608,7 @@
                 <input type="date" style={{ ...S.input, width: 'auto', fontSize: 13, colorScheme: 'dark' }} value={meetingDate} onChange={e => { setMeetingDate(e.target.value); saveMeetingInfo(e.target.value, meetingTime); }} />
                 <input type="time" style={{ ...S.input, width: 'auto', fontSize: 13, colorScheme: 'dark' }} value={meetingTime} onChange={e => { setMeetingTime(e.target.value); saveMeetingInfo(meetingDate, e.target.value); }} />
                 <button style={{ ...btn('primary'), padding: '7px 16px', fontSize: 13 }} onClick={() => { openNewRound(); setShowDatePicker(false); }}>✓ 確認開新準備室</button>
+                <button style={{ ...btn('ghost'), padding: '7px 14px', fontSize: 13 }} onClick={sendNotice}>📋 複製開會通知</button>
                 {(meetingDate || meetingTime) && (
                   <button style={{ ...btn('ghost'), padding: '6px 10px', fontSize: 12, color: C.textMut }} onClick={() => { setMeetingDate(''); setMeetingTime(''); saveMeetingInfo('', ''); }}>✕ 清除</button>
                 )}
@@ -761,10 +762,7 @@
                 <div style={{ fontSize: 15, fontWeight: 600, display: 'flex', alignItems: 'center', gap: 10 }}>
                   📋 議程提案 <span style={badge(C.accent)}>{proposals.length}</span>
                 </div>
-                <div style={{ display: 'flex', gap: 8 }}>
-                  <button style={{ ...btn('primary'), padding: '6px 14px', fontSize: 13 }} onClick={sendNotice}>📋 複製開會通知</button>
-                  <button style={{ ...btn('ghost'), padding: '6px 12px', fontSize: 13 }} onClick={loadProposals}>↻ 重整</button>
-                </div>
+                <button style={{ ...btn('ghost'), padding: '6px 12px', fontSize: 13 }} onClick={loadProposals}>↻ 重整</button>
               </div>
               {proposals.length === 0 ? (
                 <div style={{ textAlign: 'center', padding: '48px 0', color: C.textMut }}>
