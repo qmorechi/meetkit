@@ -1318,10 +1318,11 @@ ${txText}
         return m.date?.toLowerCase().includes(q) || m.summary?.toLowerCase().includes(q) || m.transcript?.toLowerCase().includes(q) || m.proposals?.some(p => p.title?.toLowerCase().includes(q) || p.author?.toLowerCase().includes(q));
       });
 
-      const deleteEntry = (id) => {
-        const updated = journal.filter(m => m.id !== id);
-        setJournal(updated);
-        localStorage.setItem(`mk_journal_${projectId}`, JSON.stringify(updated));
+      const deleteEntry = async (id) => {
+        try {
+          await db(`journals?id=eq.${id}`, { method: 'DELETE' });
+        } catch (e) { console.error('Journal delete failed', e); }
+        setJournal(prev => prev.filter(m => m.id !== id));
       };
 
       return (
@@ -1518,8 +1519,8 @@ ${txText}
         if (!projectId) return;
         // Check session auth
         if (sessionStorage.getItem(`mk_auth_${projectId}`)) setAuthed(true);
-        // Load journal
-        try { setJournal(JSON.parse(localStorage.getItem(`mk_journal_${projectId}`) || '[]')); } catch {}
+        // Load journal from Supabase
+        db(`journals?project_id=eq.${projectId}&order=created_at.asc`).then(r => r.json()).then(d => { if (Array.isArray(d)) setJournal(d); }).catch(() => {});
         // Load project info
         db(`projects?id=eq.${projectId}&select=title,meeting_date,meeting_time`).then(r => r.json()).then(d => {
           if (d[0]?.title) setProjectTitle(d[0].title);
@@ -1540,16 +1541,18 @@ ${txText}
         } catch {}
       };
 
-      const saveToJournal = ({ proposals, transcript, summary }) => {
+      const saveToJournal = async ({ proposals, transcript, summary }) => {
         const entry = {
-          id: Date.now(),
+          id: Date.now().toString(),
+          project_id: projectId,
           date: new Date().toLocaleDateString('zh-TW', { year: 'numeric', month: 'long', day: 'numeric' }),
           proposals: proposals.map(p => ({ title: p.title, author: p.author, content: p.content })),
-          transcript, summary, savedAt: new Date().toISOString(),
+          transcript, summary,
         };
-        const updated = [...journal, entry];
-        setJournal(updated);
-        localStorage.setItem(`mk_journal_${projectId}`, JSON.stringify(updated));
+        try {
+          await db('journals', { method: 'POST', body: JSON.stringify(entry) });
+        } catch (e) { console.error('Journal save failed', e); }
+        setJournal(prev => [...prev, entry]);
         setPhase(3);
       };
 
