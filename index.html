@@ -959,7 +959,7 @@
       const stopRec = () => { if (mrRef.current?.state !== 'inactive') mrRef.current.stop(); setIsRecording(false); clearInterval(timerRef.current); onRecordingChange?.(false, 0, null); };
       useEffect(() => () => clearInterval(timerRef.current), []);
       useEffect(() => { onRegisterStart?.(startRec); }, []);
-      const toggleActive = (id) => { setActiveId(prev => prev === id ? null : id); setExpanded(e => ({ ...e, [id]: true })); };
+      const toggleActive = (id) => { setActiveId(prev => prev === id ? null : id); setExpanded(e => ({ ...e, [id]: !e[id] })); };
 
       return (
         <div style={{ maxWidth: 1100, margin: '0 auto', padding: '28px 20px' }}>
