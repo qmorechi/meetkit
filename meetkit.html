@@ -389,6 +389,7 @@
       const [cardUploading, setCardUploading] = useState({});
       const [toast, setToast] = useState('');
       const [publicUrl, setPublicUrl] = useState(() => localStorage.getItem('mk_public_url') || '');
+      const [slackWebhook, setSlackWebhook] = useState(() => localStorage.getItem('mk_slack_webhook') || '');
       const [showUrlInput, setShowUrlInput] = useState(false);
       const [showJournalRef, setShowJournalRef] = useState(false);
       const [briefingOpen, setBriefingOpen] = useState(true);
@@ -534,6 +535,13 @@
         showToast('✓ 網址已儲存');
       };
 
+      const saveSlackWebhook = (val) => {
+        const clean = val.trim();
+        setSlackWebhook(clean);
+        localStorage.setItem('mk_slack_webhook', clean);
+        showToast(clean ? '✓ Slack Webhook 已儲存' : '✓ Slack 通知已關閉');
+      };
+
       const openNewRound = async () => {
         if (proposals.length > 0) {
           await Promise.all(proposals.map(p => db(`proposals?id=eq.${p.id}`, { method: 'DELETE' }).catch(() => {})));
@@ -552,8 +560,25 @@
         const shortDate = dateObj ? `${dateObj.getMonth()+1}/${dateObj.getDate()}(${weekdays[dateObj.getDay()]})` : '';
         const timeStr = meetingTime || '';
         const roomTitle = [shortDate, timeStr].filter(Boolean).join(' ') + '會議準備室';
-        navigator.clipboard.writeText(`${roomTitle}\n${url}`)
-          .then(() => showToast('✓ 開會通知已複製！'));
+
+        // 複製到剪貼簿
+        navigator.clipboard.writeText(`${roomTitle}\n${url}`).catch(() => {});
+
+        // 發送到 Slack（若有設定 Webhook）
+        if (slackWebhook) {
+          const payload = JSON.stringify({
+            text: `📅 *${roomTitle}*\n請至以下連結提交議程提案：\n${url}`
+          });
+          fetch(slackWebhook, {
+            method: 'POST',
+            mode: 'no-cors',
+            headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+            body: `payload=${encodeURIComponent(payload)}`
+          }).catch(() => {});
+          showToast('✓ 開會通知已發送到 Slack！');
+        } else {
+          showToast('✓ 開會通知已複製！');
+        }
       };
 
       return (
@@ -612,15 +637,29 @@
                 <button style={{ ...btn('ghost'), padding: '8px 10px', fontSize: 13 }} title="設定公開網址" onClick={() => setShowUrlInput(v => !v)}>⚙</button>
               </div>
               {showUrlInput && (
-                <div style={{ display: 'flex', gap: 6, alignItems: 'center' }} className="fade-in">
-                  <input
-                    defaultValue={publicUrl}
-                    placeholder="https://xxx.netlify.app/meetkit.html"
-                    style={{ ...S.input, width: 280, fontSize: 12, padding: '6px 10px' }}
-                    onKeyDown={e => e.key === 'Enter' && savePublicUrl(e.target.value)}
-                    id="public-url-input"
-                  />
-                  <button style={{ ...btn('primary'), padding: '6px 12px', fontSize: 12 }} onClick={() => savePublicUrl(document.getElementById('public-url-input').value)}>儲存</button>
+                <div style={{ display: 'flex', flexDirection: 'column', gap: 6, alignItems: 'flex-end' }} className="fade-in">
+                  <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
+                    <input
+                      defaultValue={publicUrl}
+                      placeholder="https://qmorechi.github.io/meetkit"
+                      style={{ ...S.input, width: 300, fontSize: 12, padding: '6px 10px' }}
+                      onKeyDown={e => e.key === 'Enter' && savePublicUrl(e.target.value)}
+                      id="public-url-input"
+                    />
+                    <button style={{ ...btn('primary'), padding: '6px 12px', fontSize: 12 }} onClick={() => savePublicUrl(document.getElementById('public-url-input').value)}>儲存</button>
+                  </div>
+                  <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
+                    <span style={{ fontSize: 11, color: C.textMut, whiteSpace: 'nowrap' }}>🔔 Slack Webhook</span>
+                    <input
+                      defaultValue={slackWebhook}
+                      placeholder="https://hooks.slack.com/services/…"
+                      style={{ ...S.input, width: 300, fontSize: 12, padding: '6px 10px' }}
+                      onKeyDown={e => e.key === 'Enter' && saveSlackWebhook(e.target.value)}
+                      id="slack-webhook-input"
+                    />
+                    <button style={{ ...btn('primary'), padding: '6px 12px', fontSize: 12 }} onClick={() => saveSlackWebhook(document.getElementById('slack-webhook-input').value)}>儲存</button>
+                  </div>
+                  {slackWebhook && <div style={{ fontSize: 11, color: C.success }}>✓ Slack 通知已啟用</div>}
                 </div>
               )}
             </div>
@@ -756,13 +795,15 @@
                 <div style={{ fontSize: 15, fontWeight: 600, display: 'flex', alignItems: 'center', gap: 10 }}>
                   📋 議程提案 <span style={badge(C.accent)}>{proposals.length}</span>
                 </div>
-                <button style={{ ...btn('ghost'), padding: '6px 12px', fontSize: 13 }} onClick={loadProposals}>↻ 重整</button>
+                <div style={{ display: 'flex', gap: 8 }}>
+                  <button style={{ ...btn('primary'), padding: '6px 14px', fontSize: 13 }} onClick={sendNotice}>📋 複製開會通知</button>
+                  <button style={{ ...btn('ghost'), padding: '6px 12px', fontSize: 13 }} onClick={loadProposals}>↻ 重整</button>
+                </div>
               </div>
               {proposals.length === 0 ? (
                 <div style={{ textAlign: 'center', padding: '48px 0', color: C.textMut }}>
                   <div style={{ fontSize: 36, marginBottom: 12 }}>📭</div>
-                  <div style={{ fontSize: 14, marginBottom: 20 }}>準備室已開啟，等待大家上傳提案</div>
-                  <button style={{ ...btn('primary'), padding: '10px 24px', fontSize: 14 }} onClick={sendNotice}>📢 發出開會通知</button>
+                  <div style={{ fontSize: 14, color: C.textMut }}>準備室已開啟，等待大家上傳提案</div>
                 </div>
               ) : (
                 <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
@@ -1138,6 +1179,8 @@
       const [summary,      setSummary]      = useState('');
       const [errMsg,       setErrMsg]       = useState('');
       const [whisperInfo,  setWhisperInfo]  = useState(null);
+      const [archiving,    setArchiving]    = useState(false);
+      const [archiveSteps, setArchiveSteps] = useState([]);
       const fileRef = useRef();
       const audioSrc = uploadFile || audioBlob;
 
@@ -1274,6 +1317,21 @@ ${txText}
 
       const running = status === 'transcribing' || status === 'summarizing';
 
+      const handleArchive = async () => {
+        setArchiving(true);
+        setArchiveSteps([]);
+        const steps = [
+          { msg: '💾 儲存日誌中…',    delay: 0 },
+          { msg: '📌 更新前情提要…',  delay: 900 },
+          { msg: '✅ 完成！前往日誌', delay: 1800 },
+        ];
+        steps.forEach(({ msg, delay }) => {
+          setTimeout(() => setArchiveSteps(prev => [...prev, msg]), delay);
+        });
+        await new Promise(r => setTimeout(r, 2200));
+        await onSaveJournal({ proposals, transcript, summary });
+      };
+
       return (
         <div style={{ maxWidth: 800, margin: '0 auto', padding: '28px 20px', display: 'flex', flexDirection: 'column', gap: 18 }}>
           <div style={S.panel} className="fade-in">
@@ -1348,11 +1406,30 @@ ${txText}
 
           {status === 'done' && (
             <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }} className="fade-in">
-              <button style={{ ...btn('primary'), padding: 16, fontSize: 16, width: '100%', letterSpacing: 1 }}
-                onClick={() => onSaveJournal({ proposals, transcript, summary })}>
-                ✅ 完成備忘 & 歸檔
-              </button>
-              <button style={{ ...btn('ghost'), padding: 12, fontSize: 14, width: '100%' }} onClick={exportMd}>⬇ 匯出 Markdown</button>
+              {archiving ? (
+                <div style={{ ...S.panel, padding: '20px 24px', display: 'flex', flexDirection: 'column', gap: 12 }}>
+                  {archiveSteps.length === 0 && (
+                    <div style={{ fontSize: 13, color: C.textMut, display: 'flex', alignItems: 'center', gap: 8 }}><Spinner /> 準備中…</div>
+                  )}
+                  {archiveSteps.map((s, i) => {
+                    const isDone = i < archiveSteps.length - 1 || archiveSteps.length === 3;
+                    return (
+                      <div key={i} className="fade-in" style={{ display: 'flex', alignItems: 'center', gap: 10, fontSize: 14, color: isDone ? C.success : C.textSec }}>
+                        {isDone ? <span style={{ width: 18, textAlign: 'center', fontSize: 13 }}>✓</span> : <Spinner />}
+                        {s}
+                      </div>
+                    );
+                  })}
+                </div>
+              ) : (
+                <>
+                  <button style={{ ...btn('primary'), padding: 16, fontSize: 16, width: '100%', letterSpacing: 1 }}
+                    onClick={handleArchive}>
+                    ✅ 完成備忘 & 歸檔
+                  </button>
+                  <button style={{ ...btn('ghost'), padding: 12, fontSize: 14, width: '100%' }} onClick={exportMd}>⬇ 匯出 Markdown</button>
+                </>
+              )}
             </div>
           )}
         </div>
