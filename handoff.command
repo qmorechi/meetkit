@@ -80,7 +80,13 @@ HANDOFF_EOF
 echo ""
 echo "✅ 交接紀錄已寫入 .claude-handoff.md"
 
-# ── 4. Git add + commit + push ──
+# ── 4. 同步 meetkit.html → index.html（GitHub Pages 用）──
+if [ -f "meetkit.html" ]; then
+  cp meetkit.html index.html
+  echo "✅ meetkit.html → index.html 已同步"
+fi
+
+# ── 5. Git add + commit + push ──
 echo ""
 echo "📦 提交到 GitHub..."
 git add -A
