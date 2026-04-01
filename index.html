@@ -1325,12 +1325,32 @@ ${txText}
         setJournal(prev => prev.filter(m => m.id !== id));
       };
 
+      const importFromLocal = async () => {
+        const raw = localStorage.getItem(`mk_journal_${projectId}`);
+        if (!raw) { alert('本機沒有找到舊的日誌資料'); return; }
+        let entries;
+        try { entries = JSON.parse(raw); } catch { alert('資料格式有誤'); return; }
+        if (!Array.isArray(entries) || entries.length === 0) { alert('本機日誌是空的'); return; }
+        const existing = new Set(journal.map(j => j.id?.toString()));
+        const toImport = entries.filter(e => !existing.has(e.id?.toString()));
+        if (toImport.length === 0) { alert('所有紀錄都已存在，無需匯入'); return; }
+        let ok = 0;
+        for (const e of toImport) {
+          const entry = { id: e.id?.toString(), project_id: projectId, date: e.date, proposals: e.proposals || [], transcript: e.transcript || '', summary: e.summary || '' };
+          try { await db('journals', { method: 'POST', body: JSON.stringify(entry) }); ok++; } catch {}
+        }
+        alert(`匯入完成！共匯入 ${ok} 筆`);
+        const updated = await db(`journals?project_id=eq.${projectId}&order=created_at.asc`).then(r => r.json());
+        if (Array.isArray(updated)) setJournal(updated);
+      };
+
       return (
         <div style={{ maxWidth: 860, margin: '0 auto', padding: '28px 20px' }}>
           <div style={{ display: 'flex', alignItems: 'center', marginBottom: 20 }}>
-            <div style={{ fontSize: 18, fontWeight: 600, display: 'flex', alignItems: 'center', gap: 10 }}>
+            <div style={{ fontSize: 18, fontWeight: 600, display: 'flex', alignItems: 'center', gap: 10, flex: 1 }}>
               📚 會議日誌 <span style={badge(C.accent)}>{journal.length} 場</span>
             </div>
+            <button style={{ ...btn('ghost'), fontSize: 12, padding: '5px 12px', color: C.textSec }} onClick={importFromLocal}>⬆ 從本機匯入</button>
           </div>
           <input style={{ ...S.input, marginBottom: 20 }} placeholder="🔍 搜尋關鍵字、日期、提案者…" value={search} onChange={e => setSearch(e.target.value)} />
 
