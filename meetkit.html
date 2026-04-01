@@ -505,14 +505,23 @@
         const isLocal = window.location.protocol === 'file:' || window.location.hostname === 'localhost';
         const base = publicUrl || (isLocal ? null : `${window.location.origin}${window.location.pathname}`);
         const url = base ? `${base}?p=${projectId}` : `meetkit.html?p=${projectId}`;
+        const dateStr = meetingDate ? new Date(meetingDate + 'T00:00').toLocaleDateString('zh-TW', { year: 'numeric', month: 'long', day: 'numeric', weekday: 'short' }) : '';
+        const timeStr = meetingTime || '';
         const lines = [
-          `📅 開會通知`,
+          `📅 ${projectTitle || projectId} ｜ 開會通知`,
           ``,
-          `專案：${projectTitle || projectId}`,
-          meetingDate ? `日期：${meetingDate}` : null,
-          meetingTime ? `時間：${meetingTime}` : null,
+          (dateStr || timeStr) ? `🗓 ${[dateStr, timeStr].filter(Boolean).join('　')}` : null,
           ``,
-          `連結：${url}`,
+          briefing ? `━━━━━━━━━━━━━━━━━━` : null,
+          briefing ? `📌 上次會議前情提要` : null,
+          briefing ? `━━━━━━━━━━━━━━━━━━` : null,
+          briefing ? `` : null,
+          briefing ? briefing.replace(/^>\s?/gm, '').trim() : null,
+          briefing ? `` : null,
+          `━━━━━━━━━━━━━━━━━━`,
+          ``,
+          `請在開會前上傳提案 👇`,
+          url,
         ].filter(l => l !== null).join('\n');
         navigator.clipboard.writeText(lines).then(() => {
           if (!base) showToast('⚠ 請先設定公開網址（點 ⚙）');
@@ -569,11 +578,11 @@
                   <button style={{ ...btn('ghost'), padding: '4px 10px', fontSize: 12, color: C.textMut }} onClick={() => { setMeetingDate(''); setMeetingTime(''); saveMeetingInfo('', ''); }}>✕ 清除</button>
                 </>
               )}
+              <button style={{ ...btn('primary'), padding: '8px 16px', fontSize: 13 }} onClick={copyInvite}>📨 複製開會通知</button>
             </div>
             <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-end', gap: 6, flexShrink: 0 }}>
               <div style={{ display: 'flex', gap: 6 }}>
                 <button style={{ ...btn('ghost'), padding: '8px 10px', fontSize: 13 }} title="設定公開網址" onClick={() => setShowUrlInput(v => !v)}>⚙</button>
-                <button style={{ ...btn('default'), padding: '8px 16px', fontSize: 13 }} onClick={copyInvite}>📋 複製開會通知</button>
               </div>
               {showUrlInput && (
                 <div style={{ display: 'flex', gap: 6, alignItems: 'center' }} className="fade-in">
