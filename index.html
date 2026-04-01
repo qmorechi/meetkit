@@ -774,13 +774,16 @@
     const fileLabel = (name) => FILE_TYPES[(name.split('.').pop()||'').toLowerCase()]?.label || '開啟';
 
     // 統一檔案預覽 Modal（頁內 iframe，不跳分頁）
-    function FileViewerModal({ file, onClose }) {
+    function FileViewerModal({ file, onClose, recState }) {
       const { url, name } = file;
       const ext = (name.split('.').pop() || '').toLowerCase();
       const type = FILE_TYPES[ext];
       const isMd = type?.viewer === 'markdown';
+      const isPdf = type?.viewer === 'direct';
       const [mdContent, setMdContent] = useState('');
       const [mdLoading, setMdLoading] = useState(isMd);
+      const [fontSize, setFontSize] = useState(15);
+      const [pdfZoom, setPdfZoom] = useState(100);
 
       useEffect(() => {
         if (!isMd) return;
@@ -791,6 +794,7 @@
       const iframeSrc = () => {
         if (type?.viewer === 'office') return `https://view.officeapps.live.com/op/embed.aspx?src=${encodeURIComponent(url)}`;
         if (type?.viewer === 'google') return `https://docs.google.com/viewer?url=${encodeURIComponent(url)}&embedded=true`;
+        if (isPdf) return `${url}#zoom=${pdfZoom}`;
         return url;
       };
 
@@ -801,33 +805,68 @@
         return marked.parse(text, { renderer, gfm: true, breaks: true });
       };
 
+      const rec = recState;
+      const pad2 = n => String(n).padStart(2,'0');
+
       return (
         <div style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.85)', zIndex: 500, display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 20 }} onClick={onClose}>
           <div style={{ background: C.bgPanel, border: `1px solid ${C.border}`, borderRadius: 12, width: '100%', maxWidth: isMd ? 780 : '95vw', height: isMd ? 'auto' : '90vh', maxHeight: '90vh', display: 'flex', flexDirection: 'column', overflow: 'hidden' }} onClick={e => e.stopPropagation()}>
-            <div style={{ padding: '12px 18px', borderBottom: `1px solid ${C.border}`, display: 'flex', alignItems: 'center', gap: 10, flexShrink: 0 }}>
-              <span style={{ fontSize: 14, fontWeight: 600, flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{fileIcon(name)} {name}</span>
-              <a href={url} target="_blank" rel="noopener noreferrer" style={{ ...btn('ghost'), padding: '4px 12px', fontSize: 12, color: C.textSec, textDecoration: 'none', flexShrink: 0 }}>↗ 新分頁</a>
+            {/* Header */}
+            <div style={{ padding: '10px 14px', borderBottom: `1px solid ${C.border}`, display: 'flex', alignItems: 'center', gap: 8, flexShrink: 0, flexWrap: 'wrap' }}>
+              <span style={{ fontSize: 13, fontWeight: 600, flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', minWidth: 0 }}>{fileIcon(name)} {name}</span>
+              {/* 錄音狀態 */}
+              {rec && (rec.isRecording ? (
+                <div style={{ display: 'flex', alignItems: 'center', gap: 6, background: C.dangerBg, border: `1px solid ${C.danger}`, borderRadius: 20, padding: '4px 10px', flexShrink: 0, animation: 'pulse 1.5s infinite' }}>
+                  <span style={{ width: 7, height: 7, borderRadius: '50%', background: C.danger, flexShrink: 0 }} />
+                  <span style={{ fontSize: 12, fontWeight: 700, color: C.danger, fontVariantNumeric: 'tabular-nums' }}>{pad2(Math.floor(rec.elapsed/60))}:{pad2(rec.elapsed%60)}</span>
+                  <button style={{ ...btn('danger'), padding: '2px 8px', fontSize: 11, borderRadius: 12 }} onClick={e => { e.stopPropagation(); rec.onStop?.(); }}>⏹</button>
+                </div>
+              ) : (
+                <div style={{ display: 'flex', alignItems: 'center', gap: 6, background: C.bgCard, border: `1px solid ${C.warn}66`, borderRadius: 20, padding: '4px 10px', flexShrink: 0 }}>
+                  <span style={{ fontSize: 11, color: C.warn }}>⚠ 未錄音</span>
+                  <button style={{ ...btn('primary'), padding: '2px 8px', fontSize: 11, borderRadius: 12 }} onClick={e => { e.stopPropagation(); rec.onStart?.(); }}>⏺</button>
+                </div>
+              ))}
+              {/* 字體大小（Markdown）或縮放（PDF） */}
+              {isMd && (
+                <div style={{ display: 'flex', alignItems: 'center', gap: 2, flexShrink: 0 }}>
+                  <button style={{ ...btn('ghost'), padding: '3px 8px', fontSize: 13 }} onClick={() => setFontSize(s => Math.max(11, s-1))}>A-</button>
+                  <span style={{ fontSize: 11, color: C.textSec, minWidth: 28, textAlign: 'center' }}>{fontSize}</span>
+                  <button style={{ ...btn('ghost'), padding: '3px 8px', fontSize: 13 }} onClick={() => setFontSize(s => Math.min(24, s+1))}>A+</button>
+                </div>
+              )}
+              {isPdf && (
+                <div style={{ display: 'flex', alignItems: 'center', gap: 2, flexShrink: 0 }}>
+                  <button style={{ ...btn('ghost'), padding: '3px 8px', fontSize: 13 }} onClick={() => setPdfZoom(z => Math.max(50, z-25))}>－</button>
+                  <span style={{ fontSize: 11, color: C.textSec, minWidth: 36, textAlign: 'center' }}>{pdfZoom}%</span>
+                  <button style={{ ...btn('ghost'), padding: '3px 8px', fontSize: 13 }} onClick={() => setPdfZoom(z => Math.min(200, z+25))}>＋</button>
+                </div>
+              )}
+              {(type?.viewer === 'office' || type?.viewer === 'google') && (
+                <span style={{ fontSize: 11, color: C.textMut, flexShrink: 0 }}>縮放請用文件內控制</span>
+              )}
+              <a href={url} target="_blank" rel="noopener noreferrer" style={{ ...btn('ghost'), padding: '4px 10px', fontSize: 12, color: C.textSec, textDecoration: 'none', flexShrink: 0 }}>↗</a>
               <button style={{ ...btn('ghost'), padding: '4px 10px', fontSize: 13, flexShrink: 0 }} onClick={onClose}>✕</button>
             </div>
             {isMd ? (
-              <div style={{ overflow: 'auto', padding: '24px 32px', flex: 1, lineHeight: 1.85, fontSize: 14, color: C.text, maxHeight: '80vh' }}>
+              <div style={{ overflow: 'auto', padding: '24px 32px', flex: 1, lineHeight: 1.85, fontSize: fontSize, color: C.text, maxHeight: '80vh' }}>
                 {mdLoading ? <div style={{ color: C.textSec }}><Spinner /> 載入中…</div> : (
                   <div className="mk-md" dangerouslySetInnerHTML={{ __html: renderMd(mdContent) }} />
                 )}
               </div>
             ) : (
-              <iframe src={iframeSrc()} style={{ flex: 1, border: 'none', width: '100%', minHeight: 0 }} allow="fullscreen" />
+              <iframe key={pdfZoom} src={iframeSrc()} style={{ flex: 1, border: 'none', width: '100%', minHeight: 0 }} allow="fullscreen" />
             )}
           </div>
         </div>
       );
     }
 
-    function FileAttachments({ files }) {
+    function FileAttachments({ files, recState }) {
       const [viewerFile, setViewerFile] = useState(null);
       return (
         <>
-          {viewerFile && <FileViewerModal file={viewerFile} onClose={() => setViewerFile(null)} />}
+          {viewerFile && <FileViewerModal file={viewerFile} onClose={() => setViewerFile(null)} recState={recState} />}
           <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
             {files.map((f, fi) => (
               <button key={fi} onClick={() => setViewerFile(f)}
@@ -957,7 +996,7 @@
                             {mFiles.length > 0 ? (
                               <div style={{ marginTop: 12 }}>
                                 <div style={{ fontSize: 11, color: C.textMut, letterSpacing: '0.04em', fontWeight: 600, marginBottom: 6 }}>簡報 / 文件</div>
-                                <FileAttachments files={mFiles} />
+                                <FileAttachments files={mFiles} recState={{ isRecording, elapsed, onStop: stopRec, onStart: startRec }} />
                               </div>
                             ) : (
                               <div style={{ marginTop: 10, fontSize: 12, color: C.textMut }}>（無附件）</div>
@@ -1011,8 +1050,15 @@
       const [transcript,   setTranscript]   = useState('');
       const [summary,      setSummary]      = useState('');
       const [errMsg,       setErrMsg]       = useState('');
+      const [whisperInfo,  setWhisperInfo]  = useState(null);
       const fileRef = useRef();
       const audioSrc = uploadFile || audioBlob;
+
+      const getAudioDuration = (blob) => new Promise(resolve => {
+        const a = new Audio(); a.src = URL.createObjectURL(blob);
+        a.onloadedmetadata = () => { URL.revokeObjectURL(a.src); resolve(a.duration || 0); };
+        a.onerror = () => resolve(0);
+      });
 
       const run = async () => {
         if (!openaiKey.trim()) { setErrMsg('請輸入 OpenAI API Key'); return; }
@@ -1026,6 +1072,9 @@
           const res = await fetch('https://api.openai.com/v1/audio/transcriptions', { method: 'POST', headers: { Authorization: `Bearer ${openaiKey.trim()}` }, body: fd });
           if (!res.ok) { const e = await res.json(); throw new Error(e.error?.message || `HTTP ${res.status}`); }
           txText = (await res.json()).text; setTranscript(txText);
+          const dur = await getAudioDuration(audioSrc);
+          const mins = Math.ceil(dur / 60) || 1;
+          setWhisperInfo({ mins, cost: (mins * 0.006).toFixed(3) });
         } catch (e) { setErrMsg('語音轉文字失敗：' + e.message); setStatus('error'); return; }
 
         setStatus('summarizing');
@@ -1097,6 +1146,12 @@
             </div>
           </div>
 
+          {whisperInfo && <div style={{ ...S.card, padding: '10px 16px', background: C.successBg, borderColor: C.success + '55', fontSize: 12, color: C.textSec, display: 'flex', gap: 16 }}>
+            <span>🎙 Whisper 用量</span>
+            <span>音檔長度：約 <b>{whisperInfo.mins}</b> 分鐘</span>
+            <span>費用：<b>${whisperInfo.cost}</b> USD</span>
+            <span style={{ color: C.textMut }}>（$0.006/分鐘）</span>
+          </div>}
           {errMsg && <div style={{ ...S.card, padding: '12px 16px', background: C.dangerBg, borderColor: C.danger + '66', color: '#ff8a80', fontSize: 13 }}>⚠️ {errMsg}</div>}
 
           {status !== 'done' && (
@@ -1371,7 +1426,7 @@
 
           {/* 常駐錄音指示器 */}
           {phase === 1 && (
-            <div style={{ position: 'fixed', bottom: 24, right: 24, zIndex: 600, display: 'flex', alignItems: 'center', gap: 10 }}>
+            <div style={{ position: 'fixed', top: 68, right: 16, zIndex: 600, display: 'flex', alignItems: 'center', gap: 10 }}>
               {isRecording ? (
                 <div style={{ display: 'flex', alignItems: 'center', gap: 10, background: C.dangerBg, border: `1px solid ${C.danger}`, borderRadius: 40, padding: '10px 18px', boxShadow: '0 4px 24px rgba(0,0,0,0.5)', animation: 'pulse 1.5s infinite' }}>
                   <span style={{ width: 10, height: 10, borderRadius: '50%', background: C.danger, flexShrink: 0 }} />
