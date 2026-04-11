@@ -1,0 +1,2078 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>MeetKit ◈</title>
+  <script src="https://unpkg.com/react@18/umd/react.production.min.js" crossorigin></script>
+  <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js" crossorigin></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/pdfjs-dist@3.11.174/build/pdf.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/mammoth@1.6.0/mammoth.browser.min.js"></script>
+  <script>if (typeof pdfjsLib !== 'undefined') pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdn.jsdelivr.net/npm/pdfjs-dist@3.11.174/build/pdf.worker.min.js';</script>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+TC:wght@300;400;500;600&display=swap" rel="stylesheet">
+  <style>
+    *, *::before, *::after { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      background: #0f1117;
+      color: #e8e8e8;
+      font-family: 'Noto Sans TC', 'PingFang TC', -apple-system, sans-serif;
+      min-height: 100vh;
+      -webkit-font-smoothing: antialiased;
+    }
+    #root { min-height: 100vh; }
+    ::-webkit-scrollbar { width: 5px; height: 5px; }
+    ::-webkit-scrollbar-track { background: transparent; }
+    ::-webkit-scrollbar-thumb { background: #2a2d35; border-radius: 4px; }
+    input, textarea, button { font-family: inherit; }
+    input:focus, textarea:focus { outline: none; }
+    audio { background: #1a1d25; }
+    @keyframes pulse { 0%, 100% { box-shadow: 0 0 0 0 rgba(192,57,43,0.4); } 50% { box-shadow: 0 0 0 8px rgba(192,57,43,0); } }
+    @keyframes spin { to { transform: rotate(360deg); } }
+    @keyframes fadeIn { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: translateY(0); } }
+    .fade-in { animation: fadeIn 0.25s ease; }
+    .mk-md h1,.mk-md h2,.mk-md h3,.mk-md h4 { font-weight: 700; margin: 1.2em 0 0.5em; color: #e8e8e8; }
+    .mk-md h1 { font-size: 1.6em; } .mk-md h2 { font-size: 1.3em; } .mk-md h3 { font-size: 1.1em; }
+    .mk-md p { margin: 0.7em 0; }
+    .mk-md ul,.mk-md ol { padding-left: 1.6em; margin: 0.6em 0; }
+    .mk-md li { margin: 0.3em 0; }
+    .mk-md code { background: #0f1117; border-radius: 4px; padding: 2px 6px; font-family: monospace; font-size: 0.9em; color: #95d5b2; }
+    .mk-md pre { background: #0f1117; border-radius: 8px; padding: 14px 16px; overflow-x: auto; margin: 1em 0; }
+    .mk-md pre code { background: none; padding: 0; }
+    .mk-md blockquote { border-left: 3px solid #2a2d35; padding-left: 14px; color: #888; margin: 1em 0; }
+    .mk-md hr { border: none; border-top: 1px solid #2a2d35; margin: 1.5em 0; }
+    .mk-md table { border-collapse: collapse; width: 100%; margin: 1em 0; }
+    .mk-md th,.mk-md td { border: 1px solid #2a2d35; padding: 8px 12px; text-align: left; }
+    .mk-md th { background: #1a1d25; font-weight: 600; }
+    @media (max-width: 768px) {
+      .grid-2col { grid-template-columns: 1fr !important; }
+      .grid-3-2 { grid-template-columns: 1fr !important; }
+      .hide-mobile { display: none !important; }
+    }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+  <script type="text/babel">
+    const { useState, useEffect, useRef, useCallback } = React;
+
+    // ─── SUPABASE ────────────────────────────────────────────────────────────────
+    const SB_URL = "https://yrugcgzkomydmorgzwhb.supabase.co";
+    const SB_KEY = "sb_publishable_m3Qi3HdfMT2pbcQHVuGxNw_696C0jYa";
+
+    const db = (path, opts = {}) =>
+      fetch(`${SB_URL}/rest/v1/${path}`, {
+        headers: {
+          apikey: SB_KEY,
+          Authorization: `Bearer ${SB_KEY}`,
+          "Content-Type": "application/json",
+          Prefer: "return=representation",
+          ...opts.headers,
+        },
+        ...opts,
+      });
+
+    // ─── 附件文字抽取 ─────────────────────────────────────────────────────────────
+    const extractFileText = async (fileUrl, fileName) => {
+      try {
+        const ext = (fileName || fileUrl).split('.').pop().toLowerCase().split('?')[0];
+        const res = await fetch(fileUrl);
+        if (!res.ok) return '';
+
+        if (ext === 'pdf') {
+          if (typeof pdfjsLib === 'undefined') return '';
+          const buf = await res.arrayBuffer();
+          const pdf = await pdfjsLib.getDocument({ data: buf }).promise;
+          const pages = await Promise.all(
+            Array.from({ length: pdf.numPages }, (_, i) =>
+              pdf.getPage(i + 1).then(p => p.getTextContent()).then(tc => tc.items.map(it => it.str).join(' '))
+            )
+          );
+          return pages.join('\n');
+        }
+
+        if (ext === 'docx') {
+          if (typeof mammoth === 'undefined') return '';
+          const buf = await res.arrayBuffer();
+          const result = await mammoth.extractRawText({ arrayBuffer: buf });
+          return result.value || '';
+        }
+
+        if (['txt', 'md', 'rtf'].includes(ext)) {
+          return await res.text();
+        }
+
+        return '';
+      } catch { return ''; }
+    };
+
+    const genId = () => Math.random().toString(36).slice(2, 8).toUpperCase();
+
+    // ─── DESIGN TOKENS ───────────────────────────────────────────────────────────
+    const C = {
+      bgRoot:   '#0f1117',
+      bgPanel:  '#16191f',
+      bgCard:   '#1a1d25',
+      bgInput:  '#0f1117',
+      border:   '#2a2d35',
+      accent:   '#5b8dee',
+      success:  '#95d5b2',
+      successBg:'#1e3a2f',
+      successBd:'#2d6a4f',
+      danger:   '#c0392b',
+      dangerBg: '#2d1215',
+      text:     '#e8e8e8',
+      textSec:  '#888',
+      textMut:  '#4a4d56',
+      warn:     '#f0a020',
+    };
+
+    const S = {
+      panel: { background: C.bgPanel, borderRadius: 12, padding: 24, border: `1px solid ${C.border}` },
+      card:  { background: C.bgCard, borderRadius: 8, border: `1px solid ${C.border}`, overflow: 'hidden' },
+      input: { background: C.bgInput, border: `1px solid ${C.border}`, borderRadius: 8, padding: '10px 12px', color: C.text, width: '100%', fontSize: 14, lineHeight: 1.5 },
+      label: { fontSize: 12, color: C.textSec, marginBottom: 6, display: 'block', letterSpacing: '0.03em', fontWeight: 500 },
+    };
+
+    function btn(variant = 'default', extra = {}) {
+      const base = { border: 'none', borderRadius: 8, padding: '10px 18px', cursor: 'pointer', fontSize: 14, fontWeight: 500, fontFamily: 'inherit', transition: 'opacity 0.15s', display: 'inline-flex', alignItems: 'center', justifyContent: 'center', gap: 6, userSelect: 'none', whiteSpace: 'nowrap' };
+      const variants = {
+        primary: { background: C.accent, color: '#fff' },
+        danger:  { background: C.danger, color: '#fff' },
+        ghost:   { background: 'transparent', color: C.textSec, border: `1px solid ${C.border}` },
+        default: { background: '#1e2230', color: C.text, border: `1px solid ${C.border}` },
+        success: { background: C.successBd, color: C.success },
+      };
+      return { ...base, ...(variants[variant] || variants.default), ...extra };
+    }
+
+    function badge(color = C.accent, bg) {
+      return { background: bg || (color + '22'), color, borderRadius: 10, padding: '2px 9px', fontSize: 12, fontWeight: 600, display: 'inline-flex', alignItems: 'center', gap: 4 };
+    }
+
+    function Spinner() {
+      return <span style={{ width: 14, height: 14, border: `2px solid #ffffff44`, borderTopColor: '#fff', borderRadius: '50%', animation: 'spin 0.7s linear infinite', display: 'inline-block' }} />;
+    }
+
+    // ─── HOME ────────────────────────────────────────────────────────────────────
+    function Home({ onEnter }) {
+      const [joinCode,  setJoinCode]  = useState('');
+      const [password,  setPassword]  = useState('');
+      const [creating,  setCreating]  = useState(false);
+      const [showPwField, setShowPwField] = useState(false);
+      const [recent, setRecent] = useState(() => {
+        try { return JSON.parse(localStorage.getItem('mk_recent_projects') || '[]'); } catch { return []; }
+      });
+      const [recentTitles, setRecentTitles] = useState({});
+
+      useEffect(() => {
+        if (recent.length === 0) return;
+        const ids = recent.map(p => p.id).join(',');
+        db(`projects?id=in.(${ids})&select=id,title`)
+          .then(r => r.json()).then(data => {
+            const map = {};
+            data.forEach(p => { map[p.id] = p.title; });
+            setRecentTitles(map);
+          }).catch(() => {});
+      }, []);
+
+      const removeRecent = (id, e) => {
+        e.stopPropagation();
+        const updated = recent.filter(p => p.id !== id);
+        setRecent(updated);
+        localStorage.setItem('mk_recent_projects', JSON.stringify(updated));
+      };
+
+      const createProject = async () => {
+        setCreating(true);
+        const id = genId();
+        try {
+          await db('projects', {
+            method: 'POST',
+            body: JSON.stringify({ id, title: '未命名專案', password: password.trim() }),
+          });
+        } catch {}
+        sessionStorage.setItem(`mk_auth_${id}`, '1');
+        onEnter(id);
+        setCreating(false);
+      };
+
+      const joinProject = () => {
+        const code = joinCode.trim().toUpperCase();
+        if (code.length >= 4) onEnter(code);
+      };
+
+      return (
+        <div style={{ minHeight: '100vh', display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', padding: 24 }}>
+          <div style={{ marginBottom: 48, textAlign: 'center' }}>
+            <div style={{ fontSize: 48, marginBottom: 12 }}>◈</div>
+            <div style={{ fontSize: 28, fontWeight: 700, letterSpacing: '-0.03em', color: C.text }}>MeetKit</div>
+            <div style={{ fontSize: 14, color: C.textSec, marginTop: 8 }}>小團隊會議管理系統</div>
+          </div>
+
+          <div style={{ width: '100%', maxWidth: 420, display: 'flex', flexDirection: 'column', gap: 16 }}>
+
+            {/* 最近使用的專案 */}
+            {recent.length > 0 && (
+              <div style={S.panel}>
+                <div style={{ fontSize: 15, fontWeight: 600, marginBottom: 12 }}>🕐 最近使用</div>
+                <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+                  {recent.map(p => (
+                    <div key={p.id} style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '9px 12px', background: C.bgInput, borderRadius: 8, border: `1px solid ${C.border}`, cursor: 'pointer', transition: 'border-color 0.15s' }}
+                      onClick={() => onEnter(p.id)}
+                      onMouseEnter={e => e.currentTarget.style.borderColor = C.accent + '66'}
+                      onMouseLeave={e => e.currentTarget.style.borderColor = C.border}>
+                      <div style={{ flex: 1, minWidth: 0 }}>
+                        <div style={{ fontSize: 14, fontWeight: 500, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                          {recentTitles[p.id] || '載入中…'}
+                        </div>
+                        <div style={{ fontSize: 11, color: C.textMut, fontFamily: 'monospace', letterSpacing: '0.08em', marginTop: 2 }}>{p.id}</div>
+                      </div>
+                      <button style={{ ...btn('ghost'), padding: '2px 7px', fontSize: 12, color: C.textMut, borderColor: 'transparent', flexShrink: 0 }}
+                        onClick={e => removeRecent(p.id, e)}>✕</button>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+
+            {/* 建立新專案 */}
+            <div style={S.panel}>
+              <div style={{ fontSize: 15, fontWeight: 600, marginBottom: 6 }}>建立新專案</div>
+              <div style={{ fontSize: 13, color: C.textSec, marginBottom: 16, lineHeight: 1.6 }}>
+                系統會產生一組專屬代碼，分享給與會者即可加入。
+              </div>
+              {showPwField ? (
+                <div style={{ marginBottom: 12 }}>
+                  <label style={S.label}>專案密碼（選填）</label>
+                  <input
+                    style={S.input} type="password" placeholder="留空則無密碼保護"
+                    value={password} onChange={e => setPassword(e.target.value)}
+                    autoFocus
+                  />
+                </div>
+              ) : (
+                <button style={{ ...btn('ghost'), fontSize: 12, marginBottom: 12, padding: '6px 12px' }} onClick={() => setShowPwField(true)}>
+                  🔒 設定密碼保護（選填）
+                </button>
+              )}
+              <button
+                style={{ ...btn('primary'), width: '100%', padding: 13, fontSize: 15, opacity: creating ? 0.7 : 1 }}
+                onClick={createProject} disabled={creating}
+              >
+                {creating ? <><Spinner /> 建立中…</> : '＋ 建立新專案'}
+              </button>
+            </div>
+
+            <div style={{ textAlign: 'center', fontSize: 13, color: C.textMut }}>或</div>
+
+            {/* 加入專案 */}
+            <div style={S.panel}>
+              <div style={{ fontSize: 15, fontWeight: 600, marginBottom: 16 }}>加入現有專案</div>
+              <input
+                style={S.input}
+                placeholder="輸入 6 碼專案代碼（例：A3X9KP）"
+                value={joinCode}
+                onChange={e => setJoinCode(e.target.value.toUpperCase())}
+                onKeyDown={e => e.key === 'Enter' && joinProject()}
+                maxLength={8}
+              />
+              <button
+                style={{ ...btn('default'), width: '100%', marginTop: 12, padding: 11 }}
+                onClick={joinProject} disabled={joinCode.trim().length < 4}
+              >
+                加入專案 →
+              </button>
+            </div>
+          </div>
+        </div>
+      );
+    }
+
+    // ─── HEADER ──────────────────────────────────────────────────────────────────
+    function Header({ phase, setPhase, syncOk, journalCount, projectId, projectTitle, onTitleSave }) {
+      const [editing, setEditing] = useState(false);
+      const [draft, setDraft] = useState(projectTitle);
+
+      useEffect(() => { setDraft(projectTitle); }, [projectTitle]);
+
+      const save = async () => {
+        await db(`projects?id=eq.${projectId}`, {
+          method: 'PATCH',
+          body: JSON.stringify({ title: draft }),
+        });
+        onTitleSave(draft);
+        setEditing(false);
+      };
+
+      const phases = [
+        { id: 0, icon: '📋', label: '會前提案' },
+        { id: 1, icon: '🎙️', label: '會議進行' },
+        { id: 2, icon: '📝', label: '會後整理' },
+      ];
+
+      return (
+        <header style={{ background: C.bgPanel + 'ee', borderBottom: `1px solid ${C.border}`, position: 'sticky', top: 0, zIndex: 100, backdropFilter: 'blur(16px)' }}>
+          {/* Project title bar */}
+          <div style={{ borderBottom: `1px solid ${C.border}22`, padding: '6px 20px', display: 'flex', alignItems: 'center', gap: 10, maxWidth: 1100, margin: '0 auto' }}>
+            <span style={{ fontSize: 11, color: C.textMut, letterSpacing: '0.05em' }}>專案</span>
+            {editing ? (
+              <>
+                <input
+                  style={{ ...S.input, padding: '3px 8px', fontSize: 13, width: 'auto', flex: 1, maxWidth: 320 }}
+                  value={draft}
+                  onChange={e => setDraft(e.target.value)}
+                  onKeyDown={e => { if (e.key === 'Enter') save(); if (e.key === 'Escape') setEditing(false); }}
+                  autoFocus
+                />
+                <button style={{ ...btn('primary'), padding: '3px 12px', fontSize: 12 }} onClick={save}>儲存</button>
+                <button style={{ ...btn('ghost'), padding: '3px 10px', fontSize: 12 }} onClick={() => setEditing(false)}>取消</button>
+              </>
+            ) : (
+              <>
+                <span style={{ fontSize: 13, fontWeight: 600, color: C.text }}>{projectTitle || '未命名專案'}</span>
+                <button style={{ ...btn('ghost'), padding: '2px 8px', fontSize: 11, color: C.textMut, borderColor: 'transparent' }} onClick={() => setEditing(true)}>✏️</button>
+                <span style={{ marginLeft: 'auto', fontSize: 11, color: C.textMut }}>代碼：<span style={{ fontFamily: 'monospace', color: C.textSec, letterSpacing: '0.1em' }}>{projectId}</span></span>
+              </>
+            )}
+          </div>
+
+          {/* Nav bar */}
+          <div style={{ maxWidth: 1100, margin: '0 auto', padding: '0 20px', height: 52, display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12 }}>
+            <div style={{ fontWeight: 700, fontSize: 16, letterSpacing: '-0.03em', display: 'flex', alignItems: 'center', gap: 7, flexShrink: 0 }}>
+              <span style={{ color: C.accent }}>◈</span> MeetKit
+            </div>
+
+            <nav style={{ display: 'flex', alignItems: 'center', gap: 3 }}>
+              {phases.map((p, i) => (
+                <React.Fragment key={p.id}>
+                  <button
+                    onClick={() => setPhase(p.id)}
+                    style={{ ...btn(phase === p.id ? 'primary' : 'ghost'), padding: '6px 13px', fontSize: 13, opacity: phase > p.id ? 0.55 : phase === p.id ? 1 : 0.75 }}
+                  >
+                    <span>{p.icon}</span>
+                    <span className="hide-mobile">{p.label}</span>
+                  </button>
+                  {i < phases.length - 1 && <span style={{ color: C.textMut, fontSize: 11, margin: '0 1px' }}>›</span>}
+                </React.Fragment>
+              ))}
+              <span style={{ color: C.textMut, fontSize: 11, margin: '0 4px' }}>|</span>
+              <button
+                onClick={() => setPhase(3)}
+                style={{ ...btn(phase === 3 ? 'default' : 'ghost'), padding: '6px 13px', fontSize: 13, border: phase === 3 ? `1px solid ${C.accent}` : `1px solid ${C.border}`, color: phase === 3 ? C.accent : C.textSec, position: 'relative' }}
+              >
+                <span>📚</span>
+                <span className="hide-mobile">日誌</span>
+                {journalCount > 0 && <span style={{ ...badge(C.accent), fontSize: 10, padding: '0px 5px', position: 'absolute', top: -6, right: -6 }}>{journalCount}</span>}
+              </button>
+            </nav>
+
+            <div style={{ display: 'flex', alignItems: 'center', gap: 5, fontSize: 12, color: C.textSec, flexShrink: 0 }}>
+              <span style={{ width: 7, height: 7, borderRadius: '50%', background: syncOk ? C.success : C.textMut, display: 'inline-block', boxShadow: syncOk ? `0 0 0 2px ${C.success}44` : 'none' }} />
+              <span className="hide-mobile">{syncOk ? '即時同步' : '離線'}</span>
+            </div>
+          </div>
+        </header>
+      );
+    }
+
+    // ─── PRE-MEETING ─────────────────────────────────────────────────────────────
+    function PreMeeting({ projectId, proposals, setProposals, setSyncOk, journal, projectTitle, meetingDate, setMeetingDate, meetingTime, setMeetingTime, briefing }) {
+      const [form, setForm] = useState({ author: '', title: '', content: '' });
+      const [attachFiles, setAttachFiles] = useState([]);
+      const [uploading, setUploading] = useState(false);
+      const [submitting, setSubmitting] = useState(false);
+      const [expanded, setExpanded] = useState({});
+      const [cardUploading, setCardUploading] = useState({});
+      const [toast, setToast] = useState('');
+      const [publicUrl, setPublicUrl] = useState(() => localStorage.getItem('mk_public_url') || '');
+      const [slackWebhook, setSlackWebhook] = useState(() => localStorage.getItem('mk_slack_webhook') || '');
+      const [showUrlInput, setShowUrlInput] = useState(false);
+      const [showDatePicker, setShowDatePicker] = useState(false);
+      const [showJournalRef, setShowJournalRef] = useState(false);
+      const contentRef = useRef();
+      const attachRef = useRef();
+      const cardFileRefs = useRef({});
+
+      const showToast = (msg) => { setToast(msg); setTimeout(() => setToast(''), 2500); };
+
+      useEffect(() => {
+        if (!projectId) return;
+      }, [projectId]);
+
+      const loadProposals = useCallback(async () => {
+        try {
+          const res = await db(`proposals?select=*&project_id=eq.${projectId}&order=id.asc`);
+          if (res.ok) { setProposals(await res.json()); setSyncOk(true); }
+        } catch { setSyncOk(false); }
+      }, [projectId, setProposals, setSyncOk]);
+
+      useEffect(() => {
+        loadProposals();
+        const t = setInterval(loadProposals, 5000);
+        return () => clearInterval(t);
+      }, [loadProposals]);
+
+      const submit = async () => {
+        if (!form.author.trim() || !form.title.trim() || !form.content.trim()) { showToast('請填寫所有欄位'); return; }
+        setSubmitting(true);
+        let file_url = '[]', file_name = '[]';
+        if (attachFiles.length > 0) {
+          setUploading(true);
+          try {
+            const uploaded = await uploadMultiple(attachFiles);
+            if (uploaded.length > 0) {
+              file_url = JSON.stringify(uploaded.map(f => f.url));
+              file_name = JSON.stringify(uploaded.map(f => f.name));
+            }
+            if (uploaded.length < attachFiles.length) showToast('部分檔案上傳失敗');
+          } catch { showToast('檔案上傳失敗，提案仍送出（無附件）'); }
+          setUploading(false);
+        }
+        try {
+          const res = await db("proposals", { method: 'POST', body: JSON.stringify({ ...form, project_id: projectId, file_url, file_name }) });
+          if (res.ok) { setForm({ author: '', title: '', content: '' }); setAttachFiles([]); if (attachRef.current) attachRef.current.value = ''; await loadProposals(); showToast('✓ 提案已送出！'); }
+          else showToast('送出失敗，請再試一次');
+        } catch { showToast('網路錯誤，請再試一次'); }
+        finally { setSubmitting(false); }
+      };
+
+      const deleteProposal = async (id) => { await db(`proposals?id=eq.${id}`, { method: 'DELETE' }); await loadProposals(); };
+      const toggle = (id) => setExpanded(e => ({ ...e, [id]: !e[id] }));
+
+      // 解析附件：向後相容舊的單筆字串
+      const parseFiles = (p) => {
+        try {
+          const urls = JSON.parse(p.file_url || '[]');
+          const names = JSON.parse(p.file_name || '[]');
+          if (Array.isArray(urls)) return urls.map((url, i) => ({ url, name: names[i] || url.split('/').pop() }));
+        } catch {}
+        return p.file_url ? [{ url: p.file_url, name: p.file_name || '查看附件' }] : [];
+      };
+
+      // 上傳多個檔案（逐一依序），回傳成功的結果陣列
+      const uploadMultiple = async (files) => {
+        const results = [];
+        for (const file of Array.from(files)) {
+          const ext = file.name.includes('.') ? file.name.split('.').pop().replace(/[^a-zA-Z0-9]/g, '') : 'bin';
+          const path = `${projectId}/${Date.now()}_${Math.random().toString(36).slice(2,8)}.${ext}`;
+          try {
+            const res = await fetch(`${SB_URL}/storage/v1/object/presentations/${path}`, {
+              method: 'POST',
+              headers: { apikey: SB_KEY, Authorization: `Bearer ${SB_KEY}`, 'Content-Type': file.type || 'application/octet-stream' },
+              body: file,
+            });
+            if (res.ok) results.push({ url: `${SB_URL}/storage/v1/object/public/presentations/${path}`, name: file.name });
+          } catch {}
+          await new Promise(r => setTimeout(r, 150));
+        }
+        return results;
+      };
+
+      const uploadCardFiles = async (proposalId, files, existingFiles) => {
+        setCardUploading(s => ({ ...s, [proposalId]: true }));
+        const total = files.length;
+        const newFiles = [];
+        const failed = [];
+        for (const file of Array.from(files)) {
+          const ext = file.name.includes('.') ? file.name.split('.').pop().replace(/[^a-zA-Z0-9]/g, '') : 'bin';
+          const path = `${projectId}/${Date.now()}_${Math.random().toString(36).slice(2,8)}.${ext}`;
+          try {
+            const res = await fetch(`${SB_URL}/storage/v1/object/presentations/${path}`, {
+              method: 'POST',
+              headers: { apikey: SB_KEY, Authorization: `Bearer ${SB_KEY}`, 'Content-Type': file.type || 'application/octet-stream' },
+              body: file,
+            });
+            if (res.ok) {
+              newFiles.push({ url: `${SB_URL}/storage/v1/object/public/presentations/${path}`, name: file.name });
+            } else {
+              const err = await res.json().catch(() => ({}));
+              failed.push(`${file.name}（${err.message || res.status}）`);
+            }
+          } catch (e) { failed.push(`${file.name}（網路錯誤）`); }
+        }
+        if (newFiles.length > 0) {
+          const merged = [...existingFiles, ...newFiles];
+          await db(`proposals?id=eq.${proposalId}`, { method: 'PATCH', body: JSON.stringify({
+            file_url: JSON.stringify(merged.map(f => f.url)),
+            file_name: JSON.stringify(merged.map(f => f.name)),
+          }) });
+          await loadProposals();
+        }
+        if (failed.length === 0) {
+          showToast(`✓ 已新增 ${newFiles.length} 個附件！`);
+        } else if (newFiles.length > 0) {
+          showToast(`✓ ${newFiles.length} 個成功，${failed.length} 個失敗：${failed.join('、')}`);
+        } else {
+          showToast(`上傳失敗：${failed.join('、')}`);
+        }
+        setCardUploading(s => ({ ...s, [proposalId]: false }));
+      };
+
+      const removeCardFile = async (proposalId, idx, existingFiles) => {
+        const updated = existingFiles.filter((_, i) => i !== idx);
+        await db(`proposals?id=eq.${proposalId}`, { method: 'PATCH', body: JSON.stringify({
+          file_url: JSON.stringify(updated.map(f => f.url)),
+          file_name: JSON.stringify(updated.map(f => f.name)),
+        }) });
+        await loadProposals();
+        showToast('✓ 已移除附件');
+      };
+      const lastMeeting = journal && journal.length > 0 ? journal[journal.length - 1] : null;
+
+      const saveMeetingInfo = async (date, time) => {
+        await db(`projects?id=eq.${projectId}`, { method: 'PATCH', body: JSON.stringify({ meeting_date: date, meeting_time: time }) });
+      };
+
+      const savePublicUrl = (val) => {
+        const clean = val.trim().replace(/\?.*$/, '').replace(/\/$/, '');
+        setPublicUrl(clean);
+        localStorage.setItem('mk_public_url', clean);
+        setShowUrlInput(false);
+        showToast('✓ 網址已儲存');
+      };
+
+      const saveSlackWebhook = (val) => {
+        const clean = val.trim();
+        setSlackWebhook(clean);
+        localStorage.setItem('mk_slack_webhook', clean);
+        showToast(clean ? '✓ Slack Webhook 已儲存' : '✓ Slack 通知已關閉');
+      };
+
+      const openNewRound = async () => {
+        if (proposals.length > 0) {
+          await Promise.all(proposals.map(p => db(`proposals?id=eq.${p.id}`, { method: 'DELETE' }).catch(() => {})));
+          setProposals([]);
+        }
+        showToast('✓ 準備室已開啟！');
+      };
+
+      const sendNotice = () => {
+        const isLocal = window.location.protocol === 'file:' || window.location.hostname === 'localhost';
+        const base = publicUrl || (isLocal ? null : `${window.location.origin}${window.location.pathname}`);
+        if (!base) { showToast('⚠ 請先設定公開網址（點 ⚙）'); return; }
+        const url = `${base}?p=${projectId}`;
+        const weekdays = ['日','一','二','三','四','五','六'];
+        const dateObj = meetingDate ? new Date(meetingDate + 'T00:00') : null;
+        const shortDate = dateObj ? `${dateObj.getMonth()+1}/${dateObj.getDate()}(${weekdays[dateObj.getDay()]})` : '';
+        const timeStr = meetingTime || '';
+        const roomTitle = [shortDate, timeStr].filter(Boolean).join(' ') + '會議準備室';
+
+        // 複製到剪貼簿
+        navigator.clipboard.writeText(`${roomTitle}\n${url}`).catch(() => {});
+
+        // 發送到 Slack（若有設定 Webhook）
+        if (slackWebhook) {
+          const payload = JSON.stringify({
+            text: `📅 *${roomTitle}*\n請至以下連結提交議程提案：\n${url}`
+          });
+          fetch(slackWebhook, {
+            method: 'POST',
+            mode: 'no-cors',
+            headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+            body: `payload=${encodeURIComponent(payload)}`
+          }).catch(() => {});
+          showToast('✓ 開會通知已發送到 Slack！');
+        } else {
+          showToast('✓ 開會通知已複製！');
+        }
+      };
+
+      return (
+        <div style={{ maxWidth: 1100, margin: '0 auto', padding: '28px 20px' }}>
+
+
+          {/* 開會資訊 */}
+          <div style={{ ...S.panel, marginBottom: 20 }} className="fade-in">
+            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 16 }}>
+              <div style={{ fontSize: 22, fontWeight: 700, color: C.text, letterSpacing: 0.5 }}>
+                {(() => {
+                  const w = ['日','一','二','三','四','五','六'];
+                  const d = meetingDate ? new Date(meetingDate + 'T00:00') : null;
+                  const dateStr = d ? `${d.getMonth()+1}/${d.getDate()}(${w[d.getDay()]})` : '';
+                  const timeStr = meetingTime ? ` ${meetingTime}` : '';
+                  return `📨 ${dateStr}${timeStr}會議準備室`;
+                })()}
+              </div>
+              <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexShrink: 0 }}>
+                <button style={{ ...btn('ghost'), padding: '7px 14px', fontSize: 13 }} onClick={() => { setShowDatePicker(v => !v); setShowUrlInput(false); }}>🗓 新會議預約</button>
+                <button style={{ ...btn('ghost'), padding: '8px 10px', fontSize: 13 }} title="設定" onClick={() => { setShowUrlInput(v => !v); setShowDatePicker(false); }}>⚙</button>
+              </div>
+            </div>
+
+            {showDatePicker && (
+              <div style={{ marginTop: 16, paddingTop: 16, borderTop: `1px solid ${C.border}`, display: 'flex', gap: 10, alignItems: 'center', flexWrap: 'wrap' }} className="fade-in">
+                <input type="date" style={{ ...S.input, width: 'auto', fontSize: 13, colorScheme: 'dark' }} value={meetingDate} onChange={e => { setMeetingDate(e.target.value); saveMeetingInfo(e.target.value, meetingTime); }} />
+                <input type="time" style={{ ...S.input, width: 'auto', fontSize: 13, colorScheme: 'dark' }} value={meetingTime} onChange={e => { setMeetingTime(e.target.value); saveMeetingInfo(meetingDate, e.target.value); }} />
+                <button style={{ ...btn('primary'), padding: '7px 16px', fontSize: 13 }} onClick={() => { openNewRound(); setShowDatePicker(false); }}>✓ 確認開新準備室</button>
+                <button style={{ ...btn('ghost'), padding: '7px 14px', fontSize: 13 }} onClick={sendNotice}>📋 複製開會通知</button>
+                {(meetingDate || meetingTime) && (
+                  <button style={{ ...btn('ghost'), padding: '6px 10px', fontSize: 12, color: C.textMut }} onClick={() => { setMeetingDate(''); setMeetingTime(''); saveMeetingInfo('', ''); }}>✕ 清除</button>
+                )}
+              </div>
+            )}
+
+            {showUrlInput && (
+              <div style={{ marginTop: 16, paddingTop: 16, borderTop: `1px solid ${C.border}`, display: 'flex', flexDirection: 'column', gap: 10 }} className="fade-in">
+                <div style={{ display: 'flex', gap: 10, alignItems: 'center' }}>
+                  <span style={{ fontSize: 12, color: C.textMut, width: 72, flexShrink: 0 }}>🔗 公開網址</span>
+                  <input defaultValue={publicUrl} placeholder="https://qmorechi.github.io/meetkit" style={{ ...S.input, flex: 1, fontSize: 12, padding: '6px 10px' }} onKeyDown={e => e.key === 'Enter' && savePublicUrl(e.target.value)} id="public-url-input" />
+                  <button style={{ ...btn('primary'), padding: '6px 12px', fontSize: 12, flexShrink: 0 }} onClick={() => savePublicUrl(document.getElementById('public-url-input').value)}>儲存</button>
+                </div>
+                <div style={{ display: 'flex', gap: 10, alignItems: 'center' }}>
+                  <span style={{ fontSize: 12, color: C.textMut, width: 72, flexShrink: 0 }}>🔔 Slack</span>
+                  <input defaultValue={slackWebhook} placeholder="https://hooks.slack.com/services/…" style={{ ...S.input, flex: 1, fontSize: 12, padding: '6px 10px' }} onKeyDown={e => e.key === 'Enter' && saveSlackWebhook(e.target.value)} id="slack-webhook-input" />
+                  <button style={{ ...btn('primary'), padding: '6px 12px', fontSize: 12, flexShrink: 0 }} onClick={() => saveSlackWebhook(document.getElementById('slack-webhook-input').value)}>儲存</button>
+                </div>
+                {slackWebhook && <div style={{ fontSize: 11, color: C.success, paddingLeft: 82 }}>✓ Slack 通知已啟用</div>}
+              </div>
+            )}
+          </div>
+
+          {lastMeeting && (
+            <div style={{ ...S.card, marginBottom: 20, padding: '14px 18px', borderColor: C.accent + '44', background: C.accent + '08' }} className="fade-in">
+              <div style={{ fontSize: 13, fontWeight: 600, color: C.accent, display: 'flex', alignItems: 'center', gap: 7, marginBottom: 10 }}>
+                📌 上次會議備忘 <span style={{ fontWeight: 400, color: C.textSec }}>{lastMeeting.date}</span>
+              </div>
+              <div style={{ fontSize: 13, color: C.textSec, lineHeight: 1.8, whiteSpace: 'pre-wrap' }}>
+                {lastMeeting.summary ? lastMeeting.summary.split('\n').filter(l => l.trim()).slice(0, 6).join('\n') : '（無摘要）'}
+              </div>
+              {lastMeeting.summary && lastMeeting.summary.split('\n').filter(l => l.trim()).length > 6 && (
+                <div style={{ fontSize: 12, color: C.textMut, marginTop: 6 }}>…前往「📚 日誌」查看完整內容</div>
+              )}
+            </div>
+          )}
+
+          {toast && (
+            <div style={{ position: 'fixed', bottom: 24, left: '50%', transform: 'translateX(-50%)', background: C.bgPanel, border: `1px solid ${C.border}`, borderRadius: 10, padding: '10px 20px', fontSize: 14, color: C.text, zIndex: 200, boxShadow: '0 8px 32px rgba(0,0,0,0.4)', animation: 'fadeIn 0.2s ease' }}>
+              {toast}
+            </div>
+          )}
+
+          <div className="grid-2col" style={{ display: 'grid', gridTemplateColumns: '2fr 3fr', gap: 20 }}>
+            <div style={S.panel} className="fade-in">
+              <div style={{ fontSize: 15, fontWeight: 600, marginBottom: 20 }}>✏️ 提交議程提案</div>
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
+                <div>
+                  <label style={S.label}>提案者姓名</label>
+                  <input style={S.input} placeholder="你的名字" value={form.author} onChange={e => setForm(f => ({ ...f, author: e.target.value }))} />
+                </div>
+                <div>
+                  <label style={S.label}>提案標題</label>
+                  <input style={S.input} placeholder="簡短描述議程主題" value={form.title} onChange={e => setForm(f => ({ ...f, title: e.target.value }))} />
+                </div>
+                <div>
+                  <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 6 }}>
+                    <label style={{ ...S.label, marginBottom: 0 }}>提案內容</label>
+                    {journal.length > 0 && (
+                      <button type="button" style={{ ...btn('ghost'), padding: '3px 9px', fontSize: 11, color: C.accent, borderColor: C.accent + '44' }} onClick={() => setShowJournalRef(true)}>
+                        📚 引用過去日誌
+                      </button>
+                    )}
+                  </div>
+                  <textarea ref={contentRef} style={{ ...S.input, minHeight: 130, resize: 'vertical' }} placeholder="詳細說明希望討論的問題..." value={form.content} onChange={e => setForm(f => ({ ...f, content: e.target.value }))} />
+                </div>
+
+                {/* 引用日誌 Modal */}
+                {showJournalRef && (
+                  <div style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.7)', zIndex: 500, display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 24 }} onClick={() => setShowJournalRef(false)}>
+                    <div style={{ background: C.bgPanel, border: `1px solid ${C.border}`, borderRadius: 12, width: '100%', maxWidth: 680, maxHeight: '85vh', display: 'flex', flexDirection: 'column', overflow: 'hidden' }} onClick={e => e.stopPropagation()}>
+                      <div style={{ padding: '14px 20px', borderBottom: `1px solid ${C.border}`, display: 'flex', alignItems: 'center', gap: 10, flexShrink: 0 }}>
+                        <span style={{ fontSize: 15, fontWeight: 600, flex: 1 }}>📚 選擇要引用的日誌段落</span>
+                        <button style={{ ...btn('ghost'), padding: '4px 10px', fontSize: 13 }} onClick={() => setShowJournalRef(false)}>✕</button>
+                      </div>
+                      <div style={{ overflow: 'auto', padding: '16px 20px', display: 'flex', flexDirection: 'column', gap: 14 }}>
+                        {[...journal].reverse().map((m, mi) => (
+                          <div key={m.id} style={{ ...S.card, padding: '14px 16px' }}>
+                            <div style={{ fontSize: 13, fontWeight: 600, color: C.accent, marginBottom: 10 }}>{m.date}</div>
+                            {m.summary && (
+                              <div style={{ marginBottom: 8 }}>
+                                <div style={{ fontSize: 11, color: C.textMut, marginBottom: 4 }}>AI 摘要</div>
+                                <div style={{ fontSize: 12, color: C.textSec, lineHeight: 1.7, whiteSpace: 'pre-wrap', maxHeight: 100, overflow: 'hidden', maskImage: 'linear-gradient(to bottom, black 60%, transparent)' }}>
+                                  {m.summary}
+                                </div>
+                                <button style={{ ...btn('default'), padding: '5px 12px', fontSize: 12, marginTop: 6 }}
+                                  onClick={() => {
+                                    const quote = `> **引用自 ${m.date} 會議摘要：**\n> ${m.summary.split('\n').filter(l=>l.trim()).slice(0,5).join('\n> ')}\n\n`;
+                                    setForm(f => ({ ...f, content: f.content + (f.content && !f.content.endsWith('\n') ? '\n\n' : '') + quote }));
+                                    setShowJournalRef(false);
+                                    showToast('✓ 已引用摘要');
+                                  }}>
+                                  引用摘要 →
+                                </button>
+                              </div>
+                            )}
+                            {m.proposals?.length > 0 && (
+                              <div style={{ marginTop: 8, paddingTop: 8, borderTop: `1px solid ${C.border}` }}>
+                                <div style={{ fontSize: 11, color: C.textMut, marginBottom: 6 }}>議程列表</div>
+                                {m.proposals.map((p, pi) => (
+                                  <div key={pi} style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 4 }}>
+                                    <span style={{ fontSize: 12, color: C.textSec, flex: 1 }}>• {p.title}（{p.author}）</span>
+                                    <button style={{ ...btn('ghost'), padding: '3px 8px', fontSize: 11 }}
+                                      onClick={() => {
+                                        const quote = `> **引用自 ${m.date} 議程：**\n> ${p.title}（${p.author}）\n> ${p.content || ''}\n\n`;
+                                        setForm(f => ({ ...f, content: f.content + (f.content && !f.content.endsWith('\n') ? '\n\n' : '') + quote }));
+                                        setShowJournalRef(false);
+                                        showToast('✓ 已引用議程');
+                                      }}>引用</button>
+                                  </div>
+                                ))}
+                              </div>
+                            )}
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  </div>
+                )}
+                <div>
+                  <label style={S.label}>附加簡報／文件（選填，可多選）</label>
+                  <input ref={attachRef} type="file" multiple accept={ACCEPT_FILES} style={{ display: 'none' }}
+                    onChange={e => setAttachFiles(f => [...f, ...Array.from(e.target.files)])} />
+                  <button type="button" style={{ ...btn('ghost'), padding: '7px 14px', fontSize: 13, marginBottom: attachFiles.length ? 8 : 0 }} onClick={() => attachRef.current.click()}>
+                    📎 選擇檔案
+                  </button>
+                  {attachFiles.length === 0 && <span style={{ fontSize: 12, color: C.textMut, marginLeft: 8 }}>PDF · Word · PowerPoint · Excel · Keynote</span>}
+                  {attachFiles.length > 0 && (
+                    <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+                      {attachFiles.map((f, i) => (
+                        <div key={i} style={{ display: 'flex', alignItems: 'center', gap: 6, background: C.bgCard, borderRadius: 6, padding: '4px 8px' }}>
+                          <span style={{ fontSize: 13, color: C.text, flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>📄 {f.name}</span>
+                          <button type="button" style={{ ...btn('ghost'), padding: '1px 6px', fontSize: 12, color: C.danger, borderColor: 'transparent', flexShrink: 0 }}
+                            onClick={() => setAttachFiles(a => a.filter((_, j) => j !== i))}>✕</button>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+                <button style={{ ...btn('primary'), width: '100%', padding: 13, fontSize: 15, opacity: (submitting || uploading) ? 0.65 : 1 }} onClick={submit} disabled={submitting || uploading}>
+                  {uploading ? <><Spinner /> 上傳檔案中…</> : submitting ? <><Spinner /> 送出中…</> : '送出提案'}
+                </button>
+              </div>
+              <div style={{ marginTop: 18, padding: '12px 14px', background: C.bgCard, borderRadius: 8, fontSize: 12, color: C.textSec, lineHeight: 1.7 }}>
+                💡 所有與會者使用同一個連結。提案送出後所有人即時可見。
+              </div>
+            </div>
+
+            <div style={S.panel} className="fade-in">
+              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 18 }}>
+                <div style={{ fontSize: 15, fontWeight: 600, display: 'flex', alignItems: 'center', gap: 10 }}>
+                  📋 議程提案 <span style={badge(C.accent)}>{proposals.length}</span>
+                </div>
+                <button style={{ ...btn('ghost'), padding: '6px 12px', fontSize: 13 }} onClick={loadProposals}>↻ 重整</button>
+              </div>
+              {proposals.length === 0 ? (
+                <div style={{ textAlign: 'center', padding: '48px 0', color: C.textMut }}>
+                  <div style={{ fontSize: 36, marginBottom: 12 }}>📭</div>
+                  <div style={{ fontSize: 14, color: C.textMut }}>準備室已開啟，等待大家上傳提案</div>
+                </div>
+              ) : (
+                <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+                  {proposals.map((p, i) => (
+                    <div key={p.id} style={S.card}>
+                      <div style={{ padding: '11px 14px', display: 'flex', alignItems: 'center', gap: 10, cursor: 'pointer' }} onClick={() => toggle(p.id)}>
+                        <span style={{ ...badge(C.accent), minWidth: 26, justifyContent: 'center', flexShrink: 0 }}>{i + 1}</span>
+                        <div style={{ flex: 1, minWidth: 0 }}>
+                          <div style={{ fontWeight: 500, fontSize: 14, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{p.title}</div>
+                          <div style={{ fontSize: 12, color: C.textSec, marginTop: 1 }}>{p.author}</div>
+                        </div>
+                        <div style={{ display: 'flex', alignItems: 'center', gap: 6, flexShrink: 0 }}>
+                          <span style={{ color: C.textMut, fontSize: 12 }}>{expanded[p.id] ? '▲' : '▼'}</span>
+                          <button style={{ ...btn('ghost'), padding: '3px 8px', fontSize: 13, color: C.danger, borderColor: 'transparent' }} onClick={e => { e.stopPropagation(); deleteProposal(p.id); }}>✕</button>
+                        </div>
+                      </div>
+                      {expanded[p.id] && (() => { const pFiles = parseFiles(p); return (
+                        <div style={{ padding: '0 14px 14px', borderTop: `1px solid ${C.border}` }}>
+                          <div style={{ paddingTop: 12, fontSize: 13, color: C.textSec, lineHeight: 1.8, whiteSpace: 'pre-wrap' }}>{p.content}</div>
+                          {pFiles.length > 0 && (
+                            <div style={{ display: 'flex', flexDirection: 'column', gap: 4, marginTop: 10 }}>
+                              {pFiles.map((f, fi) => (
+                                <div key={fi} style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                                  <a href={f.url} target="_blank" rel="noopener noreferrer" style={{ flex: 1, display: 'inline-flex', alignItems: 'center', gap: 6, padding: '5px 10px', background: C.accent + '18', border: `1px solid ${C.accent}44`, borderRadius: 7, fontSize: 12, color: C.accent, textDecoration: 'none', fontWeight: 500, minWidth: 0 }}>
+                                    <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>📎 {f.name}</span>
+                                  </a>
+                                  <button style={{ ...btn('ghost'), padding: '3px 7px', fontSize: 12, color: C.danger, borderColor: 'transparent', flexShrink: 0 }}
+                                    onClick={() => removeCardFile(p.id, fi, pFiles)}>✕</button>
+                                </div>
+                              ))}
+                            </div>
+                          )}
+                          <div style={{ marginTop: 8 }}>
+                            <input
+                              type="file" multiple accept={ACCEPT_FILES}
+                              style={{ display: 'none' }}
+                              ref={el => cardFileRefs.current[p.id] = el}
+                              onChange={e => { if (e.target.files.length) uploadCardFiles(p.id, e.target.files, pFiles); e.target.value = ''; }}
+                            />
+                            <button
+                              style={{ ...btn('ghost'), padding: '5px 11px', fontSize: 12, opacity: cardUploading[p.id] ? 0.6 : 1 }}
+                              onClick={() => cardFileRefs.current[p.id]?.click()}
+                              disabled={cardUploading[p.id]}
+                            >
+                              {cardUploading[p.id] ? <><Spinner /> 上傳中…</> : '📎 新增附件'}
+                            </button>
+                          </div>
+                        </div>
+                      ); })()}
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          </div>
+        </div>
+      );
+    }
+
+    // ─── MEETING ─────────────────────────────────────────────────────────────────
+    const FILE_TYPES = {
+      pdf:    { icon: '📕', label: '開啟',          viewer: 'direct' },
+      doc:    { icon: '📘', label: 'Word 開啟',     viewer: 'office' },
+      docx:   { icon: '📘', label: 'Word 開啟',     viewer: 'office' },
+      ppt:    { icon: '📙', label: 'PPT 開啟',      viewer: 'office' },
+      pptx:   { icon: '📙', label: 'PPT 開啟',      viewer: 'office' },
+      xls:    { icon: '📗', label: 'Excel 開啟',    viewer: 'office' },
+      xlsx:   { icon: '📗', label: 'Excel 開啟',    viewer: 'office' },
+      key:    { icon: '🎞️', label: 'Keynote 開啟',  viewer: 'google' },
+      pages:  { icon: '📄', label: 'Pages 開啟',    viewer: 'google' },
+      numbers:{ icon: '📊', label: 'Numbers 開啟',  viewer: 'google' },
+      md:     { icon: '📝', label: 'Markdown 預覽', viewer: 'markdown' },
+    };
+    const ACCEPT_FILES = '.pdf,.doc,.docx,.ppt,.pptx,.xls,.xlsx,.key,.pages,.numbers,.md';
+    const fileIcon  = (name) => FILE_TYPES[(name.split('.').pop()||'').toLowerCase()]?.icon  || '📎';
+    const fileLabel = (name) => FILE_TYPES[(name.split('.').pop()||'').toLowerCase()]?.label || '開啟';
+
+    // 統一檔案預覽 Modal（頁內 iframe，不跳分頁）
+    function FileViewerModal({ file, onClose, recState }) {
+      const { url, name } = file;
+      const ext = (name.split('.').pop() || '').toLowerCase();
+      const type = FILE_TYPES[ext];
+      const isMd = type?.viewer === 'markdown';
+      const isPdf = type?.viewer === 'direct';
+      const [mdContent, setMdContent] = useState('');
+      const [mdLoading, setMdLoading] = useState(isMd);
+      const [fontSize, setFontSize] = useState(15);
+      const [pdfZoom, setPdfZoom] = useState(100);
+
+      useEffect(() => {
+        if (!isMd) return;
+        fetch(url).then(r => r.text()).then(text => { setMdContent(text); setMdLoading(false); })
+          .catch(() => { setMdContent('無法載入檔案'); setMdLoading(false); });
+      }, [url]);
+
+      const iframeSrc = () => {
+        if (type?.viewer === 'office') return `https://view.officeapps.live.com/op/embed.aspx?src=${encodeURIComponent(url)}`;
+        if (type?.viewer === 'google') return `https://docs.google.com/viewer?url=${encodeURIComponent(url)}&embedded=true`;
+        if (isPdf) return `${url}#zoom=${pdfZoom}`;
+        return url;
+      };
+
+      const renderMd = (text) => {
+        if (typeof marked === 'undefined') return `<pre>${text}</pre>`;
+        const renderer = new marked.Renderer();
+        renderer.link = (href, title, text) => `<a href="${href}" target="_blank" rel="noopener noreferrer" title="${title||''}" style="color:#5b8dee;text-decoration:underline">${text}</a>`;
+        return marked.parse(text, { renderer, gfm: true, breaks: true });
+      };
+
+      const rec = recState;
+      const pad2 = n => String(n).padStart(2,'0');
+
+      return (
+        <div style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.85)', zIndex: 500, display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 20 }} onClick={onClose}>
+          <div style={{ background: C.bgPanel, border: `1px solid ${C.border}`, borderRadius: 12, width: '100%', maxWidth: isMd ? 780 : '95vw', height: isMd ? 'auto' : '90vh', maxHeight: '90vh', display: 'flex', flexDirection: 'column', overflow: 'hidden' }} onClick={e => e.stopPropagation()}>
+            {/* Header */}
+            <div style={{ padding: '10px 14px', borderBottom: `1px solid ${C.border}`, display: 'flex', alignItems: 'center', gap: 8, flexShrink: 0, flexWrap: 'wrap' }}>
+              <span style={{ fontSize: 13, fontWeight: 600, flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', minWidth: 0 }}>{fileIcon(name)} {name}</span>
+              {/* 錄音狀態 */}
+              {rec && (rec.isRecording ? (
+                <div style={{ display: 'flex', alignItems: 'center', gap: 6, background: C.dangerBg, border: `1px solid ${C.danger}`, borderRadius: 20, padding: '4px 10px', flexShrink: 0, animation: 'pulse 1.5s infinite' }}>
+                  <span style={{ width: 7, height: 7, borderRadius: '50%', background: C.danger, flexShrink: 0 }} />
+                  <span style={{ fontSize: 12, fontWeight: 700, color: C.danger, fontVariantNumeric: 'tabular-nums' }}>{pad2(Math.floor(rec.elapsed/60))}:{pad2(rec.elapsed%60)}</span>
+                  <button style={{ ...btn('danger'), padding: '2px 8px', fontSize: 11, borderRadius: 12 }} onClick={e => { e.stopPropagation(); rec.onStop?.(); }}>⏹</button>
+                </div>
+              ) : (
+                <div style={{ display: 'flex', alignItems: 'center', gap: 6, background: C.bgCard, border: `1px solid ${C.warn}66`, borderRadius: 20, padding: '4px 10px', flexShrink: 0 }}>
+                  <span style={{ fontSize: 11, color: C.warn }}>⚠ 未錄音</span>
+                  <button style={{ ...btn('primary'), padding: '2px 8px', fontSize: 11, borderRadius: 12 }} onClick={e => { e.stopPropagation(); rec.onStart?.(); }}>⏺</button>
+                </div>
+              ))}
+              {/* 字體大小（Markdown）或縮放（PDF） */}
+              {isMd && (
+                <div style={{ display: 'flex', alignItems: 'center', gap: 2, flexShrink: 0 }}>
+                  <button style={{ ...btn('ghost'), padding: '3px 8px', fontSize: 13 }} onClick={() => setFontSize(s => Math.max(11, s-1))}>A-</button>
+                  <span style={{ fontSize: 11, color: C.textSec, minWidth: 28, textAlign: 'center' }}>{fontSize}</span>
+                  <button style={{ ...btn('ghost'), padding: '3px 8px', fontSize: 13 }} onClick={() => setFontSize(s => Math.min(24, s+1))}>A+</button>
+                </div>
+              )}
+              {isPdf && (
+                <div style={{ display: 'flex', alignItems: 'center', gap: 2, flexShrink: 0 }}>
+                  <button style={{ ...btn('ghost'), padding: '3px 8px', fontSize: 13 }} onClick={() => setPdfZoom(z => Math.max(50, z-25))}>－</button>
+                  <span style={{ fontSize: 11, color: C.textSec, minWidth: 36, textAlign: 'center' }}>{pdfZoom}%</span>
+                  <button style={{ ...btn('ghost'), padding: '3px 8px', fontSize: 13 }} onClick={() => setPdfZoom(z => Math.min(200, z+25))}>＋</button>
+                </div>
+              )}
+              {(type?.viewer === 'office' || type?.viewer === 'google') && (
+                <span style={{ fontSize: 11, color: C.textMut, flexShrink: 0 }}>縮放請用文件內控制</span>
+              )}
+              <a href={url} target="_blank" rel="noopener noreferrer" style={{ ...btn('ghost'), padding: '4px 10px', fontSize: 12, color: C.textSec, textDecoration: 'none', flexShrink: 0 }}>↗</a>
+              <button style={{ ...btn('ghost'), padding: '4px 10px', fontSize: 13, flexShrink: 0 }} onClick={onClose}>✕</button>
+            </div>
+            {isMd ? (
+              <div style={{ overflow: 'auto', padding: '24px 32px', flex: 1, lineHeight: 1.85, fontSize: fontSize, color: C.text, maxHeight: '80vh' }}>
+                {mdLoading ? <div style={{ color: C.textSec }}><Spinner /> 載入中…</div> : (
+                  <div className="mk-md" dangerouslySetInnerHTML={{ __html: renderMd(mdContent) }} />
+                )}
+              </div>
+            ) : (
+              <iframe key={pdfZoom} src={iframeSrc()} style={{ flex: 1, border: 'none', width: '100%', minHeight: 0 }} allow="fullscreen" />
+            )}
+          </div>
+        </div>
+      );
+    }
+
+    function FileAttachments({ files, recState }) {
+      const [viewerFile, setViewerFile] = useState(null);
+      return (
+        <>
+          {viewerFile && <FileViewerModal file={viewerFile} onClose={() => setViewerFile(null)} recState={recState} />}
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+            {files.map((f, fi) => (
+              <button key={fi} onClick={() => setViewerFile(f)}
+                style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '9px 16px', background: C.accent + '22', border: `1px solid ${C.accent}55`, borderRadius: 8, fontSize: 14, color: C.accent, fontWeight: 600, cursor: 'pointer', width: '100%', textAlign: 'left', transition: 'opacity 0.15s' }}
+                onMouseEnter={e => e.currentTarget.style.opacity='0.8'} onMouseLeave={e => e.currentTarget.style.opacity='1'}>
+                <span>{fileIcon(f.name)}</span>
+                <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', flex: 1 }}>{f.name}</span>
+                <span style={{ fontSize: 11, color: C.accent + 'aa', flexShrink: 0 }}>預覽</span>
+              </button>
+            ))}
+          </div>
+        </>
+      );
+    }
+
+    const openFileUrl = (url, name) => {
+      const ext = (name.split('.').pop() || '').toLowerCase();
+      const type = FILE_TYPES[ext];
+      if (type?.viewer === 'office') { window.open(`https://view.officeapps.live.com/op/view.aspx?src=${encodeURIComponent(url)}`, '_blank'); return; }
+      if (type?.viewer === 'google')  { window.open(`https://docs.google.com/viewer?url=${encodeURIComponent(url)}`, '_blank'); return; }
+      window.open(url, '_blank');
+    };
+
+    function Meeting({ proposals, setProposals, projectId, onGoHome, setPhase, briefing }) {
+      const [activeId, setActiveId] = useState(null);
+      const [expanded, setExpanded] = useState({});
+      const [briefingOpen, setBriefingOpen] = useState(false);
+      const [cardUploading, setCardUploading] = useState({});
+      const cardFileRefs = useRef({});
+
+      // 錄音確認狀態機：unconfirmed / in_progress / pending_pause_confirm / paused / ended
+      const [recordingState, setRecordingState] = useState('unconfirmed');
+      const [recordingStartedAt, setRecordingStartedAt] = useState(null);
+      const [recordingEndedAt, setRecordingEndedAt] = useState(null);
+
+      // 分段錄音（純前端，重新整理會掉 — 階段 B 再持久化到 Supabase）
+      // 格式：[{ startedAt: Date, endedAt: Date, durationSeconds: number }, ...]
+      const [segments, setSegments] = useState([]);
+      const [currentSegmentStart, setCurrentSegmentStart] = useState(null);
+      const [totalEndedSeconds, setTotalEndedSeconds] = useState(0);
+      // 歷史段落累積秒數（傳給計時器用）
+      const accumulatedSeconds = segments.reduce((sum, s) => sum + s.durationSeconds, 0);
+
+      const parseFiles = (p) => {
+        try { const u = JSON.parse(p.file_url||'[]'); const n = JSON.parse(p.file_name||'[]'); if (Array.isArray(u)) return u.map((url,i)=>({url,name:n[i]||url.split('/').pop()})); } catch {}
+        return p.file_url ? [{url:p.file_url,name:p.file_name||'查看附件'}] : [];
+      };
+
+      const uploadCardFiles = async (proposalId, files, existingFiles) => {
+        setCardUploading(s => ({ ...s, [proposalId]: true }));
+        try {
+          const results = await Promise.all(Array.from(files).map(async (file) => {
+            const ext = file.name.includes('.') ? file.name.split('.').pop().replace(/[^a-zA-Z0-9]/g, '') : 'bin';
+            const path = `${projectId}/${Date.now()}_${Math.random().toString(36).slice(2,8)}.${ext}`;
+            const res = await fetch(`${SB_URL}/storage/v1/object/presentations/${path}`, {
+              method: 'POST', headers: { apikey: SB_KEY, Authorization: `Bearer ${SB_KEY}`, 'Content-Type': file.type || 'application/octet-stream' }, body: file,
+            });
+            return res.ok ? { url: `${SB_URL}/storage/v1/object/public/presentations/${path}`, name: file.name } : null;
+          }));
+          const newFiles = results.filter(Boolean);
+          if (newFiles.length > 0) {
+            const merged = [...existingFiles, ...newFiles];
+            await db(`proposals?id=eq.${proposalId}`, { method: 'PATCH', body: JSON.stringify({ file_url: JSON.stringify(merged.map(f=>f.url)), file_name: JSON.stringify(merged.map(f=>f.name)) }) });
+            const res = await db(`proposals?select=*&project_id=eq.${projectId}&order=id.asc`);
+            if (res.ok) setProposals(await res.json());
+          }
+        } catch {}
+        setCardUploading(s => ({ ...s, [proposalId]: false }));
+      };
+
+      // 進入會議時刷新提案（確保附件資料最新）
+      useEffect(() => {
+        if (!projectId) return;
+        const load = async () => {
+          const res = await db(`proposals?select=*&project_id=eq.${projectId}&order=id.asc`);
+          if (res.ok) setProposals(await res.json());
+        };
+        load();
+        const t = setInterval(load, 8000);
+        return () => clearInterval(t);
+      }, [projectId]);
+
+      // 進入會議時讀取錄音狀態，處理中途離開的恢復邏輯
+      useEffect(() => {
+        if (!projectId) return;
+        const checkRecordingState = async () => {
+          try {
+            const res = await db(
+              `projects?id=eq.${projectId}&select=recording_confirmed,recording_started_at,recording_ended_at,duration_seconds`
+            );
+            if (!res.ok) return;
+            const [project] = await res.json();
+            if (!project) return;
+
+            if (project.recording_ended_at) {
+              // 會議已結束：恢復結束狀態，含累積時長
+              setRecordingState('ended');
+              setRecordingStartedAt(new Date(project.recording_started_at));
+              setRecordingEndedAt(new Date(project.recording_ended_at));
+              setTotalEndedSeconds(project.duration_seconds || 0);
+            } else if (project.recording_confirmed && !project.recording_ended_at) {
+              // 中途離開：靜默重置為未確認
+              await db(`projects?id=eq.${projectId}`, {
+                method: 'PATCH',
+                body: JSON.stringify({
+                  recording_confirmed: false,
+                  recording_started_at: null,
+                }),
+              });
+              setRecordingState('unconfirmed');
+            } else {
+              // 全新狀態
+              setRecordingState('unconfirmed');
+            }
+          } catch {
+            // 讀取失敗不影響使用，維持預設 unconfirmed
+          }
+        };
+        checkRecordingState();
+      }, [projectId]);
+
+      // ─── 錄音狀態機函式（五狀態：unconfirmed → in_progress → pending_pause_confirm → paused → ended）
+
+      // 第一段開始：只在 segments.length === 0 時寫 Supabase（後續各段不再重複寫）
+      const confirmRecording = async () => {
+        const now = new Date();
+        try {
+          if (segments.length === 0) {
+            // 第一段：寫入 Supabase
+            const res = await db(`projects?id=eq.${projectId}`, {
+              method: 'PATCH',
+              body: JSON.stringify({
+                recording_confirmed: true,
+                recording_started_at: now.toISOString(),
+              }),
+            });
+            if (!res.ok) {
+              const err = await res.json().catch(() => ({}));
+              throw new Error(err.message || `HTTP ${res.status}`);
+            }
+            setRecordingStartedAt(now);
+          }
+          // 開始計這一段
+          setCurrentSegmentStart(now);
+          setRecordingState('in_progress');
+        } catch (err) {
+          alert('無法開始會議，請重試。\n(' + err.message + ')');
+        }
+      };
+
+      // 使用者按「結束這段」→ 進入確認 Modal（讓使用者先去 iPhone 按停止）
+      const requestPause = () => {
+        setRecordingState('pending_pause_confirm');
+      };
+
+      // Modal 確認「已關閉錄音」→ 記錄這段，進入 paused
+      const confirmPause = () => {
+        const now = new Date();
+        if (currentSegmentStart) {
+          const durationSeconds = Math.floor((now.getTime() - currentSegmentStart.getTime()) / 1000);
+          setSegments(prev => [...prev, { startedAt: currentSegmentStart, endedAt: now, durationSeconds }]);
+        }
+        setCurrentSegmentStart(null);
+        setRecordingState('paused');
+      };
+
+      // 暫停狀態按「繼續開新一段」→ 開新的 currentSegmentStart，回到 in_progress
+      const continueRecording = () => {
+        const now = new Date();
+        setCurrentSegmentStart(now);
+        setRecordingState('in_progress');
+      };
+
+      // 整場會議完全結束：把所有段的時長加總寫回 Supabase
+      const endMeetingForReal = async () => {
+        const now = new Date();
+        // 加總目前已結束的段（segments 是確認暫停後才累積，paused 狀態下 currentSegmentStart 已為 null）
+        const totalSec = segments.reduce((sum, s) => sum + s.durationSeconds, 0);
+        try {
+          const res = await db(`projects?id=eq.${projectId}`, {
+            method: 'PATCH',
+            body: JSON.stringify({
+              recording_ended_at: now.toISOString(),
+              duration_seconds: totalSec,
+            }),
+          });
+          if (!res.ok) {
+            const err = await res.json().catch(() => ({}));
+            throw new Error(err.message || `HTTP ${res.status}`);
+          }
+          // 寫入成功：更新前端狀態（不自動跳頁，由使用者按按鈕決定）
+          setRecordingEndedAt(now);
+          setTotalEndedSeconds(totalSec);
+          setRecordingState('ended');
+        } catch (err) {
+          alert('無法結束會議，請重試。\n(' + err.message + ')');
+        }
+      };
+
+      const cancelMeeting = () => {
+        if (confirm('確定要取消這場會議？已填的提案會保留。')) {
+          onGoHome();
+        }
+      };
+
+      const toggleActive = (id) => {
+        // 只有 ended 狀態才凍結；in_progress / paused / pending_pause_confirm 都允許標記議程
+        if (recordingState === 'ended') return;
+        setActiveId(prev => prev === id ? null : id);
+        setExpanded(e => ({ ...e, [id]: !e[id] }));
+      };
+
+      return (
+        <>
+          <div style={{ maxWidth: 1100, margin: '0 auto', padding: '28px 20px' }}>
+          {briefing && (
+            <div style={{ ...S.panel, marginBottom: 20, borderLeft: `3px solid ${C.accent}` }} className="fade-in">
+              <div style={{ display: 'flex', alignItems: 'center', gap: 10, cursor: 'pointer' }} onClick={() => setBriefingOpen(v => !v)}>
+                <span style={{ fontSize: 13, fontWeight: 700, color: C.accent, flex: 1 }}>📌 上次會議前情提要</span>
+                <span style={{ fontSize: 11, color: C.textMut }}>（點擊{briefingOpen ? '收起' : '展開'}）</span>
+                <span style={{ color: C.textMut, fontSize: 12 }}>{briefingOpen ? '▲' : '▼'}</span>
+              </div>
+              {briefingOpen && (
+                <div className="mk-md" style={{ fontSize: 13, lineHeight: 1.85, color: C.textSec, marginTop: 14 }}
+                  dangerouslySetInnerHTML={{ __html: (() => {
+                    if (typeof marked === 'undefined') return `<pre>${briefing}</pre>`;
+                    const r = new marked.Renderer();
+                    r.link = (href, title, text) => `<a href="${href}" target="_blank" rel="noopener noreferrer" style="color:#5b8dee">${text}</a>`;
+                    return marked.parse(briefing, { renderer: r, gfm: true, breaks: true });
+                  })()} }
+                />
+              )}
+            </div>
+          )}
+          <div className="grid-3-2" style={{ display: 'grid', gridTemplateColumns: '3fr 2fr', gap: 20 }}>
+            <div style={S.panel} className="fade-in">
+              <div style={{ fontSize: 15, fontWeight: 600, marginBottom: 18, display: 'flex', alignItems: 'center', gap: 10 }}>
+                📋 議程 <span style={badge(C.accent)}>{proposals.length}</span>
+                {activeId && <span style={badge(C.success, C.successBg)}>● 主持中</span>}
+              </div>
+              {proposals.length === 0 ? (
+                <div style={{ textAlign: 'center', padding: '56px 0', color: C.textMut, fontSize: 14 }}>請先在「會前提案」收集議程</div>
+              ) : (
+                <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+                  {proposals.map((p, i) => {
+                    const active = activeId === p.id;
+                    return (
+                      <div key={p.id} style={{ ...S.card, border: `1px solid ${active ? C.accent : C.border}`, boxShadow: active ? `0 0 0 2px ${C.accent}22` : 'none', transition: 'all 0.2s' }}>
+                        <div style={{ padding: '12px 14px', display: 'flex', alignItems: 'center', gap: 10, cursor: 'pointer' }} onClick={() => toggleActive(p.id)}>
+                          <span style={{ ...badge(active ? '#fff' : C.accent, active ? C.accent : C.accent + '22'), minWidth: 26, justifyContent: 'center', flexShrink: 0 }}>{i + 1}</span>
+                          <div style={{ flex: 1, minWidth: 0 }}>
+                            <div style={{ fontWeight: 500, fontSize: 14, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{p.title}</div>
+                            <div style={{ fontSize: 12, color: C.textSec, marginTop: 1 }}>{p.author}</div>
+                          </div>
+                          <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexShrink: 0 }}>
+                            {active && <span style={badge(C.success, C.successBg)}>● 討論中</span>}
+                            <span style={{ color: C.textMut, fontSize: 12 }}>{expanded[p.id] ? '▲' : '▼'}</span>
+                          </div>
+                        </div>
+                        {expanded[p.id] && (() => {
+                          const mFiles = parseFiles(p);
+                          return (
+                          <div style={{ padding: '0 14px 14px', borderTop: `1px solid ${C.border}` }}>
+                            <div style={{ paddingTop: 12, fontSize: 13, color: C.textSec, lineHeight: 1.8, whiteSpace: 'pre-wrap' }}>{p.content}</div>
+                            {mFiles.length > 0 ? (
+                              <div style={{ marginTop: 12 }}>
+                                <div style={{ fontSize: 11, color: C.textMut, letterSpacing: '0.04em', fontWeight: 600, marginBottom: 6 }}>簡報 / 文件</div>
+                                <FileAttachments files={mFiles} recState={null} />
+                              </div>
+                            ) : (
+                              <div style={{ marginTop: 10, fontSize: 12, color: C.textMut }}>（無附件）</div>
+                            )}
+                          </div>
+                        ); })()}
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
+            </div>
+
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
+              {recordingState === 'in_progress' && (
+                <MeetingTimer
+                  accumulatedSeconds={accumulatedSeconds}
+                  currentSegmentStart={currentSegmentStart}
+                  onRequestPause={requestPause}
+                />
+              )}
+              {recordingState === 'paused' && (
+                <PausedPanel
+                  accumulatedSeconds={accumulatedSeconds}
+                  segmentCount={segments.length}
+                  onContinue={continueRecording}
+                  onEndForReal={endMeetingForReal}
+                />
+              )}
+              {recordingState === 'ended' && (
+                <div style={S.panel} className="fade-in">
+                  <div style={{ fontSize: 15, fontWeight: 600, marginBottom: 20 }}>✅ 會議已結束</div>
+                  <div style={{ textAlign: 'center', padding: '16px 0' }}>
+                    {(() => {
+                      const total = totalEndedSeconds;
+                      const h = Math.floor(total / 3600);
+                      const m2 = Math.floor((total % 3600) / 60);
+                      const s2 = total % 60;
+                      const pad = n => String(n).padStart(2, '0');
+                      return (
+                        <>
+                          <div style={{ fontSize: 13, color: C.textSec, marginBottom: 8 }}>總會議時長</div>
+                          <div style={{ fontSize: 32, fontWeight: 700, color: C.success, marginBottom: 24, fontVariantNumeric: 'tabular-nums' }}>
+                            {pad(h)}:{pad(m2)}:{pad(s2)}
+                          </div>
+                        </>
+                      );
+                    })()}
+                    <button
+                      style={{ ...btn('primary'), width: '100%', padding: 13, fontSize: 14 }}
+                      onClick={() => setPhase(2)}
+                    >
+                      前往會後整理 →
+                    </button>
+                  </div>
+                </div>
+              )}
+              {(recordingState === 'unconfirmed' || recordingState === 'paused') && (
+                <div style={{ ...S.card, padding: '12px 14px', fontSize: 13, color: C.textSec, background: C.textSec + '11', borderColor: C.textSec + '33', lineHeight: 1.7 }}>
+                  💡 點選左側議程可標記目前討論中的項目。
+                </div>
+              )}
+            </div>
+          </div>
+          </div>
+          {recordingState === 'unconfirmed' && (
+            <RecordingConfirmModal onConfirm={confirmRecording} onCancel={cancelMeeting} />
+          )}
+          {recordingState === 'pending_pause_confirm' && (
+            <PauseConfirmModal
+              currentSegmentStart={currentSegmentStart}
+              onConfirm={confirmPause}
+            />
+          )}
+        </>
+      );
+    }
+
+    // ─── BLOCKING MODAL (通用攔截 Modal) ─────────────────────────────────────────
+    // 未來任何頁面需要「阻擋使用者互動直到完成某個動作」都可以重用
+    // ─────────────────────────────────────────────────────────────────────────────
+
+    function BlockingModal({ show, children }) {
+      if (!show) return null;
+      return (
+        <div style={{
+          position: 'fixed', inset: 0, zIndex: 1000,
+          display: 'flex', alignItems: 'center', justifyContent: 'center',
+          animation: 'fadeIn 0.3s ease',
+        }}>
+          <div style={{
+            position: 'absolute', inset: 0,
+            background: '#DC2626', opacity: 0.45, mixBlendMode: 'multiply',
+          }} />
+          <div style={{ position: 'relative', zIndex: 10 }}>
+            {children}
+          </div>
+        </div>
+      );
+    }
+
+    // ─── RECORDING CONFIRM MODAL (會議錄音確認) ───────────────────────────────────
+
+    function RecordingConfirmModal({ onConfirm, onCancel }) {
+      return (
+        <BlockingModal show={true}>
+          <div style={{
+            background: C.bgCard, border: `1px solid ${C.border}`,
+            borderRadius: 12, padding: '32px 36px', maxWidth: 440,
+            boxShadow: '0 20px 60px rgba(0,0,0,0.5)',
+          }}>
+            <div style={{ fontSize: 22, fontWeight: 700, marginBottom: 16, textAlign: 'center' }}>
+              🎙 會議錄音
+            </div>
+            <div style={{ fontSize: 15, lineHeight: 1.8, color: C.textSec, marginBottom: 24, textAlign: 'center' }}>
+              📱 請打開 iPhone「語音備忘錄」開始錄音<br />
+              <span style={{ fontSize: 12, color: C.textMut }}>（會議結束後回到這裡上傳錄音檔）</span>
+            </div>
+            <button
+              style={{ ...btn('primary'), width: '100%', padding: 14, fontSize: 15 }}
+              onClick={onConfirm}
+            >
+              ✓ 已確認開始錄音
+            </button>
+            <div style={{ textAlign: 'center', marginTop: 16 }}>
+              <a
+                onClick={onCancel}
+                style={{ fontSize: 12, color: C.textMut, textDecoration: 'underline', cursor: 'pointer' }}
+              >
+                ← 取消，不開這場會議
+              </a>
+            </div>
+          </div>
+        </BlockingModal>
+      );
+    }
+
+    // ─── MEETING TIMER (純計時器，不錄音) ────────────────────────────────────────
+
+    // MeetingTimer：顯示「歷史段落累積 + 目前這段」的總時間
+    // accumulatedSeconds：前幾段的秒數加總
+    // currentSegmentStart：這一段的開始時間（Date）
+    // onRequestPause：使用者按「結束這段」時觸發，進入 pending_pause_confirm
+    function MeetingTimer({ accumulatedSeconds, currentSegmentStart, onRequestPause }) {
+      const [currentSec, setCurrentSec] = useState(0);
+      useEffect(() => {
+        const tick = () => setCurrentSec(Math.floor((Date.now() - currentSegmentStart.getTime()) / 1000));
+        tick();
+        const id = setInterval(tick, 1000);
+        return () => clearInterval(id);
+      }, [currentSegmentStart]);
+
+      // 總時間 = 歷史累積 + 本段已過秒數
+      const total = accumulatedSeconds + currentSec;
+      const h = Math.floor(total / 3600);
+      const m = Math.floor((total % 3600) / 60);
+      const s = total % 60;
+      const pad = n => String(n).padStart(2, '0');
+
+      return (
+        <div style={S.panel} className="fade-in">
+          <div style={{ fontSize: 15, fontWeight: 600, marginBottom: 20 }}>⏱ 會議進行中</div>
+          <div style={{ textAlign: 'center', padding: '16px 0' }}>
+            <div style={{
+              fontSize: 42, fontWeight: 700, color: C.accent, marginBottom: 24,
+              fontVariantNumeric: 'tabular-nums', letterSpacing: '0.05em',
+            }}>
+              {pad(h)}:{pad(m)}:{pad(s)}
+            </div>
+            <div style={{ color: C.textSec, fontSize: 13, marginBottom: 20 }}>
+              記得 iPhone 繼續錄音中
+            </div>
+            <button
+              style={{ ...btn('danger'), width: '100%', padding: 13, fontSize: 15 }}
+              onClick={onRequestPause}
+            >
+              ⏹ 結束這段
+            </button>
+          </div>
+        </div>
+      );
+    }
+
+    // ─── PAUSE CONFIRM MODAL (確認 iPhone 已停止錄音 — 暫停這段) ─────────────────
+    // 每段結束時的對稱防呆：確保使用者去 iPhone 按停止錄音，再進入 paused 狀態
+    // 綠色覆蓋層，對稱於開會前的紅色 RecordingConfirmModal
+    // ─────────────────────────────────────────────────────────────────────────────
+
+    function PauseConfirmModal({ currentSegmentStart, onConfirm }) {
+      // 計算這段已過多少秒（快照，不即時更新）
+      const segmentSec = Math.floor((Date.now() - currentSegmentStart.getTime()) / 1000);
+      const h = Math.floor(segmentSec / 3600);
+      const m = Math.floor((segmentSec % 3600) / 60);
+      const s = segmentSec % 60;
+      const pad = n => String(n).padStart(2, '0');
+
+      const handleNotYet = () => {
+        alert('請打開 iPhone 的「語音備忘錄」按下停止錄音，完成後回到這裡按「✓ 已關閉錄音」');
+      };
+
+      return (
+        <div style={{
+          position: 'fixed', inset: 0, zIndex: 1000,
+          display: 'flex', alignItems: 'center', justifyContent: 'center',
+          animation: 'fadeIn 0.3s ease',
+        }}>
+          <div style={{
+            position: 'absolute', inset: 0,
+            background: '#22C55E', opacity: 0.45, mixBlendMode: 'multiply',
+          }} />
+          <div style={{
+            position: 'relative', zIndex: 10,
+            background: C.bgCard, border: `1px solid ${C.border}`,
+            borderRadius: 12, padding: '32px 36px', maxWidth: 460,
+            boxShadow: '0 20px 60px rgba(0,0,0,0.5)',
+          }}>
+            <div style={{ fontSize: 22, fontWeight: 700, marginBottom: 16, textAlign: 'center' }}>
+              ⏸ 這段結束
+            </div>
+            <div style={{ fontSize: 13, color: C.textMut, marginBottom: 6, textAlign: 'center' }}>
+              這段時長
+            </div>
+            <div style={{
+              fontSize: 32, fontWeight: 700, color: C.success,
+              marginBottom: 24, textAlign: 'center', fontVariantNumeric: 'tabular-nums',
+            }}>
+              {pad(h)}:{pad(m)}:{pad(s)}
+            </div>
+            <div style={{ fontSize: 15, lineHeight: 1.8, color: C.textSec, marginBottom: 12, textAlign: 'center' }}>
+              📱 請打開 iPhone「語音備忘錄」<br />
+              按下停止錄音
+            </div>
+            <div style={{ fontSize: 12, color: C.textMut, textAlign: 'center', marginBottom: 20, lineHeight: 1.6 }}>
+              會議完全結束了嗎？還是只是暫停？<br />
+              稍後可以續開新一段
+            </div>
+            <div style={{
+              fontSize: 12, color: C.textMut, lineHeight: 1.6, marginBottom: 24,
+              padding: '10px 14px', background: C.dangerBg, borderRadius: 6,
+              border: `1px solid ${C.danger}33`,
+            }}>
+              ⚠️ 沒關掉的話，這段音檔會多很多空白
+            </div>
+            <button
+              style={{ ...btn('primary'), width: '100%', padding: 14, fontSize: 15 }}
+              onClick={onConfirm}
+            >
+              ✓ 已關閉錄音
+            </button>
+            <div style={{ textAlign: 'center', marginTop: 16 }}>
+              <a
+                onClick={handleNotYet}
+                style={{ fontSize: 12, color: C.textMut, textDecoration: 'underline', cursor: 'pointer' }}
+              >
+                ← 還沒，讓我去按一下
+              </a>
+            </div>
+          </div>
+        </div>
+      );
+    }
+
+    // ─── PAUSED PANEL (暫停狀態的右側面板) ────────────────────────────────────
+    // 顯示在 paused 狀態，讓使用者選擇「續開新一段」或「整場會議完全結束」
+    // ─────────────────────────────────────────────────────────────────────────────
+
+    function PausedPanel({ accumulatedSeconds, segmentCount, onContinue, onEndForReal }) {
+      const h = Math.floor(accumulatedSeconds / 3600);
+      const m = Math.floor((accumulatedSeconds % 3600) / 60);
+      const s = accumulatedSeconds % 60;
+      const pad = n => String(n).padStart(2, '0');
+
+      return (
+        <div style={S.panel} className="fade-in">
+          <div style={{ fontSize: 15, fontWeight: 600, marginBottom: 20 }}>⏸ 已暫停</div>
+          <div style={{ textAlign: 'center', padding: '8px 0 16px' }}>
+            <div style={{ fontSize: 12, color: C.textMut, marginBottom: 4 }}>
+              已累積（{segmentCount} 段）
+            </div>
+            <div style={{
+              fontSize: 36, fontWeight: 700, color: C.textSec,
+              marginBottom: 24, fontVariantNumeric: 'tabular-nums', letterSpacing: '0.05em',
+            }}>
+              {pad(h)}:{pad(m)}:{pad(s)}
+            </div>
+            <button
+              style={{ ...btn('primary'), width: '100%', padding: 13, fontSize: 14, marginBottom: 10 }}
+              onClick={onContinue}
+            >
+              ↻ 繼續開新一段
+            </button>
+            <button
+              style={{ ...btn('ghost'), width: '100%', padding: 11, fontSize: 13 }}
+              onClick={onEndForReal}
+            >
+              ✅ 整場會議完全結束
+            </button>
+          </div>
+          <div style={{
+            fontSize: 11, color: C.textMut, lineHeight: 1.6, marginTop: 4,
+            padding: '10px 12px', background: C.textSec + '08',
+            borderRadius: 6, border: `1px solid ${C.border}`,
+          }}>
+            💡 如果還有事情要討論，點「繼續開新一段」可以開新的錄音段。會後上傳時記得上傳所有段的音檔（系統會依檔案建立時間自動排序）。
+          </div>
+        </div>
+      );
+    }
+
+    // ─── POST-MEETING ────────────────────────────────────────────────────────────
+    function PostMeeting({ proposals, audioBlob, onSaveJournal, projectId, projectTitle }) {
+      const [openaiKey,    setOpenaiKey]    = useState(() => localStorage.getItem('mk_openai_key') || '');
+      const [anthropicKey, setAnthropicKey] = useState(() => localStorage.getItem('mk_anthropic_key') || '');
+      const [uploadFile,   setUploadFile]   = useState(null);
+      const [status,       setStatus]       = useState('idle');
+      const [transcript,   setTranscript]   = useState('');
+      const [summary,      setSummary]      = useState('');
+      const [errMsg,       setErrMsg]       = useState('');
+      const [whisperInfo,  setWhisperInfo]  = useState(null);
+      const [archiving,    setArchiving]    = useState(false);
+      const [archiveSteps, setArchiveSteps] = useState([]);
+      const fileRef = useRef();
+      const audioSrc = uploadFile || audioBlob;
+
+      const getAudioDuration = (blob) => new Promise(resolve => {
+        const a = new Audio(); a.src = URL.createObjectURL(blob);
+        a.onloadedmetadata = () => { URL.revokeObjectURL(a.src); resolve(a.duration || 0); };
+        a.onerror = () => resolve(0);
+      });
+
+      const run = async () => {
+        if (!openaiKey.trim()) { setErrMsg('請輸入 OpenAI API Key'); return; }
+        if (!audioSrc) { setErrMsg('請先錄音或上傳音檔'); return; }
+        setErrMsg(''); setStatus('transcribing');
+        let txText = '';
+        try {
+          const fd = new FormData();
+          fd.append('file', audioSrc, uploadFile?.name || 'recording.webm');
+          fd.append('model', 'whisper-1'); fd.append('language', 'zh');
+          const res = await fetch('https://api.openai.com/v1/audio/transcriptions', { method: 'POST', headers: { Authorization: `Bearer ${openaiKey.trim()}` }, body: fd });
+          if (!res.ok) { const e = await res.json(); throw new Error(e.error?.message || `HTTP ${res.status}`); }
+          txText = (await res.json()).text; setTranscript(txText);
+          const dur = await getAudioDuration(audioSrc);
+          const mins = Math.ceil(dur / 60) || 1;
+          setWhisperInfo({ mins, cost: (mins * 0.006).toFixed(3) });
+        } catch (e) { setErrMsg('語音轉文字失敗：' + e.message); setStatus('error'); return; }
+
+        setStatus('summarizing');
+        // 抽取每個提案的附件文字
+        const proposalsWithText = await Promise.all(proposals.map(async (p) => {
+          let attachText = '';
+          try {
+            const urls = JSON.parse(p.file_url || '[]');
+            const names = JSON.parse(p.file_name || '[]');
+            const texts = await Promise.all(urls.map((url, i) => extractFileText(url, names[i] || url)));
+            attachText = texts.filter(Boolean).join('\n');
+          } catch {}
+          return { ...p, attachText };
+        }));
+        const agendaDetail = proposalsWithText.length
+          ? proposalsWithText.map((p, i) => {
+              const base = `${i + 1}. 【${p.title}】提案人：${p.author}\n   ${p.content || '（無提案說明）'}`;
+              return p.attachText ? `${base}\n\n   【附件內容摘錄】\n${p.attachText.slice(0, 3000)}` : base;
+            }).join('\n\n')
+          : '（無提案議程）';
+        const prompt = `你是一位專業的會議記錄與策略分析師。以下是一場會議的完整逐字稿與議程提案，請用繁體中文產出一份結構完整的會後文件。
+
+━━━ 本次議程提案 ━━━
+${agendaDetail}
+
+━━━ 會議逐字稿 ━━━
+${txText}
+
+━━━ 請依照以下格式輸出 ━━━
+
+# 📋 各提案分析
+
+（針對每一個提案，依下列結構整理）
+
+## 提案 N：{提案標題}（{提案人}）
+
+### 核心想法
+（一段話說明提案人的核心主張）
+
+### 會議 Findings
+- **支持點：** （與會者認同的觀點、正面回饋）
+- **疑慮與挑戰：** （提出的問題、擔憂、障礙）
+
+### 可行性評估
+- **執行面：** （技術、流程、人力的可行度）
+- **資源需求：** （時間、預算、工具）
+- **風險：** （潛在風險與不確定因素）
+
+### 結論
+（本次討論的共識或未解決的分歧）
+
+---
+
+# ✅ 待辦事項清單
+
+（整合會議中、會議後提出的所有待辦，含會議討論中臨時提出的項目）
+
+| 事項 | 負責人 | 建議完成時間 | 優先度 |
+|------|--------|------------|--------|
+（用表格列出，優先度分：🔴 緊急 / 🟡 本週 / 🟢 下週前）
+
+---
+
+# 📌 下次會議前情提要
+
+## 背景摘要
+（給未出席者或下次會議開場用的 2-3 段精簡說明，讓所有人快速進入狀況）
+
+## 尚待確認的問題
+（列出本次未解決、需要在下次會議前釐清的關鍵問題）
+
+## 建議各方提前準備
+（針對各提案負責人，建議下次會議前應準備的資料或評估）
+
+---
+
+# 💡 AI 綜合建議
+
+（根據整體會議內容，提出 3-5 點具體可行的策略建議，包含優先順序推薦與注意事項）`;
+        try {
+          let summaryText = '';
+          if (anthropicKey.trim()) {
+            const res = await fetch('https://api.anthropic.com/v1/messages', { method: 'POST', headers: { 'x-api-key': anthropicKey.trim(), 'anthropic-version': '2023-06-01', 'anthropic-dangerous-request-allow-browsers': 'true', 'Content-Type': 'application/json' }, body: JSON.stringify({ model: 'claude-sonnet-4-6', max_tokens: 4096, messages: [{ role: 'user', content: prompt }] }) });
+            if (!res.ok) { const e = await res.json(); throw new Error(e.error?.message || `HTTP ${res.status}`); }
+            summaryText = (await res.json()).content[0].text;
+          } else {
+            const res = await fetch('https://api.openai.com/v1/chat/completions', { method: 'POST', headers: { Authorization: `Bearer ${openaiKey.trim()}`, 'Content-Type': 'application/json' }, body: JSON.stringify({ model: 'gpt-4o', messages: [{ role: 'user', content: prompt }] }) });
+            if (!res.ok) { const e = await res.json(); throw new Error(e.error?.message || `HTTP ${res.status}`); }
+            summaryText = (await res.json()).choices[0].message.content;
+          }
+          setSummary(summaryText);
+          // 自動存前情提要到 Supabase
+          if (projectId) {
+            const date = new Date().toLocaleDateString('zh-TW', { year: 'numeric', month: 'long', day: 'numeric' });
+            const briefingMd = `> 📌 上次會議前情提要（${date}）\n\n${summaryText}`;
+            db(`projects?id=eq.${projectId}`, { method: 'PATCH', body: JSON.stringify({ briefing: briefingMd }) }).catch(() => {});
+          }
+        } catch (e) { setErrMsg('AI 摘要失敗：' + e.message); setStatus('error'); return; }
+        setStatus('done');
+      };
+
+      const exportMd = () => {
+        const date = new Date().toLocaleDateString('zh-TW', { year: 'numeric', month: 'long', day: 'numeric' });
+        const agendaSec = proposals.length ? proposals.map((p, i) => `### ${i + 1}. ${p.title}\n**提案者：** ${p.author}\n\n${p.content}`).join('\n\n---\n\n') : '（無提案）';
+        const md = `# 會議紀錄\n\n**日期：** ${date}\n\n---\n\n## 📋 議程提案\n\n${agendaSec}\n\n---\n\n## 🎙️ 會議逐字稿\n\n${transcript}\n\n---\n\n## 📝 AI 摘要整理\n\n${summary}\n`;
+        const a = document.createElement('a');
+        a.href = URL.createObjectURL(new Blob([md], { type: 'text/markdown; charset=utf-8' }));
+        a.download = `meetkit-${new Date().toISOString().slice(0,10)}.md`; a.click();
+      };
+
+      const running = status === 'transcribing' || status === 'summarizing';
+
+      const handleArchive = async () => {
+        setArchiving(true);
+        setArchiveSteps([]);
+        const steps = [
+          { msg: '💾 儲存日誌中…',    delay: 0 },
+          { msg: '📌 更新前情提要…',  delay: 900 },
+          { msg: '✅ 完成！前往日誌', delay: 1800 },
+        ];
+        steps.forEach(({ msg, delay }) => {
+          setTimeout(() => setArchiveSteps(prev => [...prev, msg]), delay);
+        });
+        await new Promise(r => setTimeout(r, 2200));
+        await onSaveJournal({ proposals, transcript, summary });
+      };
+
+      return (
+        <div style={{ maxWidth: 800, margin: '0 auto', padding: '28px 20px', display: 'flex', flexDirection: 'column', gap: 18 }}>
+          <div style={S.panel} className="fade-in">
+            <div style={{ fontSize: 15, fontWeight: 600, marginBottom: 18 }}>🔑 API 設定</div>
+            <div className="grid-2col" style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 14 }}>
+              <div>
+                <label style={S.label}>OpenAI API Key（必填，語音轉文字）</label>
+                <input style={S.input} type="password" placeholder="sk-…" value={openaiKey} onChange={e => { setOpenaiKey(e.target.value); localStorage.setItem('mk_openai_key', e.target.value); }} autoComplete="off" />
+              </div>
+              <div>
+                <label style={S.label}>Anthropic API Key（選填，優先用 Claude 摘要）</label>
+                <input style={S.input} type="password" placeholder="sk-ant-…" value={anthropicKey} onChange={e => { setAnthropicKey(e.target.value); localStorage.setItem('mk_anthropic_key', e.target.value); }} autoComplete="off" />
+              </div>
+            </div>
+            <div style={{ marginTop: 12, fontSize: 12, color: C.textMut, lineHeight: 1.6 }}>
+              🔒 API Key 儲存於本機瀏覽器，不傳送至任何第三方。未填 Anthropic Key 時自動改用 GPT-4o 摘要。
+            </div>
+          </div>
+
+          <div style={S.panel} className="fade-in">
+            <div style={{ fontSize: 15, fontWeight: 600, marginBottom: 16 }}>🎵 音檔來源</div>
+            {audioBlob && (
+              <div style={{ ...S.card, padding: '10px 14px', marginBottom: 14, display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
+                <span style={badge(C.success, C.successBg)}>✓ 已有錄音</span>
+                <span style={{ fontSize: 13, color: C.textSec, flex: 1 }}>來自「會議進行」的錄音</span>
+                <a href={URL.createObjectURL(audioBlob)} download={`meetkit-rec-${new Date().toISOString().slice(0,16).replace('T','-')}.webm`}
+                  style={{ ...btn('ghost'), padding: '4px 12px', fontSize: 12, color: C.textSec, textDecoration: 'none', flexShrink: 0 }}>
+                  ⬇ 下載錄音檔
+                </a>
+              </div>
+            )}
+            <div>
+              <label style={S.label}>{audioBlob ? '或改用上傳的音檔' : '上傳音檔'}</label>
+              <div style={{ display: 'flex', gap: 10, alignItems: 'center' }}>
+                <input ref={fileRef} type="file" accept="audio/*,video/webm" style={{ display: 'none' }} onChange={e => setUploadFile(e.target.files[0])} />
+                <button style={{ ...btn(), padding: '9px 16px' }} onClick={() => fileRef.current.click()}>📂 選擇音檔</button>
+                {uploadFile && <span style={{ fontSize: 13, color: C.textSec }}>{uploadFile.name}</span>}
+              </div>
+            </div>
+          </div>
+
+          {whisperInfo && <div style={{ ...S.card, padding: '10px 16px', background: C.successBg, borderColor: C.success + '55', fontSize: 12, color: C.textSec, display: 'flex', gap: 16 }}>
+            <span>🎙 Whisper 用量</span>
+            <span>音檔長度：約 <b>{whisperInfo.mins}</b> 分鐘</span>
+            <span>費用：<b>${whisperInfo.cost}</b> USD</span>
+            <span style={{ color: C.textMut }}>（$0.006/分鐘）</span>
+          </div>}
+          {errMsg && <div style={{ ...S.card, padding: '12px 16px', background: C.dangerBg, borderColor: C.danger + '66', color: '#ff8a80', fontSize: 13 }}>⚠️ {errMsg}</div>}
+
+          {status !== 'done' && (
+            <button style={{ ...btn('primary'), padding: 14, fontSize: 15, opacity: running ? 0.7 : 1 }} onClick={run} disabled={running}>
+              {status === 'transcribing' ? <><Spinner /> 語音轉文字中…</> : status === 'summarizing' ? <><Spinner /> AI 摘要生成中…</> : '▶ 開始轉文字 & 摘要'}
+            </button>
+          )}
+
+          {transcript && (
+            <div style={S.panel} className="fade-in">
+              <div style={{ fontSize: 15, fontWeight: 600, marginBottom: 14 }}>🎙️ 會議逐字稿</div>
+              <textarea style={{ ...S.input, minHeight: 200, lineHeight: 1.9, resize: 'vertical' }} value={transcript} onChange={e => setTranscript(e.target.value)} />
+            </div>
+          )}
+
+          {summary && (
+            <div style={S.panel} className="fade-in">
+              <div style={{ fontSize: 15, fontWeight: 600, marginBottom: 14 }}>
+                📝 AI 摘要整理
+                <span style={{ ...badge(anthropicKey ? C.accent : C.warn), marginLeft: 10, fontSize: 11 }}>{anthropicKey ? 'Claude' : 'GPT-4o'}</span>
+              </div>
+              <textarea style={{ ...S.input, minHeight: 260, lineHeight: 1.9, resize: 'vertical' }} value={summary} onChange={e => setSummary(e.target.value)} />
+            </div>
+          )}
+
+          {status === 'done' && (
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }} className="fade-in">
+              {archiving ? (
+                <div style={{ ...S.panel, padding: '20px 24px', display: 'flex', flexDirection: 'column', gap: 12 }}>
+                  {archiveSteps.length === 0 && (
+                    <div style={{ fontSize: 13, color: C.textMut, display: 'flex', alignItems: 'center', gap: 8 }}><Spinner /> 準備中…</div>
+                  )}
+                  {archiveSteps.map((s, i) => {
+                    const isDone = i < archiveSteps.length - 1 || archiveSteps.length === 3;
+                    return (
+                      <div key={i} className="fade-in" style={{ display: 'flex', alignItems: 'center', gap: 10, fontSize: 14, color: isDone ? C.success : C.textSec }}>
+                        {isDone ? <span style={{ width: 18, textAlign: 'center', fontSize: 13 }}>✓</span> : <Spinner />}
+                        {s}
+                      </div>
+                    );
+                  })}
+                </div>
+              ) : (
+                <>
+                  <button style={{ ...btn('primary'), padding: 16, fontSize: 16, width: '100%', letterSpacing: 1 }}
+                    onClick={handleArchive}>
+                    ✅ 完成備忘 & 歸檔
+                  </button>
+                  <button style={{ ...btn('ghost'), padding: 12, fontSize: 14, width: '100%' }} onClick={exportMd}>⬇ 匯出 Markdown</button>
+                </>
+              )}
+            </div>
+          )}
+        </div>
+      );
+    }
+
+    // ─── JOURNAL ─────────────────────────────────────────────────────────────────
+    function Journal({ journal, setJournal, projectId }) {
+      const [search, setSearch] = useState('');
+      const [expanded, setExpanded] = useState({});
+
+      const filtered = journal.slice().reverse().filter(m => {
+        if (!search.trim()) return true;
+        const q = search.toLowerCase();
+        return m.date?.toLowerCase().includes(q) || m.summary?.toLowerCase().includes(q) || m.transcript?.toLowerCase().includes(q) || m.proposals?.some(p => p.title?.toLowerCase().includes(q) || p.author?.toLowerCase().includes(q));
+      });
+
+      const deleteEntry = async (id) => {
+        try {
+          await db(`journals?id=eq.${id}`, { method: 'DELETE' });
+        } catch (e) { console.error('Journal delete failed', e); }
+        setJournal(prev => prev.filter(m => m.id !== id));
+      };
+
+      const importFromLocal = async () => {
+        const raw = localStorage.getItem(`mk_journal_${projectId}`);
+        if (!raw) { alert('本機沒有找到舊的日誌資料'); return; }
+        let entries;
+        try { entries = JSON.parse(raw); } catch { alert('資料格式有誤'); return; }
+        if (!Array.isArray(entries) || entries.length === 0) { alert('本機日誌是空的'); return; }
+        const existing = new Set(journal.map(j => j.id?.toString()));
+        const toImport = entries.filter(e => !existing.has(e.id?.toString()));
+        if (toImport.length === 0) { alert('所有紀錄都已存在，無需匯入'); return; }
+        let ok = 0;
+        for (const e of toImport) {
+          const entry = { id: e.id?.toString(), project_id: projectId, date: e.date, proposals: e.proposals || [], transcript: e.transcript || '', summary: e.summary || '' };
+          try { await db('journals', { method: 'POST', body: JSON.stringify(entry) }); ok++; } catch {}
+        }
+        alert(`匯入完成！共匯入 ${ok} 筆`);
+        const updated = await db(`journals?project_id=eq.${projectId}&order=created_at.asc`).then(r => r.json());
+        if (Array.isArray(updated)) setJournal(updated);
+      };
+
+      return (
+        <div style={{ maxWidth: 860, margin: '0 auto', padding: '28px 20px' }}>
+          <div style={{ display: 'flex', alignItems: 'center', marginBottom: 20 }}>
+            <div style={{ fontSize: 18, fontWeight: 600, display: 'flex', alignItems: 'center', gap: 10, flex: 1 }}>
+              📚 會議日誌 <span style={badge(C.accent)}>{journal.length} 場</span>
+            </div>
+            <button style={{ ...btn('ghost'), fontSize: 12, padding: '5px 12px', color: C.textSec }} onClick={importFromLocal}>⬆ 從本機匯入</button>
+          </div>
+          <input style={{ ...S.input, marginBottom: 20 }} placeholder="🔍 搜尋關鍵字、日期、提案者…" value={search} onChange={e => setSearch(e.target.value)} />
+
+          {journal.length === 0 ? (
+            <div style={{ textAlign: 'center', padding: '72px 0', color: C.textMut }}>
+              <div style={{ fontSize: 40, marginBottom: 14 }}>📭</div>
+              <div style={{ fontSize: 14 }}>尚無會議記錄</div>
+              <div style={{ fontSize: 12, marginTop: 6 }}>完成會後整理後按「存入日誌」建立紀錄</div>
+            </div>
+          ) : filtered.length === 0 ? (
+            <div style={{ textAlign: 'center', padding: '48px 0', color: C.textMut, fontSize: 14 }}>找不到「{search}」相關記錄</div>
+          ) : (
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+              {filtered.map((m) => (
+                <div key={m.id} style={S.card} className="fade-in">
+                  <div style={{ padding: '14px 18px', display: 'flex', alignItems: 'center', gap: 12, cursor: 'pointer' }} onClick={() => setExpanded(e => ({ ...e, [m.id]: !e[m.id] }))}>
+                    <span style={{ ...badge(C.accent), minWidth: 28, justifyContent: 'center', flexShrink: 0 }}>{journal.length - journal.findIndex(x => x.id === m.id)}</span>
+                    <div style={{ flex: 1, minWidth: 0 }}>
+                      <div style={{ fontWeight: 600, fontSize: 14 }}>{m.date}</div>
+                      <div style={{ fontSize: 12, color: C.textSec, marginTop: 2 }}>{m.proposals?.length || 0} 項議程{m.transcript ? ' · 有逐字稿' : ''}</div>
+                    </div>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                      <span style={{ color: C.textMut, fontSize: 12 }}>{expanded[m.id] ? '▲' : '▼'}</span>
+                      <button style={{ ...btn('ghost'), padding: '3px 8px', fontSize: 13, color: C.danger, borderColor: 'transparent' }} onClick={e => { e.stopPropagation(); if (confirm('確定刪除？')) deleteEntry(m.id); }}>✕</button>
+                    </div>
+                  </div>
+                  {expanded[m.id] && (
+                    <div style={{ borderTop: `1px solid ${C.border}`, padding: '16px 18px', display: 'flex', flexDirection: 'column', gap: 16 }}>
+                      {m.proposals?.length > 0 && (
+                        <div>
+                          <div style={{ fontSize: 12, fontWeight: 600, color: C.textSec, marginBottom: 8 }}>議程</div>
+                          {m.proposals.map((p, pi) => {
+                            let files = [];
+                            try { const u = JSON.parse(p.file_url||'[]'); const n = JSON.parse(p.file_name||'[]'); if (Array.isArray(u)) files = u.map((url,i)=>({url,name:n[i]||url.split('/').pop()})); } catch {}
+                            if (!files.length && p.file_url) files = [{url: p.file_url, name: p.file_name||'附件'}];
+                            return (
+                              <div key={pi} style={{ ...S.card, padding: '8px 12px', marginBottom: 6 }}>
+                                <div style={{ display: 'flex', gap: 8, alignItems: 'flex-start' }}>
+                                  <span style={{ ...badge(C.accent), flexShrink: 0 }}>{pi + 1}</span>
+                                  <div style={{ flex: 1 }}>
+                                    <div style={{ fontSize: 13, fontWeight: 500 }}>{p.title}</div>
+                                    <div style={{ fontSize: 12, color: C.textSec }}>{p.author}</div>
+                                    {files.length > 0 && (
+                                      <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, marginTop: 6 }}>
+                                        {files.map((f, fi) => (
+                                          <a key={fi} href={f.url} target="_blank" rel="noopener noreferrer"
+                                            style={{ fontSize: 11, color: C.accent, background: C.accent+'18', borderRadius: 6, padding: '2px 8px', textDecoration: 'none' }}>
+                                            {fileIcon(f.name)} {f.name}
+                                          </a>
+                                        ))}
+                                      </div>
+                                    )}
+                                  </div>
+                                </div>
+                              </div>
+                            );
+                          })}
+                        </div>
+                      )}
+                      {m.summary && (
+                        <div>
+                          <div style={{ fontSize: 12, fontWeight: 600, color: C.textSec, marginBottom: 8 }}>📝 AI 摘要</div>
+                          <div className="mk-md" style={{ fontSize: 13, lineHeight: 1.85, background: C.bgCard, borderRadius: 8, padding: 16 }}
+                            dangerouslySetInnerHTML={{ __html: (() => {
+                              if (typeof marked === 'undefined') return `<pre>${m.summary}</pre>`;
+                              const r = new marked.Renderer();
+                              r.link = (href, title, text) => `<a href="${href}" target="_blank" rel="noopener noreferrer" style="color:#5b8dee">${text}</a>`;
+                              return marked.parse(m.summary, { renderer: r, gfm: true, breaks: true });
+                            })()} }
+                          />
+                        </div>
+                      )}
+                      {m.transcript && (
+                        <details>
+                          <summary style={{ fontSize: 12, fontWeight: 600, color: C.textSec, cursor: 'pointer', marginBottom: 8 }}>🎙️ 逐字稿 <span style={{ color: C.textMut, fontWeight: 400 }}>（點擊展開）</span></summary>
+                          <div style={{ fontSize: 13, color: C.textSec, lineHeight: 1.9, whiteSpace: 'pre-wrap', background: C.bgCard, borderRadius: 8, padding: 14, marginTop: 8 }}>{m.transcript}</div>
+                        </details>
+                      )}
+                    </div>
+                  )}
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      );
+    }
+
+    // ─── PASSWORD GATE ───────────────────────────────────────────────────────────
+    function PasswordGate({ projectTitle, onAuth }) {
+      const [input, setInput] = useState('');
+      const [error, setError] = useState(false);
+
+      const attempt = (correctPw) => {
+        if (input.trim() === correctPw) { onAuth(); }
+        else { setError(true); setInput(''); setTimeout(() => setError(false), 1500); }
+      };
+
+      return (
+        <div style={{ minHeight: '100vh', display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', padding: 24 }}>
+          <div style={{ marginBottom: 32, textAlign: 'center' }}>
+            <div style={{ fontSize: 40, marginBottom: 12 }}>🔒</div>
+            <div style={{ fontSize: 20, fontWeight: 700, color: C.text }}>{projectTitle || '此專案'}</div>
+            <div style={{ fontSize: 13, color: C.textSec, marginTop: 6 }}>請輸入密碼以進入</div>
+          </div>
+          <div style={{ width: '100%', maxWidth: 360 }}>
+            <input
+              style={{ ...S.input, marginBottom: 12, border: `1px solid ${error ? C.danger : C.border}`, textAlign: 'center', fontSize: 16, letterSpacing: '0.1em' }}
+              type="password" placeholder="輸入密碼"
+              value={input}
+              onChange={e => setInput(e.target.value)}
+              onKeyDown={e => e.key === 'Enter' && attempt(e.currentTarget.dataset.pw)}
+              autoFocus
+            />
+            {error && <div style={{ textAlign: 'center', color: C.danger, fontSize: 13, marginBottom: 10 }}>密碼錯誤，請再試一次</div>}
+            <PasswordGateButton input={input} onAttempt={attempt} />
+          </div>
+        </div>
+      );
+    }
+
+    // Helper to pass correct password into the button without re-fetching
+    function PasswordGateInner({ projectId, projectTitle, onAuth }) {
+      const [pw, setPw] = useState(null);
+      const [input, setInput] = useState('');
+      const [error, setError] = useState(false);
+
+      useEffect(() => {
+        db(`projects?id=eq.${projectId}&select=password,title`).then(r => r.json()).then(d => {
+          setPw(d[0]?.password || '');
+          if (!d[0]?.password) onAuth(); // no password, auto-pass
+        }).catch(() => setPw(''));
+      }, [projectId]);
+
+      if (pw === null) return (
+        <div style={{ minHeight: '100vh', display: 'flex', alignItems: 'center', justifyContent: 'center', color: C.textSec, fontSize: 14 }}>
+          <Spinner /> <span style={{ marginLeft: 10 }}>載入中…</span>
+        </div>
+      );
+
+      const attempt = () => {
+        if (input.trim() === pw) { sessionStorage.setItem(`mk_auth_${projectId}`, '1'); onAuth(); }
+        else { setError(true); setInput(''); setTimeout(() => setError(false), 1500); }
+      };
+
+      return (
+        <div style={{ minHeight: '100vh', display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', padding: 24 }}>
+          <div style={{ marginBottom: 32, textAlign: 'center' }}>
+            <div style={{ fontSize: 40, marginBottom: 12 }}>🔒</div>
+            <div style={{ fontSize: 20, fontWeight: 700, color: C.text }}>{projectTitle || '此專案'}</div>
+            <div style={{ fontSize: 13, color: C.textSec, marginTop: 6 }}>請輸入密碼以進入</div>
+          </div>
+          <div style={{ width: '100%', maxWidth: 360 }}>
+            <input
+              style={{ ...S.input, marginBottom: 12, border: `1px solid ${error ? C.danger : C.border}`, textAlign: 'center', fontSize: 16, letterSpacing: '0.1em' }}
+              type="password" placeholder="輸入密碼"
+              value={input} onChange={e => setInput(e.target.value)}
+              onKeyDown={e => e.key === 'Enter' && attempt()}
+              autoFocus
+            />
+            {error && <div style={{ textAlign: 'center', color: C.danger, fontSize: 13, marginBottom: 10 }}>密碼錯誤，請再試一次</div>}
+            <button style={{ ...btn('primary'), width: '100%', padding: 13 }} onClick={attempt}>進入專案</button>
+          </div>
+        </div>
+      );
+    }
+
+    // ─── APP ROOT ────────────────────────────────────────────────────────────────
+    function App() {
+      const [projectId, setProjectId] = useState(() => new URLSearchParams(window.location.search).get('p'));
+      const [projectTitle, setProjectTitle] = useState('未命名專案');
+      const [meetingDate, setMeetingDate] = useState('');
+      const [meetingTime, setMeetingTime] = useState('');
+      const [authed,    setAuthed]    = useState(false);
+      const [phase,     setPhase]     = useState(0);
+      const [proposals, setProposals] = useState([]);
+      const [audioBlob, setAudioBlob] = useState(null);
+      const [syncOk,    setSyncOk]    = useState(true);
+      const [journal,   setJournal]   = useState([]);
+      const [briefing,  setBriefing]  = useState('');
+
+      useEffect(() => {
+        if (!projectId) return;
+        // Check session auth
+        if (sessionStorage.getItem(`mk_auth_${projectId}`)) setAuthed(true);
+        // Load journal from Supabase
+        db(`journals?project_id=eq.${projectId}&order=created_at.asc`).then(r => r.json()).then(d => { if (Array.isArray(d)) setJournal(d); }).catch(() => {});
+        // Load project info
+        db(`projects?id=eq.${projectId}&select=title,meeting_date,meeting_time,briefing`).then(r => r.json()).then(d => {
+          if (d[0]?.title) setProjectTitle(d[0].title);
+          if (d[0]?.meeting_date) setMeetingDate(d[0].meeting_date);
+          if (d[0]?.meeting_time) setMeetingTime(d[0].meeting_time);
+          if (d[0]?.briefing) setBriefing(d[0].briefing);
+        }).catch(() => {});
+      }, [projectId]);
+
+      const enterProject = (id) => {
+        setProjectId(id);
+        setAuthed(false);
+        window.history.pushState({}, '', `?p=${id}`);
+        // 記錄到最近使用
+        try {
+          const recent = JSON.parse(localStorage.getItem('mk_recent_projects') || '[]');
+          const updated = [{ id, lastVisited: new Date().toISOString() }, ...recent.filter(p => p.id !== id)].slice(0, 8);
+          localStorage.setItem('mk_recent_projects', JSON.stringify(updated));
+        } catch {}
+      };
+
+      const saveToJournal = async ({ proposals, transcript, summary }) => {
+        const entry = {
+          id: Date.now().toString(),
+          project_id: projectId,
+          date: new Date().toLocaleDateString('zh-TW', { year: 'numeric', month: 'long', day: 'numeric' }),
+          proposals: proposals.map(p => ({ title: p.title, author: p.author, content: p.content })),
+          transcript, summary,
+        };
+        try {
+          await db('journals', { method: 'POST', body: JSON.stringify(entry) });
+        } catch (e) { console.error('Journal save failed', e); }
+        setJournal(prev => [...prev, entry]);
+        setPhase(3);
+      };
+
+      if (!projectId) return <Home onEnter={enterProject} />;
+      if (!authed) return <PasswordGateInner projectId={projectId} projectTitle={projectTitle} onAuth={() => setAuthed(true)} />;
+
+      return (
+        <div>
+          <Header
+            phase={phase} setPhase={setPhase} syncOk={syncOk}
+            journalCount={journal.length}
+            projectId={projectId} projectTitle={projectTitle}
+            onTitleSave={setProjectTitle}
+          />
+          {phase === 0 && <PreMeeting projectId={projectId} proposals={proposals} setProposals={setProposals} setSyncOk={setSyncOk} journal={journal} projectTitle={projectTitle} meetingDate={meetingDate} setMeetingDate={setMeetingDate} meetingTime={meetingTime} setMeetingTime={setMeetingTime} briefing={briefing} />}
+          {phase === 1 && <Meeting proposals={proposals} setProposals={setProposals} projectId={projectId} briefing={briefing}
+            onGoHome={() => { setProjectId(null); window.history.pushState({}, '', window.location.pathname); }}
+            setPhase={setPhase} />}
+          {phase === 2 && <PostMeeting proposals={proposals} audioBlob={audioBlob} onSaveJournal={saveToJournal} projectId={projectId} projectTitle={projectTitle} />}
+          {phase === 3 && <Journal journal={journal} setJournal={setJournal} projectId={projectId} />}
+
+        </div>
+      );
+    }
+
+    ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+  </script>
+</body>
+</html>

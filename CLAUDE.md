@@ -6,6 +6,61 @@
 
 ---
 
+## ⚠️ 第一鐵律:MeetKit 是正在運作的生產環境
+
+**在做任何事之前,先讀這段。**
+
+### 部署現況
+
+- **正式網址:** `https://qmorechi.github.io/meetkit/`
+- **部署方式:** GitHub Pages 自動從 `main` branch 部署
+- **觸發條件:** 每次 `git push` 後,GitHub Pages 1-2 分鐘內自動更新
+- **有同事正在使用中**,裡面有真實的客戶會議、SIPAI 等機密專案
+- **Supabase** 存著所有專案、提案、附件、逐字稿
+
+### 為什麼這件事重要
+
+1. **Bug 會立刻影響同事** — 任何半成品 push 上去,同事下次開會就會踩到
+2. **資料和介面分離** — 改 index.html **不會**動到 Supabase 資料,但介面變了同事會困惑
+3. **GitHub Pages 沒有 staging** — 一 push 就是正式環境,沒有「測試完再上線」的緩衝
+
+### 開發期的鐵律:用 index-dev.html 隔離
+
+**所有改造動作都先做在 `index-dev.html`,不動 `index.html`。**
+
+```bash
+# Claude Code 開工第一件事
+ls index-dev.html 2>/dev/null || cp index.html index-dev.html
+```
+
+之後所有 str_replace 都對 `index-dev.html` 執行。
+
+### 測試方式
+
+- 本機:用瀏覽器打開 `index-dev.html`(有 `file://` 限制)
+- 部署:push 後開 `https://qmorechi.github.io/meetkit/index-dev.html?p=TEST001`
+- **不要**用真實客戶專案測試,建一個測試專案(例如代碼 `TEST001`)
+
+### 正式切換的流程
+
+開發完成 → qmore 驗收 → **qmore 明確說「可以正式切換」** → 才能執行:
+
+```bash
+cp index-dev.html index.html
+```
+
+**Claude Code 絕對不能自作主張執行這個 `cp`**。切換時機由 qmore 決定。
+
+### 資料安全保證
+
+即使 Phase 2 全部改壞了,Supabase 裡的所有資料依然完整:
+
+- 專案、提案、附件、逐字稿都存在雲端資料庫
+- 改程式 = 換前端介面,就像換書架,書不會不見
+- 唯一會弄丟資料的情況是手動進 Supabase dashboard 刪除
+
+---
+
 ## 1. 專案定位
 
 **MX Meeting Kit** 是 MX Design 內部會議管理工具的**公版**。
