@@ -24,68 +24,155 @@
 
 ---
 
-## 2. 核心架構:四層資料結構
+## 2. 核心架構:三層資料結構(實際現況)
 
 ```
-專案層 (Project)
-  └─ 會議層 (Meeting)
-      ├─ 提案層 (Proposal)     ← 會議前收集
-      └─ 紀錄層 (Record)       ← 會議後產出
+專案層 (projects)
+  ├─ 提案層 (proposals)     ← 會前收集,可含附件
+  └─ 日誌層 (journal)        ← 會後產出,含逐字稿和摘要
 ```
 
-**欄位細節:**
+**重要:** 原本規劃的「Meeting 層」**目前沒有獨立存在** — 一個專案就是一場會議,`meeting_date` 和 `meeting_time` 直接存在 `projects` 表裡。
 
-| 層 | 欄位 |
+這個簡化是對的,因為:
+- 目前的使用情境多半是「建一個專案 → 開一場會 → 歸檔」
+- 不需要「一個專案開好幾場會」的複雜結構
+- Phase 3 如果真的需要「一個專案多場會議」,再把 meeting 抽出來做獨立表
+
+### 實際欄位(從 index.html 推斷)
+
+**`projects` 表:**
+- `id` (UUID)
+- `code` (6 碼專案代碼,例如 `A3X9KP`)
+- `title` (專案名稱)
+- `password_hash` (可選的密碼保護)
+- `meeting_date`
+- `meeting_time`
+
+**`proposals` 表:**
+- `id` (UUID)
+- `project_id` (FK)
+- `title` (提案標題)
+- `author` (提案人)
+- `content` (提案內容)
+- `file_url` (JSON 字串,附件 URL 陣列)
+- `file_name` (JSON 字串,附件檔名陣列)
+
+**`journal` 表:**
+- 存歸檔的會議紀錄(逐字稿 + AI 摘要 + 決議)
+- 結構待確認,等 Claude Code 讀 App 元件時補完
+
+**Supabase Storage:**
+- Bucket: `presentations`
+- 路徑: `{projectId}/{timestamp}_{random}.{ext}`
+- 用途: 存放提案附件(PDF、DOCX、圖片)
+
+### 如果未來要擴展成「一個專案多場會議」
+
+只需要:
+1. 新增 `meetings` 表(id, project_id, date, time, number)
+2. `proposals.project_id` 改成 `proposals.meeting_id`
+3. 在 UI 上加「會議列表」頁面
+
+**在那之前,三層結構就夠用,不要過度設計。**
+
+---
+
+## 3. 權限模型(現況)
+
+**現階段 MeetKit 的權限機制非常輕量:**
+
+- **6 碼專案代碼** — 每個專案有一組自動產生的 6 碼代碼(例如 `A3X9KP`),知道代碼的人就能加入
+- **可選的密碼保護** — 機密專案(SIPAI、客戶會議)可以設密碼,進入前要輸入
+- **沒有使用者帳號系統** — 不需要註冊登入,大家靠「代碼 + 密碼」協作
+
+**這個設計的優缺點:**
+
+| 優點 | 缺點 |
 |---|---|
-| Project | id, name, type (IP開發/品牌設計/電商/客戶案/其他), owner_id, members[], created_at |
-| Meeting | id, project_id, number, date, host_id, attendees[], type (提案/進度/決策/腦力激盪) |
-| Proposal | id, meeting_id, author_id, title, description, goal, resources, priority, status (草稿/待討論/討論中/通過/擱置), references[] |
-| Record | id, meeting_id, audio_file_url, transcript, summary, decisions[], action_items[] |
+| 設計師能獨立維護,不需要帳號系統 | 無法追蹤「誰做了什麼」 |
+| 外部客戶也能直接加入專案(分享代碼即可) | 無法區分不同角色的權限 |
+| 無註冊門檻 | 密碼外流就無法擋 |
+| 符合 Phase 2-3 階段的實際需求 | Phase 4 全公司 rollout 時可能要升級 |
 
-**關鍵規則 — 單一來源原則:**
-Project 和 Meeting 層的欄位修改後,**所有歷史紀錄中引用的顯示值都要同步更新**。例如改了專案名,所有會議紀錄頁顯示的專案名也要跟著變。實作上用 foreign key 關聯,不要冗餘存字串。
+### 未來的權限擴展(Phase 3+)
 
----
+當 MeetKit 需要更嚴謹的權限時(例如「只有 Owner 能刪提案」、「Member 不能看到其他專案」),有兩條路:
 
-## 3. 權限模型
+**路線 A:在 index.html 內部加簡單的 role 管理**
+- 在 Supabase `projects` 表加一個 `owner_id` 欄位
+- 在進入專案時用 localStorage 存 `is_owner` flag
+- 保持單檔案架構
 
-**使用 Supabase RLS (Row Level Security) 實作。**
+**路線 B:升級到 Next.js + NextAuth**
+- 引入真正的使用者系統
+- 用 Supabase RLS 做 row-level 權限
+- 這是 Phase 4 全公司 rollout 的前置條件
 
-| 角色 | Project | Meeting | Proposal | Record |
-|---|---|---|---|---|
-| Owner | 全權(建/編/刪) | 全權 | 全權 | 全權 |
-| Member | 唯讀 | 唯讀 | 填自己的 / 讀全部 | 唯讀 |
-
-**前端實作:**
-- 同一套 Component,用 `isOwner` Boolean 控制顯示
-- Owner 看到的按鈕(編輯、刪除、管理),Member 完全隱藏
-- **不要**做兩套 Component,也**不要**用 CSS `display:none` 來藏 — 直接 `{isOwner && <EditButton />}`
-
-這個模式和 Cosmoship Cart Panel 的 Guest/Member 切換是同一個思路。
+**原則:不到必要時,不要升級。** 簡單的權限能用就用,不要過度工程化。
 
 ---
 
-## 4. 技術棧(不可變動)
+## 4. 技術棧(實際現況)
 
-| 項目 | 版本 | 備註 |
+**重要:** MeetKit **不是**一個需要 build 的 Next.js 專案,而是**單一 HTML 檔案 `index.html`**,用 React + Babel in-browser 編譯。這個架構是刻意選擇的,適合設計師獨立維護、零 build 時間、部署極簡單。
+
+詳見 `docs/current-state-audit.md` 的完整現況盤點。
+
+### 核心技術棧
+
+| 項目 | 技術 | 載入方式 |
 |---|---|---|
-| Framework | Next.js 16 | App Router,和 Cosmoship 同版本 |
-| UI | React 19 | Functional components + hooks |
-| Language | TypeScript | Strict mode |
-| Styling | Tailwind CSS v4 | CSS variables via `@theme` |
-| DB | Supabase | 和 Cosmoship 共用帳號,但**獨立 project** |
-| Auth | NextAuth v5 | Google SSO 優先(全員 Google Workspace) |
-| State | Zustand v5 | |
-| AI 摘要 | Anthropic API | Claude Sonnet 4.6 |
-| 語音轉文字 | OpenAI Whisper API | `whisper-1` 或 `gpt-4o-transcribe` |
-| 音訊前置處理 | ffmpeg.wasm | **前端處理**,詳見 §5 |
-| Email | Resend | 下次會議提案信 |
-| 部署 | Vercel | |
+| UI 框架 | React 18 | CDN: `unpkg.com/react@18` |
+| 編譯 | Babel Standalone | CDN: `@babel/standalone` |
+| Markdown | marked.js | CDN |
+| PDF 解析 | pdf.js v3.11.174 | CDN(附件文字抽取) |
+| Word 解析 | mammoth.js v1.6.0 | CDN(附件文字抽取) |
+| 字型 | Noto Sans TC | Google Fonts |
+| DB | Supabase REST API | 直接 fetch,無 SDK |
+| Storage | Supabase Storage | 直接 fetch,bucket 名 `presentations` |
+| 語音轉文字 | OpenAI Whisper API | 使用者輸入 API Key(存 localStorage) |
+| AI 摘要 | Anthropic Claude(主)/ OpenAI GPT-4o(備) | 使用者輸入 API Key |
+| 音訊前置處理 | ffmpeg.wasm(Phase 2 待整合) | CDN: `@ffmpeg/ffmpeg` |
 
-**為什麼 Supabase 要獨立 project 不和 Cosmoship 共用:**
-- 權限完全隔離,會議內容(特別是客戶會議、SIPAI)絕對不能和電商資料混在一起
-- RLS 規則完全不同,獨立 project 更好維護
-- 未來若 SIPAI 再額外隔離成第三個 project,架構上也順
+**Supabase 配置:**
+- URL: `https://yrugcgzkomydmorgzwhb.supabase.co`
+- Anon Key 寫死在 index.html 第 63-64 行
+
+**刻意不用的東西:**
+- ❌ **Next.js / React Router** — 單頁 SPA,不需要
+- ❌ **TypeScript** — 純 JavaScript + JSX,降低設計師理解門檻
+- ❌ **Zustand / Redux** — React 的 `useState` + props drilling 已經夠用
+- ❌ **Tailwind / styled-components** — 用原生 CSS-in-JS 物件(`S.panel`、`btn()` 等 helper)
+- ❌ **NextAuth** — 用 6 碼專案代碼 + 可選密碼保護,不需要完整帳號系統
+- ❌ **npm / package.json / node_modules** — 所有函式庫從 CDN 載入
+- ❌ **build 流程** — 改完檔案直接重新整理
+
+**為什麼保持這個架構:**
+- 設計師(qmore)能獨立維護,不需要前端工程師支援
+- 零 build 時間,改完立刻看到效果
+- 部署只要一個 HTML 檔丟到靜態伺服器
+- SIPAI 機密會議情境下,沒有 node_modules 的供應鏈攻擊風險
+- 這套架構在實際會議中已經驗證可用
+
+### 何時該考慮 Next.js 重寫
+
+**等到以下任一情況出現再考慮:**
+- 需要真正的多使用者登入系統(跨專案帳號管理)
+- 需要複雜的權限系統(跨專案 RLS + middleware)
+- `index.html` 超過 3000 行,維護變困難
+- 需要 SSR / Server Components
+- 要做 PWA(離線使用)
+- 全公司 rollout 的安全性要求提升(例如 SSO + domain 白名單)
+
+**在那之前,`index.html` 就是對的架構。**
+
+### 資料表結構(Supabase)
+
+- `projects` — id, code(6 碼), title, password_hash, meeting_date, meeting_time
+- `proposals` — id, project_id, title, author, content, file_url (JSON), file_name (JSON)
+- `journal` — 會議歸檔(逐字稿、摘要)
+- Storage bucket `presentations` — 提案附件,路徑 `{projectId}/{timestamp}_{random}.{ext}`
 
 ---
 
@@ -126,20 +213,43 @@ Project 和 Meeting 層的欄位修改後,**所有歷史紀錄中引用的顯示
 
 ### 5.2 為什麼用 ffmpeg.wasm 前端處理
 
-- Vercel Serverless Function 有 10-60 秒執行上限、1GB 記憶體上限 — 處理 3 小時音檔會爆
+- 完全沒有後端 — 整個 MeetKit 就是 `index.html`,從來沒有 serverless function 可以用
 - 前端處理 = 原檔不離開使用者電腦,只上傳壓縮後的片段 = SIPAI 機密會議更安全
 - ffmpeg.wasm 首次載入約 30MB,會被瀏覽器快取,之後使用無延遲
 - iOS 16+ Safari 對 ffmpeg.wasm 支援良好,全員 iPhone 的情境下風險很低
+- 從 CDN 載入 ffmpeg.wasm,延續 index.html「無 build、無 npm」的架構哲學
+
+### 5.2.5 實作位置(重要)
+
+所有音訊 pipeline 邏輯都寫在 `index.html` **內部**,不拆檔案。
+
+- ffmpeg.wasm 從 CDN `unpkg.com/@ffmpeg/ffmpeg` 載入
+- 在 `<script type="text/babel">` 區塊內新增一個 `// ─── AUDIO PIPELINE ─────────────` 註解區塊,所有相關函式寫在這裡
+- `PostMeeting` 元件現有的 Whisper API 呼叫邏輯(1163-1168 行)要改寫,接上前置處理
+
+**現有 index.html 已經有的:**
+- ✅ 上傳音檔的 UI(1318-1338 行)
+- ✅ Whisper API 呼叫(1163-1168 行)
+- ✅ 成本計算(1169-1171 行)
+- ✅ Anthropic/GPT 雙引擎摘要(1192-1280 行的 prompt)
+
+**需要新增的:**
+- ❌ ffmpeg.wasm 載入和初始化
+- ❌ 壓縮函式(16kHz mono opus 24kbps)
+- ❌ 靜音偵測切段
+- ❌ 並行上傳邏輯
+- ❌ 逐字稿合併
+- ❌ 六階段 UI 進度顯示
 
 ### 5.3 Whisper API 呼叫細節
 
 **必帶參數:**
-```ts
+```js
 {
-  file: <audio segment>,
+  file: <audio segment blob>,
   model: "whisper-1",
   language: "zh",  // 絕對不能省,會議一定中英混講
-  prompt: "Cosmoship, 宇宙小艇, SIPAI, 偷瞄的X, MX Design, Figma, Supabase, Anthropic, Claude, Next.js"
+  prompt: "Cosmoship, 宇宙小艇, SIPAI, 偷瞄的X, MX Design, Figma, Supabase, Anthropic, Claude, ComfyUI, Flux, MeetKit"
   // prompt 塞專有名詞清單,Whisper 會對這些詞特別準確
 }
 ```
@@ -157,29 +267,39 @@ Project 和 Meeting 層的欄位修改後,**所有歷史紀錄中引用的顯示
 
 ### 6.1 絕對規則:只輸出修改部分,不全文重寫
 
-**禁止**:一次輸出整個 component 檔案,即使只改一行。
+**禁止**:一次輸出整個 `index.html`(或其中一個 React 元件的完整程式碼),即使只改一行。
 
 **要求**:每次程式碼修改都用 `str_replace` 格式:
 
 ```
-📄 File: src/components/upload/AudioUploader.tsx
+📄 File: index.html
+📍 Location: Meeting 元件 (~1018 行,startRec 函式)
 
 🔴 Replace:
-const MAX_SEGMENT_MINUTES = 10
+const startRec = async () => {
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
 
 🟢 With:
-const MAX_SEGMENT_MINUTES = 15
+const startRec = async () => {
+  alert('會議進行中請打開 iPhone 語音備忘錄錄音,會後回到這裡上傳檔案');
+  return;
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
 
-💬 Why: 和 CLAUDE.md §5.1 對齊,目標段長 15 分鐘
+💬 Why: 暫時停用瀏覽器錄音,引導使用者改用 iPhone。完整改造見任務書
 ```
+
+**找行數的方式:** 先用 `grep -n "function 元件名"` 或類似方式確認實際行號,因為 index.html 會隨改動增長,絕對行號會漂移。用「元件名 + 函式名」定位比行號更穩定。
 
 如果多個地方要改,輸出多個 str_replace 區塊。**新檔案才能全文輸出**,且要標 `🆕 New File:`。
 
 ### 6.2 中文註解規範
 
 - 程式碼註解用**繁體中文**,方便設計師 qmore 直接閱讀
-- 變數名、函式名用英文(符合 JS/TS 慣例)
+- 變數名、函式名用英文(符合 JavaScript 慣例)
 - 錯誤訊息給使用者看的一律繁體中文
+- 大段功能區塊用 `// ─── 區塊名稱 ─────────────` 分隔,和現有 index.html 的風格一致
 
 ### 6.3 Commit 訊息規範
 
@@ -197,15 +317,17 @@ const MAX_SEGMENT_MINUTES = 15
 
 ## 7. Rollout 路線圖(詳見 `docs/ROADMAP.md`)
 
-目前位置:**Phase 1 後段 → Phase 2 前段**
+目前位置:**Phase 2 準備開工**(index.html 實戰版已有,錄音改造待做)
 
 - ✅ Phase 0:需求與架構確立
-- ✅ Phase 1:UI prototype + GitHub/Vercel/Claude Code 基礎建設
-- 🔄 Phase 2:音訊 pipeline 上線(當前重點)
-- ⏭ Phase 3:多專案多 Owner 版
-- ⏭ Phase 4:全公司 rollout + SIPAI 額外隔離
+- ✅ Phase 1:index.html 實戰版上線,多次真實會議驗證
+- 🔄 Phase 2:錄音改造(放棄瀏覽器錄音 + 整合 ffmpeg.wasm + 切段上傳)← 當前
+- ⏭ Phase 3:多專案管理介面優化 + 跨專案搜尋
+- ⏭ Phase 4:全公司 rollout(可能的 Next.js 重寫時機)
 
 每一次 session 結束時,如果有里程碑變動,請更新 `docs/ROADMAP.md` 的狀態標記。
+
+**重要認知:** MeetKit 的 Phase 劃分**不是**「從零到 Next.js 正式版」的工程路線,而是「從單檔實戰版逐步擴充功能」的漸進路線。保留 index.html 作為主體,直到它不敷使用才考慮重寫。
 
 ---
 
