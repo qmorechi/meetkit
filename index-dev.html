@@ -2031,10 +2031,39 @@ ${txText}
             )}
             <div>
               <label style={S.label}>{audioBlob ? '或改用上傳的音檔' : '上傳音檔'}</label>
-              <div style={{ display: 'flex', gap: 10, alignItems: 'center' }}>
-                <input ref={fileRef} type="file" accept="audio/*,video/webm" style={{ display: 'none' }} onChange={e => setUploadFile(e.target.files[0])} />
-                <button style={{ ...btn(), padding: '9px 16px' }} onClick={() => fileRef.current.click()}>📂 選擇音檔</button>
-                {uploadFile && <span style={{ fontSize: 13, color: C.textSec }}>{uploadFile.name}</span>}
+              <input ref={fileRef} type="file" accept="audio/*,video/webm" style={{ display: 'none' }} onChange={e => setUploadFile(e.target.files[0])} />
+              {/* 拖曳區域 */}
+              <div
+                onDragOver={e => { e.preventDefault(); e.currentTarget.style.borderColor = C.accent; e.currentTarget.style.background = C.accent + '11'; }}
+                onDragLeave={e => { e.currentTarget.style.borderColor = C.border; e.currentTarget.style.background = 'transparent'; }}
+                onDrop={e => {
+                  e.preventDefault();
+                  e.currentTarget.style.borderColor = C.border;
+                  e.currentTarget.style.background = 'transparent';
+                  const f = e.dataTransfer.files[0];
+                  if (f) setUploadFile(f);
+                }}
+                onClick={() => fileRef.current.click()}
+                style={{
+                  border: `2px dashed ${uploadFile ? C.success : C.border}`,
+                  borderRadius: 10, padding: '24px 16px', textAlign: 'center',
+                  cursor: 'pointer', transition: 'all 0.15s',
+                  background: uploadFile ? C.successBg : 'transparent',
+                }}
+              >
+                {uploadFile ? (
+                  <>
+                    <div style={{ fontSize: 28, marginBottom: 6 }}>✅</div>
+                    <div style={{ fontSize: 14, fontWeight: 600, color: C.success }}>{uploadFile.name}</div>
+                    <div style={{ fontSize: 12, color: C.textMut, marginTop: 4 }}>點擊重新選擇</div>
+                  </>
+                ) : (
+                  <>
+                    <div style={{ fontSize: 28, marginBottom: 6 }}>🎵</div>
+                    <div style={{ fontSize: 14, fontWeight: 500 }}>拖曳音檔到此處</div>
+                    <div style={{ fontSize: 12, color: C.textMut, marginTop: 4 }}>或點擊選擇檔案 · m4a / mp3 / wav / webm</div>
+                  </>
+                )}
               </div>
             </div>
           </div>
