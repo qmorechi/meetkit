@@ -1161,6 +1161,22 @@
                 <span style={{ fontSize: 11, color: C.textMut, flexShrink: 0 }}>縮放請用文件內控制</span>
               )}
               <a href={url} target="_blank" rel="noopener noreferrer" style={{ ...btn('ghost'), padding: '4px 10px', fontSize: 12, color: C.textSec, textDecoration: 'none', flexShrink: 0 }}>↗</a>
+              {/* 全螢幕按鈕：在 header 列，確保在 PDF iframe 上方可見 */}
+              <button style={{ ...btn('ghost'), padding: '4px 10px', fontSize: 12, color: C.accent, fontWeight: 600, flexShrink: 0 }}
+                onClick={() => {
+                  const isFS = document.fullscreenElement || document.webkitFullscreenElement;
+                  if (isFS) {
+                    if (document.exitFullscreen) document.exitFullscreen().catch(() => {});
+                    else if (document.webkitExitFullscreen) document.webkitExitFullscreen();
+                  } else {
+                    const iframe = document.querySelector('iframe');
+                    const target = iframe || document.body;
+                    if (target.requestFullscreen) target.requestFullscreen().catch(() => {});
+                    else if (target.webkitRequestFullscreen) target.webkitRequestFullscreen();
+                  }
+                }}>
+                ↗ 全螢幕
+              </button>
               <button style={{ ...btn('ghost'), padding: '4px 10px', fontSize: 13, flexShrink: 0 }} onClick={onClose}>✕</button>
             </div>
             {isMd ? (
