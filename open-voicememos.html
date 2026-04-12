@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>開啟語音備忘錄</title>
+  <title>開始錄音</title>
   <style>
     body {
       margin: 0;
@@ -18,30 +18,78 @@
       padding: 24px;
       box-sizing: border-box;
     }
-    .box {
-      max-width: 320px;
-    }
+    .box { max-width: 320px; width: 100%; }
     .icon { font-size: 64px; margin-bottom: 16px; }
-    h1 { font-size: 22px; margin: 0 0 12px; }
+    h1 { font-size: 22px; margin: 0 0 10px; }
     p { font-size: 15px; color: #aaa; line-height: 1.6; margin: 0 0 24px; }
-    a.btn {
+    .btn {
       display: block;
       background: #ec1d24;
       color: #fff;
       text-decoration: none;
-      font-size: 16px;
+      font-size: 17px;
       font-weight: 600;
-      padding: 14px 24px;
-      border-radius: 10px;
+      padding: 16px 24px;
+      border-radius: 12px;
+      border: none;
+      width: 100%;
+      box-sizing: border-box;
+      cursor: pointer;
+      margin-bottom: 12px;
     }
+    .btn-secondary {
+      background: #222;
+      border: 1px solid #444;
+      font-size: 14px;
+      padding: 12px 24px;
+    }
+    .spinner {
+      display: inline-block;
+      width: 32px; height: 32px;
+      border: 3px solid #333;
+      border-top-color: #ec1d24;
+      border-radius: 50%;
+      animation: spin 0.8s linear infinite;
+      margin-bottom: 20px;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+    #loading-section { display: block; }
+    #install-section { display: none; }
   </style>
-  <script>window.location = 'voicememos://';</script>
 </head>
 <body>
   <div class="box">
-    <div class="icon">🎙</div>
-    <h1>正在開啟語音備忘錄…</h1>
-    <p>請在系統提示中點「打開」<br>開始錄音後回到 MeetKit 確認。</p>
+
+    <!-- 載入中狀態：嘗試觸發捷徑 -->
+    <div id="loading-section">
+      <div class="spinner"></div>
+      <h1>正在開啟語音備忘錄…</h1>
+      <p>請在系統提示中點「執行」<br>開始錄音後回到 MeetKit 確認。</p>
+    </div>
+
+    <!-- 捷徑未安裝：顯示安裝引導 -->
+    <div id="install-section">
+      <div class="icon">🎙</div>
+      <h1>首次使用需安裝捷徑</h1>
+      <p>點下方按鈕安裝「MeetKit 錄音」捷徑<br>安裝一次，之後掃碼就能直接開始錄音。</p>
+      <a href="https://www.icloud.com/shortcuts/a81f41df988e4bc8be4289896bf7cc0c" class="btn">
+        安裝 MeetKit 錄音捷徑
+      </a>
+      <p style="font-size:13px; color:#666; margin-top:8px;">
+        安裝完成後，重新掃描 QR Code 即可直接錄音
+      </p>
+    </div>
+
   </div>
+  <script>
+    // 嘗試觸發已安裝的捷徑
+    window.location = 'shortcuts://run-shortcut?name=MeetKit%E9%8C%84%E9%9F%B3';
+
+    // 2 秒後還在頁面上，代表捷徑未安裝
+    setTimeout(function() {
+      document.getElementById('loading-section').style.display = 'none';
+      document.getElementById('install-section').style.display = 'block';
+    }, 2000);
+  </script>
 </body>
 </html>
