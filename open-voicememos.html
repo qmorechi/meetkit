@@ -1,0 +1,51 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>開啟語音備忘錄</title>
+  <style>
+    body {
+      margin: 0;
+      background: #111;
+      color: #fff;
+      font-family: -apple-system, sans-serif;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      min-height: 100vh;
+      text-align: center;
+      padding: 24px;
+      box-sizing: border-box;
+    }
+    .box {
+      max-width: 320px;
+    }
+    .icon { font-size: 64px; margin-bottom: 16px; }
+    h1 { font-size: 22px; margin: 0 0 12px; }
+    p { font-size: 15px; color: #aaa; line-height: 1.6; margin: 0 0 24px; }
+    a.btn {
+      display: block;
+      background: #ec1d24;
+      color: #fff;
+      text-decoration: none;
+      font-size: 16px;
+      font-weight: 600;
+      padding: 14px 24px;
+      border-radius: 10px;
+    }
+  </style>
+  <script>
+    // 自動嘗試開啟語音備忘錄
+    window.location = 'voicememos://';
+  </script>
+</head>
+<body>
+  <div class="box">
+    <div class="icon">🎙</div>
+    <h1>開啟語音備忘錄</h1>
+    <p>正在嘗試開啟 iPhone 語音備忘錄…<br>如果沒有自動跳轉，請點下方按鈕。</p>
+    <a href="voicememos://" class="btn">開啟語音備忘錄</a>
+  </div>
+</body>
+</html>
