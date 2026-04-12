@@ -1219,12 +1219,14 @@
           if (document.exitFullscreen) document.exitFullscreen().catch(() => {});
           else if (document.webkitExitFullscreen) document.webkitExitFullscreen();
         } else {
-          // document.body 比 documentElement 在有 iframe 的頁面更可靠
-          const el = document.body;
-          if (el.requestFullscreen) {
-            el.requestFullscreen().catch(e => console.warn('全螢幕失敗:', e));
-          } else if (el.webkitRequestFullscreen) {
-            el.webkitRequestFullscreen();
+          // Chrome 在頁面有 iframe 時，對 body 的全螢幕請求會被擋
+          // 改成：有 iframe（PDF/文件預覽）→ 對 iframe 全螢幕；沒有 → 對 body 全螢幕
+          const iframe = document.querySelector('iframe');
+          const target = iframe || document.body;
+          if (target.requestFullscreen) {
+            target.requestFullscreen().catch(e => console.warn('全螢幕失敗:', e));
+          } else if (target.webkitRequestFullscreen) {
+            target.webkitRequestFullscreen();
           }
         }
       };
