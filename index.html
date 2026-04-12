@@ -498,7 +498,7 @@
     }
 
     // ─── HEADER ──────────────────────────────────────────────────────────────────
-    function Header({ phase, setPhase, syncOk, journalCount, projectId, projectTitle, onTitleSave, isRecording, recordingSeconds }) {
+    function Header({ phase, setPhase, syncOk, journalCount, projectId, projectTitle, onTitleSave, isRecording, recordingSeconds, hidden }) {
       const [editing, setEditing] = useState(false);
       const [draft, setDraft] = useState(projectTitle);
 
@@ -520,7 +520,13 @@
       ];
 
       return (
-        <header style={{ background: C.bgPanel + 'ee', borderBottom: `1px solid ${C.border}`, position: 'sticky', top: 0, zIndex: 100, backdropFilter: 'blur(16px)' }}>
+        <header style={{
+          background: C.bgPanel + 'ee', borderBottom: `1px solid ${C.border}`,
+          position: 'sticky', top: 0, zIndex: 100, backdropFilter: 'blur(16px)',
+          // 往上滑才顯示：用 transform 平滑滑出/滑入
+          transform: hidden ? 'translateY(-110%)' : 'translateY(0)',
+          transition: 'transform 0.35s ease',
+        }}>
           {/* Project title bar */}
           <div style={{ borderBottom: `1px solid ${C.border}22`, padding: '6px 20px', display: 'flex', alignItems: 'center', gap: 10, maxWidth: 1100, margin: '0 auto' }}>
             <span style={{ fontSize: 11, color: C.textMut, letterSpacing: '0.05em' }}>專案</span>
@@ -555,7 +561,22 @@
               {phases.map((p, i) => (
                 <React.Fragment key={p.id}>
                   <button
-                    onClick={() => setPhase(p.id)}
+                    onClick={() => {
+                      setPhase(p.id);
+                      const el = document.body;
+                      // 切到「會議進行」：請求全螢幕（含 Safari webkit 前綴；用 body 比 documentElement 更可靠）
+                      if (p.id === 1) {
+                        if (el.requestFullscreen) el.requestFullscreen().catch(() => {});
+                        else if (el.webkitRequestFullscreen) el.webkitRequestFullscreen();
+                      } else {
+                        // 離開會議進行：退出全螢幕
+                        const isFS = document.fullscreenElement || document.webkitFullscreenElement;
+                        if (isFS) {
+                          if (document.exitFullscreen) document.exitFullscreen().catch(() => {});
+                          else if (document.webkitExitFullscreen) document.webkitExitFullscreen();
+                        }
+                      }
+                    }}
                     style={{ ...btn(phase === p.id ? 'primary' : 'ghost'), padding: '6px 13px', fontSize: 13, opacity: phase > p.id ? 0.55 : phase === p.id ? 1 : 0.75 }}
                   >
                     <span>{p.icon}</span>
@@ -1087,7 +1108,8 @@
       const iframeSrc = () => {
         if (type?.viewer === 'office') return `https://view.officeapps.live.com/op/embed.aspx?src=${encodeURIComponent(url)}`;
         if (type?.viewer === 'google') return `https://docs.google.com/viewer?url=${encodeURIComponent(url)}&embedded=true`;
-        if (isPdf) return `${url}#zoom=${pdfZoom}`;
+        // toolbar=0 隱藏 Chrome PDF 閱讀器的側邊縮圖欄和工具列
+        if (isPdf) return `${url}#toolbar=0&zoom=${pdfZoom}`;
         return url;
       };
 
@@ -1138,7 +1160,29 @@
               {(type?.viewer === 'office' || type?.viewer === 'google') && (
                 <span style={{ fontSize: 11, color: C.textMut, flexShrink: 0 }}>縮放請用文件內控制</span>
               )}
-              <a href={url} target="_blank" rel="noopener noreferrer" style={{ ...btn('ghost'), padding: '4px 10px', fontSize: 12, color: C.textSec, textDecoration: 'none', flexShrink: 0 }}>↗</a>
+              {/* 全螢幕按鈕 */}
+              <button
+                onClick={() => {
+                  const isFS = document.fullscreenElement || document.webkitFullscreenElement;
+                  if (isFS) {
+                    if (document.exitFullscreen) document.exitFullscreen().catch(() => {});
+                    else if (document.webkitExitFullscreen) document.webkitExitFullscreen();
+                  } else {
+                    const iframe = document.querySelector('iframe');
+                    const target = iframe || document.body;
+                    if (target.requestFullscreen) target.requestFullscreen().catch(() => {});
+                    else if (target.webkitRequestFullscreen) target.webkitRequestFullscreen();
+                  }
+                }}
+                style={{
+                  background: '#5b8dee', color: '#fff', border: 'none',
+                  borderRadius: 7, padding: '5px 14px', fontSize: 13,
+                  fontWeight: 700, cursor: 'pointer', flexShrink: 0,
+                  fontFamily: 'inherit',
+                }}
+              >
+                全螢幕
+              </button>
               <button style={{ ...btn('ghost'), padding: '4px 10px', fontSize: 13, flexShrink: 0 }} onClick={onClose}>✕</button>
             </div>
             {isMd ? (
@@ -2449,11 +2493,95 @@ ${txText}
       const [briefing,  setBriefing]  = useState('');
       const [isRecording, setIsRecording] = useState(false);
       const [recordingSeconds, setRecordingSeconds] = useState(0);
+      const [headerHidden, setHeaderHidden] = useState(false);
+      const [isFullscreen, setIsFullscreen] = useState(false);
+      const lastScrollY = useRef(0);
+
+      // ─── App 層全螢幕按鈕（Meeting 元件外，確保 position:fixed 不受父層影響）─────
+      useEffect(() => {
+        const onFSChange = () => {
+          setIsFullscreen(!!(document.fullscreenElement || document.webkitFullscreenElement));
+        };
+        document.addEventListener('fullscreenchange', onFSChange);
+        document.addEventListener('webkitfullscreenchange', onFSChange);
+        return () => {
+          document.removeEventListener('fullscreenchange', onFSChange);
+          document.removeEventListener('webkitfullscreenchange', onFSChange);
+        };
+      }, []);
+
+      const toggleFullscreen = () => {
+        const isFS = document.fullscreenElement || document.webkitFullscreenElement;
+        if (isFS) {
+          if (document.exitFullscreen) document.exitFullscreen().catch(() => {});
+          else if (document.webkitExitFullscreen) document.webkitExitFullscreen();
+        } else {
+          const iframe = document.querySelector('iframe');
+          const target = iframe || document.body;
+          if (target.requestFullscreen) target.requestFullscreen().catch(e => console.warn('全螢幕失敗:', e));
+          else if (target.webkitRequestFullscreen) target.webkitRequestFullscreen();
+        }
+      };
+
       // Meeting 每秒回呼：active=是否錄音中, seconds=累積總秒數
       const handleRecordingChange = (active, seconds = 0) => {
         setIsRecording(active);
         if (active) setRecordingSeconds(seconds);
       };
+
+      // ─── Header 隱藏/顯示（全螢幕請求已移到 tab onClick，避免被瀏覽器擋）─────────────
+      useEffect(() => {
+        if (phase === 1) {
+          setHeaderHidden(true);
+          lastScrollY.current = window.scrollY;
+        } else {
+          setHeaderHidden(false);
+        }
+      }, [phase]);
+
+      // 往上滑：退出全螢幕，Header 重新出現
+      useEffect(() => {
+        if (phase !== 1) return;
+        // 退出全螢幕的 helper（含 Safari webkit 前綴）
+        const exitFS = () => {
+          const isFS = document.fullscreenElement || document.webkitFullscreenElement;
+          if (isFS) {
+            if (document.exitFullscreen) document.exitFullscreen().catch(() => {});
+            else if (document.webkitExitFullscreen) document.webkitExitFullscreen();
+          }
+        };
+        const onScroll = () => {
+          const y = window.scrollY;
+          if (y < lastScrollY.current - 40) {
+            // 往上滑超過 40px
+            exitFS();
+            setHeaderHidden(false);
+          } else if (y > lastScrollY.current + 10) {
+            // 往下滑就隱藏 Header
+            setHeaderHidden(true);
+          }
+          lastScrollY.current = y;
+        };
+        // 觸控裝置：用 touchstart/touchend 偵測上滑手勢
+        let touchStartY = 0;
+        const onTouchStart = (e) => { touchStartY = e.touches[0].clientY; };
+        const onTouchEnd = (e) => {
+          const dy = e.changedTouches[0].clientY - touchStartY;
+          if (dy > 60) {
+            // 往下拉（手指向下移動超過 60px）→ 顯示 Header
+            exitFS();
+            setHeaderHidden(false);
+          }
+        };
+        window.addEventListener('scroll', onScroll, { passive: true });
+        window.addEventListener('touchstart', onTouchStart, { passive: true });
+        window.addEventListener('touchend', onTouchEnd, { passive: true });
+        return () => {
+          window.removeEventListener('scroll', onScroll);
+          window.removeEventListener('touchstart', onTouchStart);
+          window.removeEventListener('touchend', onTouchEnd);
+        };
+      }, [phase]);
 
       useEffect(() => {
         if (!projectId) return;
@@ -2509,6 +2637,7 @@ ${txText}
             onTitleSave={setProjectTitle}
             isRecording={isRecording}
             recordingSeconds={recordingSeconds}
+            hidden={headerHidden}
           />
           {phase === 0 && <PreMeeting projectId={projectId} proposals={proposals} setProposals={setProposals} setSyncOk={setSyncOk} journal={journal} projectTitle={projectTitle} meetingDate={meetingDate} setMeetingDate={setMeetingDate} meetingTime={meetingTime} setMeetingTime={setMeetingTime} briefing={briefing} />}
           {/* Meeting: 永遠掛載，避免切換 tab 時 unmount 導致計時狀態歸零 */}
@@ -2520,7 +2649,22 @@ ${txText}
           </div>
           {phase === 2 && <PostMeeting proposals={proposals} audioBlob={audioBlob} onSaveJournal={saveToJournal} projectId={projectId} projectTitle={projectTitle} />}
           {phase === 3 && <Journal journal={journal} setJournal={setJournal} projectId={projectId} />}
-
+          {/* 全螢幕按鈕：只在會議進行時顯示，放在 App 最外層確保 position:fixed 正常 */}
+          {phase === 1 && (
+            <button onClick={toggleFullscreen} style={{
+              position: 'fixed', bottom: 24, right: 24, zIndex: 9999,
+              background: isFullscreen ? C.accent : C.bgPanel,
+              border: `1px solid ${isFullscreen ? C.accent : C.border}`,
+              borderRadius: 10, padding: '8px 14px',
+              display: 'flex', alignItems: 'center', gap: 6,
+              fontSize: 13, fontWeight: 600,
+              color: isFullscreen ? '#fff' : C.textSec,
+              cursor: 'pointer', backdropFilter: 'blur(12px)',
+              boxShadow: '0 4px 20px rgba(0,0,0,0.5)',
+            }}>
+              {isFullscreen ? '↙ 縮小' : '↗ 全螢幕'}
+            </button>
+          )}
         </div>
       );
     }
