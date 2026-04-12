@@ -260,7 +260,14 @@
     const transcribeSegment = async (segment, openaiKey, attempt = 1) => {
       try {
         const fd = new FormData();
-        fd.append('file', segment.blob, `segment-${segment.index}.opus`);
+        // 依 blob 類型決定副檔名，Whisper 用副檔名判斷格式
+        const blobType = segment.blob.type || '';
+        const ext = blobType.includes('mp4') || blobType.includes('m4a') ? 'm4a'
+                  : blobType.includes('webm') ? 'webm'
+                  : blobType.includes('opus') ? 'opus'
+                  : blobType.includes('mpeg') || blobType.includes('mp3') ? 'mp3'
+                  : 'm4a'; // 預設
+        fd.append('file', segment.blob, `segment-${segment.index}.${ext}`);
         fd.append('model', 'whisper-1');
         fd.append('language', AUDIO_CONFIG.whisperLanguage);
         fd.append('prompt', AUDIO_CONFIG.whisperPrompt);
@@ -1878,7 +1885,7 @@
           } catch (e) {
             console.warn('切段失敗，改用原始檔案作為單一段落：', e.message);
             // fallback：整個音檔當一段直接送 Whisper
-            segs = [{ index: 0, blob: compressed, start: 0, end: duration }];
+            segs = [{ index: 0, blob: compressed, startSec: 0, durationSec: duration }];
           }
           setSegmentProgress(1);
           setSegmentCount(segs.length);
