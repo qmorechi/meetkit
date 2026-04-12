@@ -358,11 +358,11 @@
 
       useEffect(() => {
         if (recent.length === 0) return;
-        const ids = recent.map(p => p.id).join(',');
-        db(`projects?id=in.(${ids})&select=id,title`)
+        const codes = recent.map(p => p.id).join(',');
+        db(`projects?code=in.(${codes})&select=code,title`)
           .then(r => r.json()).then(data => {
             const map = {};
-            data.forEach(p => { map[p.id] = p.title; });
+            data.forEach(p => { map[p.code] = p.title; });
             setRecentTitles(map);
           }).catch(() => {});
       }, []);
