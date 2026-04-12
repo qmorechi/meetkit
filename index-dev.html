@@ -498,7 +498,7 @@
     }
 
     // ─── HEADER ──────────────────────────────────────────────────────────────────
-    function Header({ phase, setPhase, syncOk, journalCount, projectId, projectTitle, onTitleSave, isRecording, recordingSeconds }) {
+    function Header({ phase, setPhase, syncOk, journalCount, projectId, projectTitle, onTitleSave, isRecording, recordingSeconds, hidden }) {
       const [editing, setEditing] = useState(false);
       const [draft, setDraft] = useState(projectTitle);
 
@@ -520,7 +520,13 @@
       ];
 
       return (
-        <header style={{ background: C.bgPanel + 'ee', borderBottom: `1px solid ${C.border}`, position: 'sticky', top: 0, zIndex: 100, backdropFilter: 'blur(16px)' }}>
+        <header style={{
+          background: C.bgPanel + 'ee', borderBottom: `1px solid ${C.border}`,
+          position: 'sticky', top: 0, zIndex: 100, backdropFilter: 'blur(16px)',
+          // 往上滑才顯示：用 transform 平滑滑出/滑入
+          transform: hidden ? 'translateY(-110%)' : 'translateY(0)',
+          transition: 'transform 0.35s ease',
+        }}>
           {/* Project title bar */}
           <div style={{ borderBottom: `1px solid ${C.border}22`, padding: '6px 20px', display: 'flex', alignItems: 'center', gap: 10, maxWidth: 1100, margin: '0 auto' }}>
             <span style={{ fontSize: 11, color: C.textMut, letterSpacing: '0.05em' }}>專案</span>
@@ -2449,11 +2455,68 @@ ${txText}
       const [briefing,  setBriefing]  = useState('');
       const [isRecording, setIsRecording] = useState(false);
       const [recordingSeconds, setRecordingSeconds] = useState(0);
+      const [headerHidden, setHeaderHidden] = useState(false);
+      const lastScrollY = useRef(0);
+
       // Meeting 每秒回呼：active=是否錄音中, seconds=累積總秒數
       const handleRecordingChange = (active, seconds = 0) => {
         setIsRecording(active);
         if (active) setRecordingSeconds(seconds);
       };
+
+      // ─── 全螢幕 + Header 隱藏/顯示 ─────────────
+      useEffect(() => {
+        if (phase === 1) {
+          // 進入會議進行：請求全螢幕並隱藏 Header
+          if (document.documentElement.requestFullscreen) {
+            document.documentElement.requestFullscreen().catch(() => {});
+          }
+          setHeaderHidden(true);
+          lastScrollY.current = window.scrollY;
+        } else {
+          // 離開會議進行：退出全螢幕並顯示 Header
+          if (document.fullscreenElement) {
+            document.exitFullscreen().catch(() => {});
+          }
+          setHeaderHidden(false);
+        }
+      }, [phase]);
+
+      // 往上滑：退出全螢幕，Header 重新出現
+      useEffect(() => {
+        if (phase !== 1) return;
+        const onScroll = () => {
+          const y = window.scrollY;
+          if (y < lastScrollY.current - 40) {
+            // 往上滑超過 40px
+            if (document.fullscreenElement) document.exitFullscreen().catch(() => {});
+            setHeaderHidden(false);
+          } else if (y > lastScrollY.current + 10) {
+            // 往下滑就隱藏 Header
+            setHeaderHidden(true);
+          }
+          lastScrollY.current = y;
+        };
+        // 觸控裝置：用 touchstart/touchend 偵測上滑手勢
+        let touchStartY = 0;
+        const onTouchStart = (e) => { touchStartY = e.touches[0].clientY; };
+        const onTouchEnd = (e) => {
+          const dy = e.changedTouches[0].clientY - touchStartY;
+          if (dy > 60) {
+            // 往下拉（手指向下移動超過 60px）→ 顯示 Header
+            if (document.fullscreenElement) document.exitFullscreen().catch(() => {});
+            setHeaderHidden(false);
+          }
+        };
+        window.addEventListener('scroll', onScroll, { passive: true });
+        window.addEventListener('touchstart', onTouchStart, { passive: true });
+        window.addEventListener('touchend', onTouchEnd, { passive: true });
+        return () => {
+          window.removeEventListener('scroll', onScroll);
+          window.removeEventListener('touchstart', onTouchStart);
+          window.removeEventListener('touchend', onTouchEnd);
+        };
+      }, [phase]);
 
       useEffect(() => {
         if (!projectId) return;
@@ -2509,6 +2572,7 @@ ${txText}
             onTitleSave={setProjectTitle}
             isRecording={isRecording}
             recordingSeconds={recordingSeconds}
+            hidden={headerHidden}
           />
           {phase === 0 && <PreMeeting projectId={projectId} proposals={proposals} setProposals={setProposals} setSyncOk={setSyncOk} journal={journal} projectTitle={projectTitle} meetingDate={meetingDate} setMeetingDate={setMeetingDate} meetingTime={meetingTime} setMeetingTime={setMeetingTime} briefing={briefing} />}
           {/* Meeting: 永遠掛載，避免切換 tab 時 unmount 導致計時狀態歸零 */}
