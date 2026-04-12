@@ -148,29 +148,39 @@
       if (ffmpegInstance) return ffmpegInstance;
       const { FFmpeg } = FFmpegWASM;
       ffmpegInstance = new FFmpeg();
-      await ffmpegInstance.load({
-        coreURL: 'https://unpkg.com/@ffmpeg/core@0.12.6/dist/umd/ffmpeg-core.js',
-      });
+      // 10 秒 timeout：GitHub Pages 沒有 COOP/COEP headers 時 SharedArrayBuffer 會卡住
+      await Promise.race([
+        ffmpegInstance.load({ coreURL: 'https://unpkg.com/@ffmpeg/core@0.12.6/dist/umd/ffmpeg-core.js' }),
+        new Promise((_, reject) => setTimeout(() => reject(new Error('ffmpeg timeout')), 10000)),
+      ]);
       return ffmpegInstance;
     };
 
     // 階段 1：壓縮 → 16kHz mono opus 24kbps
+    // 若 ffmpeg 無法載入（例如 GitHub Pages 無 SharedArrayBuffer），直接回傳原始檔案
     const compressAudio = async (inputBlob, onProgress) => {
-      const ffmpeg = await getFFmpeg();
-      await ffmpeg.writeFile('input.m4a', new Uint8Array(await inputBlob.arrayBuffer()));
-      ffmpeg.on('progress', ({ progress }) => { if (onProgress) onProgress(Math.min(progress, 1)); });
-      await ffmpeg.exec([
-        '-i', 'input.m4a',
-        '-ar', String(AUDIO_CONFIG.sampleRate),
-        '-ac', String(AUDIO_CONFIG.channels),
-        '-c:a', AUDIO_CONFIG.codec,
-        '-b:a', AUDIO_CONFIG.bitrate,
-        'output.opus',
-      ]);
-      const out = await ffmpeg.readFile('output.opus');
-      await ffmpeg.deleteFile('input.m4a');
-      await ffmpeg.deleteFile('output.opus');
-      return new Blob([out.buffer], { type: 'audio/opus' });
+      try {
+        const ffmpeg = await getFFmpeg();
+        await ffmpeg.writeFile('input.m4a', new Uint8Array(await inputBlob.arrayBuffer()));
+        ffmpeg.on('progress', ({ progress }) => { if (onProgress) onProgress(Math.min(progress, 1)); });
+        await ffmpeg.exec([
+          '-i', 'input.m4a',
+          '-ar', String(AUDIO_CONFIG.sampleRate),
+          '-ac', String(AUDIO_CONFIG.channels),
+          '-c:a', AUDIO_CONFIG.codec,
+          '-b:a', AUDIO_CONFIG.bitrate,
+          'output.opus',
+        ]);
+        const out = await ffmpeg.readFile('output.opus');
+        await ffmpeg.deleteFile('input.m4a');
+        await ffmpeg.deleteFile('output.opus');
+        if (onProgress) onProgress(1);
+        return new Blob([out.buffer], { type: 'audio/opus' });
+      } catch (e) {
+        console.warn('ffmpeg 壓縮失敗，改用原始檔案直接上傳：', e.message);
+        if (onProgress) onProgress(1);
+        return inputBlob; // 直接用原始音檔
+      }
     };
 
     // 階段 2a：靜音偵測
