@@ -561,7 +561,17 @@
               {phases.map((p, i) => (
                 <React.Fragment key={p.id}>
                   <button
-                    onClick={() => setPhase(p.id)}
+                    onClick={() => {
+                      setPhase(p.id);
+                      // 切到「會議進行」時，直接在點擊當下請求全螢幕（useEffect 裡呼叫會被瀏覽器擋）
+                      if (p.id === 1) {
+                        if (document.documentElement.requestFullscreen) {
+                          document.documentElement.requestFullscreen().catch(() => {});
+                        }
+                      } else {
+                        if (document.fullscreenElement) document.exitFullscreen().catch(() => {});
+                      }
+                    }}
                     style={{ ...btn(phase === p.id ? 'primary' : 'ghost'), padding: '6px 13px', fontSize: 13, opacity: phase > p.id ? 0.55 : phase === p.id ? 1 : 0.75 }}
                   >
                     <span>{p.icon}</span>
@@ -2464,20 +2474,12 @@ ${txText}
         if (active) setRecordingSeconds(seconds);
       };
 
-      // ─── 全螢幕 + Header 隱藏/顯示 ─────────────
+      // ─── Header 隱藏/顯示（全螢幕請求已移到 tab onClick，避免被瀏覽器擋）─────────────
       useEffect(() => {
         if (phase === 1) {
-          // 進入會議進行：請求全螢幕並隱藏 Header
-          if (document.documentElement.requestFullscreen) {
-            document.documentElement.requestFullscreen().catch(() => {});
-          }
           setHeaderHidden(true);
           lastScrollY.current = window.scrollY;
         } else {
-          // 離開會議進行：退出全螢幕並顯示 Header
-          if (document.fullscreenElement) {
-            document.exitFullscreen().catch(() => {});
-          }
           setHeaderHidden(false);
         }
       }, [phase]);
