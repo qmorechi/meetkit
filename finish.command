@@ -10,54 +10,6 @@ echo "  ◈  MeetKit 收工中..."
 echo "═══════════════════════════════════════════"
 echo ""
 
-# ── 1. 檢查 .claude-handoff.md 是否存在且最近更新過 ──
-HANDOFF_FILE="$PROJECT_DIR/.claude-handoff.md"
-
-if [ ! -f "$HANDOFF_FILE" ]; then
-  echo "⚠ 找不到 .claude-handoff.md"
-  echo ""
-  echo "  可能原因:"
-  echo "  • 這是第一次使用 finish.command"
-  echo "  • Claude Code 這次 session 沒有更新交接紀錄"
-  echo ""
-  echo "  建議: 回到 Claude Code 說「幫我整理交接」,等它更新後再執行本腳本"
-  echo ""
-  echo "  仍要繼續 push 嗎？（y/N）"
-  read -r CONTINUE_WITHOUT_HANDOFF
-  if [ "$CONTINUE_WITHOUT_HANDOFF" != "y" ] && [ "$CONTINUE_WITHOUT_HANDOFF" != "Y" ]; then
-    echo ""
-    echo "已取消。請先更新交接紀錄。"
-    read -n 1 -s -r -p "（按任意鍵關閉）"
-    exit 0
-  fi
-else
-  # 檢查 handoff 檔案的修改時間
-  if [ "$(uname)" = "Darwin" ]; then
-    HANDOFF_MTIME=$(stat -f "%m" "$HANDOFF_FILE")
-  else
-    HANDOFF_MTIME=$(stat -c "%Y" "$HANDOFF_FILE")
-  fi
-  NOW=$(date +%s)
-  AGE_MINUTES=$(( (NOW - HANDOFF_MTIME) / 60 ))
-
-  if [ "$AGE_MINUTES" -gt 30 ]; then
-    echo "⚠ .claude-handoff.md 已經 $AGE_MINUTES 分鐘沒更新"
-    echo ""
-    echo "  可能 Claude Code 這次 session 忘了更新交接紀錄"
-    echo ""
-    echo "  仍要繼續 push 嗎？（y/N）"
-    read -r CONTINUE_OLD_HANDOFF
-    if [ "$CONTINUE_OLD_HANDOFF" != "y" ] && [ "$CONTINUE_OLD_HANDOFF" != "Y" ]; then
-      echo ""
-      echo "已取消。請回到 Claude Code 說「幫我整理交接」再執行本腳本。"
-      read -n 1 -s -r -p "（按任意鍵關閉）"
-      exit 0
-    fi
-  else
-    echo "✓ 交接紀錄已更新（$AGE_MINUTES 分鐘前）"
-  fi
-fi
-echo ""
 
 # ── 2. 顯示即將提交的變動 ──
 echo "═══════════════════════════════════════════"
@@ -97,14 +49,7 @@ fi
 echo ""
 
 # ── 4. 組合 commit 訊息 ──
-# 優先從 .claude-handoff.md 的「## 摘要」段落取內容
-if [ -f "$HANDOFF_FILE" ]; then
-  SUMMARY=$(awk '/^## 摘要/{flag=1; next} /^## /{flag=0} flag' "$HANDOFF_FILE" | sed '/^$/d' | head -2 | tr '\n' ' ')
-fi
-
-if [ -z "$SUMMARY" ]; then
-  SUMMARY="自動收工 commit"
-fi
+SUMMARY="自動收工 commit"
 
 TIMESTAMP=$(date "+%Y-%m-%d %H:%M")
 DEVICE=$(hostname | sed 's/\.local//')
