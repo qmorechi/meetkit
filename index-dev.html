@@ -1864,8 +1864,23 @@
           // ── 階段 2：取得時長 + 靜音切段 ──────────────────────────────────
           setStatus('segmenting');
           const duration = await getAudioDuration(audioSrc);
-          const boundaries = await calculateSegmentBoundaries(compressed, duration);
-          const segs = await segmentAudio(compressed, boundaries, p => setSegmentProgress(p));
+          let segs;
+          try {
+            // 加 15 秒 timeout，ffmpeg 無法使用時直接跳過
+            const segResult = await Promise.race([
+              (async () => {
+                const boundaries = await calculateSegmentBoundaries(compressed, duration);
+                return await segmentAudio(compressed, boundaries, p => setSegmentProgress(p));
+              })(),
+              new Promise((_, reject) => setTimeout(() => reject(new Error('segmentation timeout')), 15000)),
+            ]);
+            segs = segResult;
+          } catch (e) {
+            console.warn('切段失敗，改用原始檔案作為單一段落：', e.message);
+            // fallback：整個音檔當一段直接送 Whisper
+            segs = [{ index: 0, blob: compressed, start: 0, end: duration }];
+          }
+          setSegmentProgress(1);
           setSegmentCount(segs.length);
 
           // ── 階段 3：並行上傳 Whisper ──────────────────────────────────────
