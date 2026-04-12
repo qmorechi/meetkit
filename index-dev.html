@@ -1984,15 +1984,34 @@ ${txText}
 （根據整體會議內容，提出 3-5 點具體可行的策略建議，包含優先順序推薦與注意事項）`;
         try {
           let summaryText = '';
+          // 優先嘗試 Anthropic，失敗（含 CORS）自動 fallback 到 GPT-4o
+          let usedEngine = 'gpt-4o';
           if (anthropicKey.trim()) {
-            const res = await fetch('https://api.anthropic.com/v1/messages', { method: 'POST', headers: { 'x-api-key': anthropicKey.trim(), 'anthropic-version': '2023-06-01', 'anthropic-dangerous-request-allow-browsers': 'true', 'Content-Type': 'application/json' }, body: JSON.stringify({ model: 'claude-sonnet-4-6', max_tokens: 4096, messages: [{ role: 'user', content: prompt }] }) });
-            if (!res.ok) { const e = await res.json(); throw new Error(e.error?.message || `HTTP ${res.status}`); }
-            summaryText = (await res.json()).content[0].text;
-          } else {
+            try {
+              const res = await fetch('https://api.anthropic.com/v1/messages', {
+                method: 'POST',
+                headers: {
+                  'x-api-key': anthropicKey.trim(),
+                  'anthropic-version': '2023-06-01',
+                  'anthropic-dangerous-request-allow-browsers': 'true',
+                  'Content-Type': 'application/json',
+                },
+                body: JSON.stringify({ model: 'claude-opus-4-5', max_tokens: 4096, messages: [{ role: 'user', content: prompt }] }),
+              });
+              if (!res.ok) { const e = await res.json(); throw new Error(e.error?.message || `HTTP ${res.status}`); }
+              summaryText = (await res.json()).content[0].text;
+              usedEngine = 'claude';
+            } catch (anthropicErr) {
+              console.warn('Anthropic 摘要失敗，改用 GPT-4o：', anthropicErr.message);
+              // fallback 到 GPT-4o
+            }
+          }
+          if (!summaryText) {
             const res = await fetch('https://api.openai.com/v1/chat/completions', { method: 'POST', headers: { Authorization: `Bearer ${openaiKey.trim()}`, 'Content-Type': 'application/json' }, body: JSON.stringify({ model: 'gpt-4o', messages: [{ role: 'user', content: prompt }] }) });
             if (!res.ok) { const e = await res.json(); throw new Error(e.error?.message || `HTTP ${res.status}`); }
             summaryText = (await res.json()).choices[0].message.content;
           }
+          console.log('摘要引擎：', usedEngine);
           setSummary(summaryText);
           // 自動存前情提要到 Supabase
           if (projectId) {
