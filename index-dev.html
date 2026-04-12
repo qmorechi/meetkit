@@ -1108,7 +1108,8 @@
       const iframeSrc = () => {
         if (type?.viewer === 'office') return `https://view.officeapps.live.com/op/embed.aspx?src=${encodeURIComponent(url)}`;
         if (type?.viewer === 'google') return `https://docs.google.com/viewer?url=${encodeURIComponent(url)}&embedded=true`;
-        if (isPdf) return `${url}#zoom=${pdfZoom}`;
+        // toolbar=0 隱藏 Chrome PDF 閱讀器的側邊縮圖欄和工具列
+        if (isPdf) return `${url}#toolbar=0&zoom=${pdfZoom}`;
         return url;
       };
 
