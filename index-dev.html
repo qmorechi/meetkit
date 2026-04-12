@@ -1160,8 +1160,8 @@
               {(type?.viewer === 'office' || type?.viewer === 'google') && (
                 <span style={{ fontSize: 11, color: C.textMut, flexShrink: 0 }}>縮放請用文件內控制</span>
               )}
-              {/* 全螢幕按鈕（取代舊的 ↗ 新分頁按鈕，避免混淆）*/}
-              <button style={{ ...btn('primary'), padding: '4px 12px', fontSize: 12, fontWeight: 600, flexShrink: 0 }}
+              {/* 全螢幕按鈕 */}
+              <button
                 onClick={() => {
                   const isFS = document.fullscreenElement || document.webkitFullscreenElement;
                   if (isFS) {
@@ -1173,7 +1173,14 @@
                     if (target.requestFullscreen) target.requestFullscreen().catch(() => {});
                     else if (target.webkitRequestFullscreen) target.webkitRequestFullscreen();
                   }
-                }}>
+                }}
+                style={{
+                  background: '#5b8dee', color: '#fff', border: 'none',
+                  borderRadius: 7, padding: '5px 14px', fontSize: 13,
+                  fontWeight: 700, cursor: 'pointer', flexShrink: 0,
+                  fontFamily: 'inherit',
+                }}
+              >
                 全螢幕
               </button>
               <button style={{ ...btn('ghost'), padding: '4px 10px', fontSize: 13, flexShrink: 0 }} onClick={onClose}>✕</button>
