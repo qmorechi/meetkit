@@ -563,13 +563,18 @@
                   <button
                     onClick={() => {
                       setPhase(p.id);
-                      // 切到「會議進行」時，直接在點擊當下請求全螢幕（useEffect 裡呼叫會被瀏覽器擋）
+                      const el = document.documentElement;
+                      // 切到「會議進行」：請求全螢幕（含 Safari webkit 前綴）
                       if (p.id === 1) {
-                        if (document.documentElement.requestFullscreen) {
-                          document.documentElement.requestFullscreen().catch(() => {});
-                        }
+                        if (el.requestFullscreen) el.requestFullscreen().catch(() => {});
+                        else if (el.webkitRequestFullscreen) el.webkitRequestFullscreen();
                       } else {
-                        if (document.fullscreenElement) document.exitFullscreen().catch(() => {});
+                        // 離開會議進行：退出全螢幕
+                        const isFS = document.fullscreenElement || document.webkitFullscreenElement;
+                        if (isFS) {
+                          if (document.exitFullscreen) document.exitFullscreen().catch(() => {});
+                          else if (document.webkitExitFullscreen) document.webkitExitFullscreen();
+                        }
                       }
                     }}
                     style={{ ...btn(phase === p.id ? 'primary' : 'ghost'), padding: '6px 13px', fontSize: 13, opacity: phase > p.id ? 0.55 : phase === p.id ? 1 : 0.75 }}
@@ -2487,11 +2492,19 @@ ${txText}
       // 往上滑：退出全螢幕，Header 重新出現
       useEffect(() => {
         if (phase !== 1) return;
+        // 退出全螢幕的 helper（含 Safari webkit 前綴）
+        const exitFS = () => {
+          const isFS = document.fullscreenElement || document.webkitFullscreenElement;
+          if (isFS) {
+            if (document.exitFullscreen) document.exitFullscreen().catch(() => {});
+            else if (document.webkitExitFullscreen) document.webkitExitFullscreen();
+          }
+        };
         const onScroll = () => {
           const y = window.scrollY;
           if (y < lastScrollY.current - 40) {
             // 往上滑超過 40px
-            if (document.fullscreenElement) document.exitFullscreen().catch(() => {});
+            exitFS();
             setHeaderHidden(false);
           } else if (y > lastScrollY.current + 10) {
             // 往下滑就隱藏 Header
@@ -2506,7 +2519,7 @@ ${txText}
           const dy = e.changedTouches[0].clientY - touchStartY;
           if (dy > 60) {
             // 往下拉（手指向下移動超過 60px）→ 顯示 Header
-            if (document.fullscreenElement) document.exitFullscreen().catch(() => {});
+            exitFS();
             setHeaderHidden(false);
           }
         };
