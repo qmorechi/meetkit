@@ -1210,6 +1210,33 @@
       const [briefingOpen, setBriefingOpen] = useState(false);
       const [cardUploading, setCardUploading] = useState({});
       const cardFileRefs = useRef({});
+      const [isFullscreen, setIsFullscreen] = useState(false);
+
+      // 全螢幕 toggle（含 Safari webkit 前綴）
+      const toggleFullscreen = () => {
+        const isFS = document.fullscreenElement || document.webkitFullscreenElement;
+        if (isFS) {
+          if (document.exitFullscreen) document.exitFullscreen().catch(() => {});
+          else if (document.webkitExitFullscreen) document.webkitExitFullscreen();
+        } else {
+          const el = document.documentElement;
+          if (el.requestFullscreen) el.requestFullscreen().catch(() => {});
+          else if (el.webkitRequestFullscreen) el.webkitRequestFullscreen();
+        }
+      };
+
+      // 監聽全螢幕狀態變化，更新按鈕圖示
+      useEffect(() => {
+        const onFSChange = () => {
+          setIsFullscreen(!!(document.fullscreenElement || document.webkitFullscreenElement));
+        };
+        document.addEventListener('fullscreenchange', onFSChange);
+        document.addEventListener('webkitfullscreenchange', onFSChange);
+        return () => {
+          document.removeEventListener('fullscreenchange', onFSChange);
+          document.removeEventListener('webkitfullscreenchange', onFSChange);
+        };
+      }, []);
 
       // 錄音確認狀態機：preparing / unconfirmed / in_progress / pending_pause_confirm / paused / ended
       // preparing = 預設，自由瀏覽議程；unconfirmed = 紅色 Modal 要求確認錄音
@@ -1572,6 +1599,22 @@
               onConfirm={confirmPause}
             />
           )}
+          {/* 全螢幕浮動按鈕：固定右下角 */}
+          <button
+            onClick={toggleFullscreen}
+            title={isFullscreen ? '退出全螢幕' : '全螢幕'}
+            style={{
+              position: 'fixed', bottom: 24, right: 24, zIndex: 999,
+              background: C.bgPanel + 'dd', border: `1px solid ${C.border}`,
+              borderRadius: 10, width: 44, height: 44,
+              display: 'flex', alignItems: 'center', justifyContent: 'center',
+              fontSize: 20, cursor: 'pointer', backdropFilter: 'blur(12px)',
+              boxShadow: '0 2px 12px rgba(0,0,0,0.3)',
+              transition: 'opacity 0.2s',
+            }}
+          >
+            {isFullscreen ? '⊠' : '⛶'}
+          </button>
         </>
       );
     }
