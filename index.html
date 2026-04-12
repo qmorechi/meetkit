@@ -33,6 +33,10 @@
     @keyframes pulse { 0%, 100% { box-shadow: 0 0 0 0 rgba(192,57,43,0.4); } 50% { box-shadow: 0 0 0 8px rgba(192,57,43,0); } }
     @keyframes spin { to { transform: rotate(360deg); } }
     @keyframes fadeIn { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: translateY(0); } }
+    @keyframes breathe {
+      0%, 100% { color: #ec1d24; border-color: rgba(236,29,36,0.4); background-color: rgba(236,29,36,0.1); }
+      50%       { color: #f7ec13; border-color: rgba(247,236,19,0.6); background-color: rgba(247,236,19,0.12); }
+    }
     .fade-in { animation: fadeIn 0.25s ease; }
     .mk-md h1,.mk-md h2,.mk-md h3,.mk-md h4 { font-weight: 700; margin: 1.2em 0 0.5em; color: #e8e8e8; }
     .mk-md h1 { font-size: 1.6em; } .mk-md h2 { font-size: 1.3em; } .mk-md h3 { font-size: 1.1em; }
@@ -53,6 +57,9 @@
       .hide-mobile { display: none !important; }
     }
   </style>
+  <script src="https://unpkg.com/@ffmpeg/ffmpeg@0.12.10/dist/umd/ffmpeg.js"></script>
+  <script src="https://unpkg.com/@ffmpeg/util@0.12.1/dist/umd/index.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/qrcodejs@1.0.0/qrcode.min.js"></script>
 </head>
 <body>
   <div id="root"></div>
@@ -110,6 +117,204 @@
     };
 
     const genId = () => Math.random().toString(36).slice(2, 8).toUpperCase();
+
+    // ─── AUDIO PIPELINE ──────────────────────────────────────────────────────────
+    // 壓縮 → 靜音切段 → 並行 Whisper 上傳 → 合併逐字稿
+    // 依賴：ffmpeg.wasm（<head> CDN 載入）
+    // 決策文件：docs/audio-pipeline.md
+    // ─────────────────────────────────────────────────────────────────────────────
+
+    const AUDIO_CONFIG = {
+      sampleRate: 16000,
+      channels: 1,
+      bitrate: '24k',
+      codec: 'libopus',
+      targetSegmentMinutes: 15,
+      maxSegmentMinutes: 20,
+      searchWindowMinutes: 2,
+      silenceThresholdDb: -40,
+      minSilenceSec: 0.8,
+      parallelChannels: 4,
+      retryAttempts: 3,
+      retryDelayMs: 2000,
+      maxFileSizeMB: 500,
+      whisperLanguage: 'zh',
+      whisperPrompt: 'Cosmoship, 宇宙小艇, SIPAI, 偷瞄的X, MX Design, Figma, Supabase, Anthropic, Claude, ComfyUI, Flux, MeetKit',
+    };
+
+    // ffmpeg 懶載入（第一次呼叫時初始化，之後重用）
+    let ffmpegInstance = null;
+    const getFFmpeg = async () => {
+      if (ffmpegInstance) return ffmpegInstance;
+      const { FFmpeg } = FFmpegWASM;
+      ffmpegInstance = new FFmpeg();
+      // 10 秒 timeout：GitHub Pages 沒有 COOP/COEP headers 時 SharedArrayBuffer 會卡住
+      await Promise.race([
+        ffmpegInstance.load({ coreURL: 'https://unpkg.com/@ffmpeg/core@0.12.6/dist/umd/ffmpeg-core.js' }),
+        new Promise((_, reject) => setTimeout(() => reject(new Error('ffmpeg timeout')), 10000)),
+      ]);
+      return ffmpegInstance;
+    };
+
+    // 階段 1：壓縮 → 16kHz mono opus 24kbps
+    // 若 ffmpeg 無法載入（例如 GitHub Pages 無 SharedArrayBuffer），直接回傳原始檔案
+    const compressAudio = async (inputBlob, onProgress) => {
+      try {
+        const ffmpeg = await getFFmpeg();
+        await ffmpeg.writeFile('input.m4a', new Uint8Array(await inputBlob.arrayBuffer()));
+        ffmpeg.on('progress', ({ progress }) => { if (onProgress) onProgress(Math.min(progress, 1)); });
+        await ffmpeg.exec([
+          '-i', 'input.m4a',
+          '-ar', String(AUDIO_CONFIG.sampleRate),
+          '-ac', String(AUDIO_CONFIG.channels),
+          '-c:a', AUDIO_CONFIG.codec,
+          '-b:a', AUDIO_CONFIG.bitrate,
+          'output.opus',
+        ]);
+        const out = await ffmpeg.readFile('output.opus');
+        await ffmpeg.deleteFile('input.m4a');
+        await ffmpeg.deleteFile('output.opus');
+        if (onProgress) onProgress(1);
+        return new Blob([out.buffer], { type: 'audio/opus' });
+      } catch (e) {
+        console.warn('ffmpeg 壓縮失敗，改用原始檔案直接上傳：', e.message);
+        if (onProgress) onProgress(1);
+        return inputBlob; // 直接用原始音檔
+      }
+    };
+
+    // 階段 2a：靜音偵測
+    const detectSilence = async (audioBlob, silenceDurationSec) => {
+      const ffmpeg = await getFFmpeg();
+      await ffmpeg.writeFile('detect.opus', new Uint8Array(await audioBlob.arrayBuffer()));
+      const marks = [];
+      ffmpeg.on('log', ({ message }) => {
+        const s = message.match(/silence_start: ([\d.]+)/);
+        const e = message.match(/silence_end: ([\d.]+) \| silence_duration: ([\d.]+)/);
+        if (s) marks.push({ type: 'start', time: parseFloat(s[1]) });
+        if (e) marks.push({ type: 'end', time: parseFloat(e[1]) });
+      });
+      await ffmpeg.exec(['-i', 'detect.opus', '-af',
+        `silencedetect=noise=${AUDIO_CONFIG.silenceThresholdDb}dB:d=${silenceDurationSec}`,
+        '-f', 'null', '-']);
+      await ffmpeg.deleteFile('detect.opus');
+      const silences = [];
+      for (let i = 0; i < marks.length - 1; i++) {
+        if (marks[i].type === 'start' && marks[i + 1].type === 'end') {
+          silences.push({ midpoint: (marks[i].time + marks[i + 1].time) / 2 });
+        }
+      }
+      return silences;
+    };
+
+    // 階段 2b：計算切段邊界
+    const calculateSegmentBoundaries = async (audioBlob, totalDurationSec) => {
+      const targetSec = AUDIO_CONFIG.targetSegmentMinutes * 60;
+      const windowSec = AUDIO_CONFIG.searchWindowMinutes * 60;
+      const maxSec    = AUDIO_CONFIG.maxSegmentMinutes * 60;
+      let silences = await detectSilence(audioBlob, AUDIO_CONFIG.minSilenceSec);
+      if (silences.length === 0) silences = await detectSilence(audioBlob, 0.5); // 寬鬆 fallback
+      const boundaries = [0];
+      let pos = 0;
+      while (pos < totalDurationSec) {
+        const ideal = pos + targetSec;
+        if (ideal >= totalDurationSec) break;
+        const candidates = silences.filter(s => s.midpoint >= ideal - windowSec && s.midpoint <= ideal + windowSec);
+        let cut;
+        if (candidates.length > 0) {
+          cut = candidates.reduce((best, s) =>
+            Math.abs(s.midpoint - ideal) < Math.abs(best.midpoint - ideal) ? s : best
+          ).midpoint;
+        } else if (pos + maxSec < totalDurationSec) {
+          cut = pos + maxSec; // 找不到靜音，強制切
+        } else {
+          break;
+        }
+        boundaries.push(cut);
+        pos = cut;
+      }
+      boundaries.push(totalDurationSec);
+      return boundaries;
+    };
+
+    // 階段 2c：依邊界切出各段 Blob
+    const segmentAudio = async (compressedBlob, boundaries, onProgress) => {
+      const ffmpeg = await getFFmpeg();
+      await ffmpeg.writeFile('full.opus', new Uint8Array(await compressedBlob.arrayBuffer()));
+      const segments = [];
+      for (let i = 0; i < boundaries.length - 1; i++) {
+        const start = boundaries[i];
+        const dur   = boundaries[i + 1] - boundaries[i];
+        const name  = `seg_${i}.opus`;
+        await ffmpeg.exec(['-i', 'full.opus', '-ss', String(start), '-t', String(dur), '-c', 'copy', name]);
+        const data  = await ffmpeg.readFile(name);
+        segments.push({ index: i, blob: new Blob([data.buffer], { type: 'audio/opus' }), startSec: start, durationSec: dur });
+        await ffmpeg.deleteFile(name);
+        if (onProgress) onProgress((i + 1) / (boundaries.length - 1));
+      }
+      await ffmpeg.deleteFile('full.opus');
+      return segments;
+    };
+
+    // 階段 3a：單段 Whisper（含重試）
+    const transcribeSegment = async (segment, openaiKey, attempt = 1) => {
+      try {
+        const fd = new FormData();
+        // 依 blob 類型決定副檔名，Whisper 用副檔名判斷格式
+        const blobType = segment.blob.type || '';
+        const ext = blobType.includes('mp4') || blobType.includes('m4a') ? 'm4a'
+                  : blobType.includes('webm') ? 'webm'
+                  : blobType.includes('opus') ? 'opus'
+                  : blobType.includes('mpeg') || blobType.includes('mp3') ? 'mp3'
+                  : 'm4a'; // 預設
+        fd.append('file', segment.blob, `segment-${segment.index}.${ext}`);
+        fd.append('model', 'whisper-1');
+        fd.append('language', AUDIO_CONFIG.whisperLanguage);
+        fd.append('prompt', AUDIO_CONFIG.whisperPrompt);
+        fd.append('response_format', 'verbose_json');
+        const res = await fetch('https://api.openai.com/v1/audio/transcriptions', {
+          method: 'POST', headers: { Authorization: `Bearer ${openaiKey}` }, body: fd,
+        });
+        if (!res.ok) { const e = await res.json(); throw new Error(e.error?.message || `HTTP ${res.status}`); }
+        const data = await res.json();
+        return { index: segment.index, startSec: segment.startSec, durationSec: segment.durationSec, text: data.text };
+      } catch (err) {
+        if (attempt >= AUDIO_CONFIG.retryAttempts) {
+          return { index: segment.index, error: `段 ${segment.index + 1} 失敗（重試 ${attempt} 次）：${err.message}` };
+        }
+        await new Promise(r => setTimeout(r, AUDIO_CONFIG.retryDelayMs));
+        return transcribeSegment(segment, openaiKey, attempt + 1);
+      }
+    };
+
+    // 階段 3b：4 通道並行上傳池
+    const transcribeAllSegments = async (segments, openaiKey, onProgress) => {
+      const results = new Array(segments.length);
+      let completed = 0;
+      const queue = [...segments];
+      const worker = async () => {
+        while (queue.length > 0) {
+          const seg = queue.shift();
+          if (!seg) break;
+          results[seg.index] = await transcribeSegment(seg, openaiKey);
+          completed++;
+          if (onProgress) onProgress(completed / segments.length);
+        }
+      };
+      await Promise.all(Array(AUDIO_CONFIG.parallelChannels).fill(null).map(worker));
+      return results;
+    };
+
+    // 階段 4：合併（按 index 排序）
+    const mergeTranscripts = (transcripts) => {
+      const sorted = transcripts.filter(t => !t.error).sort((a, b) => a.index - b.index);
+      return {
+        fullText: sorted.map(t => t.text).join('\n\n'),
+        failedSegments: transcripts.filter(t => t.error),
+      };
+    };
+
+    // ─────────────────────────────────────────────────────────────────────────────
 
     // ─── DESIGN TOKENS ───────────────────────────────────────────────────────────
     const C = {
@@ -170,11 +375,11 @@
 
       useEffect(() => {
         if (recent.length === 0) return;
-        const ids = recent.map(p => p.id).join(',');
-        db(`projects?id=in.(${ids})&select=id,title`)
+        const codes = recent.map(p => p.id).join(',');
+        db(`projects?code=in.(${codes})&select=code,title`)
           .then(r => r.json()).then(data => {
             const map = {};
-            data.forEach(p => { map[p.id] = p.title; });
+            data.forEach(p => { map[p.code] = p.title; });
             setRecentTitles(map);
           }).catch(() => {});
       }, []);
@@ -293,7 +498,7 @@
     }
 
     // ─── HEADER ──────────────────────────────────────────────────────────────────
-    function Header({ phase, setPhase, syncOk, journalCount, projectId, projectTitle, onTitleSave }) {
+    function Header({ phase, setPhase, syncOk, journalCount, projectId, projectTitle, onTitleSave, isRecording, recordingSeconds }) {
       const [editing, setEditing] = useState(false);
       const [draft, setDraft] = useState(projectTitle);
 
@@ -370,9 +575,25 @@
               </button>
             </nav>
 
-            <div style={{ display: 'flex', alignItems: 'center', gap: 5, fontSize: 12, color: C.textSec, flexShrink: 0 }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexShrink: 0 }}>
+              {isRecording && (() => {
+                const h = Math.floor(recordingSeconds / 3600);
+                const m = Math.floor((recordingSeconds % 3600) / 60);
+                const s = recordingSeconds % 60;
+                const pad = n => String(n).padStart(2, '0');
+                return (
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 6, border: '2px solid', borderRadius: 20, padding: '3px 12px', animation: 'breathe 2.5s ease-in-out infinite' }}>
+                    <span style={{ width: 6, height: 6, borderRadius: '50%', background: 'currentColor', display: 'inline-block', flexShrink: 0 }} />
+                    <span style={{ fontSize: 12, fontWeight: 600, fontVariantNumeric: 'tabular-nums', letterSpacing: '0.04em' }}>
+                      {h > 0 ? `${pad(h)}:` : ''}{pad(m)}:{pad(s)}
+                    </span>
+                  </div>
+                );
+              })()}
+              <div style={{ display: 'flex', alignItems: 'center', gap: 5, fontSize: 12, color: C.textSec }}>
               <span style={{ width: 7, height: 7, borderRadius: '50%', background: syncOk ? C.success : C.textMut, display: 'inline-block', boxShadow: syncOk ? `0 0 0 2px ${C.success}44` : 'none' }} />
               <span className="hide-mobile">{syncOk ? '即時同步' : '離線'}</span>
+              </div>
             </div>
           </div>
         </header>
@@ -962,16 +1183,26 @@
       window.open(url, '_blank');
     };
 
-    function Meeting({ proposals, setProposals, projectId, audioBlob, setAudioBlob, onRecordingChange, onRegisterStart, briefing }) {
+    function Meeting({ proposals, setProposals, projectId, onGoHome, setPhase, briefing, onRecordingStateChange }) {
       const [activeId, setActiveId] = useState(null);
       const [expanded, setExpanded] = useState({});
       const [briefingOpen, setBriefingOpen] = useState(false);
-      const [isRecording, setIsRecording] = useState(false);
-      const [elapsed, setElapsed] = useState(0);
-      const [audioUrl, setAudioUrl] = useState(null);
       const [cardUploading, setCardUploading] = useState({});
-      const mrRef = useRef(null); const chunksRef = useRef([]); const timerRef = useRef(null);
       const cardFileRefs = useRef({});
+
+      // 錄音確認狀態機：preparing / unconfirmed / in_progress / pending_pause_confirm / paused / ended
+      // preparing = 預設，自由瀏覽議程；unconfirmed = 紅色 Modal 要求確認錄音
+      const [recordingState, setRecordingState] = useState('preparing');
+      const [recordingStartedAt, setRecordingStartedAt] = useState(null);
+      const [recordingEndedAt, setRecordingEndedAt] = useState(null);
+
+      // 分段錄音（純前端，重新整理會掉 — 階段 B 再持久化到 Supabase）
+      // 格式：[{ startedAt: Date, endedAt: Date, durationSeconds: number }, ...]
+      const [segments, setSegments] = useState([]);
+      const [currentSegmentStart, setCurrentSegmentStart] = useState(null);
+      const [totalEndedSeconds, setTotalEndedSeconds] = useState(0);
+      // 歷史段落累積秒數（傳給計時器用）
+      const accumulatedSeconds = segments.reduce((sum, s) => sum + s.durationSeconds, 0);
 
       const parseFiles = (p) => {
         try { const u = JSON.parse(p.file_url||'[]'); const n = JSON.parse(p.file_name||'[]'); if (Array.isArray(u)) return u.map((url,i)=>({url,name:n[i]||url.split('/').pop()})); } catch {}
@@ -1012,30 +1243,167 @@
         return () => clearInterval(t);
       }, [projectId]);
 
-      const pad = n => String(n).padStart(2, '0');
-      const fmt = s => `${pad(Math.floor(s / 60))}:${pad(s % 60)}`;
+      // 進入會議時讀取錄音狀態，處理中途離開的恢復邏輯
+      useEffect(() => {
+        if (!projectId) return;
+        const checkRecordingState = async () => {
+          try {
+            const res = await db(
+              `projects?id=eq.${projectId}&select=recording_confirmed,recording_started_at,recording_ended_at,duration_seconds`
+            );
+            if (!res.ok) return;
+            const [project] = await res.json();
+            if (!project) return;
 
-      const startRec = async () => {
+            if (project.recording_ended_at) {
+              // 會議已結束：恢復結束狀態，含累積時長
+              setRecordingState('ended');
+              setRecordingStartedAt(new Date(project.recording_started_at));
+              setRecordingEndedAt(new Date(project.recording_ended_at));
+              setTotalEndedSeconds(project.duration_seconds || 0);
+            } else if (project.recording_confirmed && !project.recording_ended_at) {
+              // 中途離開：靜默重置為未確認
+              await db(`projects?id=eq.${projectId}`, {
+                method: 'PATCH',
+                body: JSON.stringify({
+                  recording_confirmed: false,
+                  recording_started_at: null,
+                }),
+              });
+              setRecordingState('preparing');
+            } else {
+              // 全新狀態
+              setRecordingState('preparing');
+            }
+          } catch {
+            // 讀取失敗不影響使用，維持預設 unconfirmed
+          }
+        };
+        checkRecordingState();
+      }, [projectId]);
+
+      // 錄音進行中時每秒通知父元件（用於 Header 顯示累積時間）
+      useEffect(() => {
+        if (!onRecordingStateChange) return;
+        if (recordingState !== 'in_progress') {
+          onRecordingStateChange(false, 0);
+          return;
+        }
+        const tick = () => {
+          const curSec = currentSegmentStart
+            ? Math.floor((Date.now() - currentSegmentStart.getTime()) / 1000)
+            : 0;
+          onRecordingStateChange(true, accumulatedSeconds + curSec);
+        };
+        tick();
+        const id = setInterval(tick, 1000);
+        return () => clearInterval(id);
+      }, [recordingState, accumulatedSeconds, currentSegmentStart]);
+
+      // ─── 錄音狀態機函式（六狀態：preparing → unconfirmed → in_progress → pending_pause_confirm → paused → ended）
+
+      // 第一段開始：只在 segments.length === 0 時寫 Supabase（後續各段不再重複寫）
+      const confirmRecording = async () => {
+        const now = new Date();
         try {
-          const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-          const mime = ['audio/webm;codecs=opus','audio/webm','audio/ogg','audio/mp4'].find(t => MediaRecorder.isTypeSupported(t)) || '';
-          const mr = new MediaRecorder(stream, { ...(mime ? { mimeType: mime } : {}), audioBitsPerSecond: 32000 });
-          chunksRef.current = [];
-          mr.ondataavailable = e => { if (e.data.size > 0) chunksRef.current.push(e.data); };
-          mr.onstop = () => { const blob = new Blob(chunksRef.current, { type: mr.mimeType }); setAudioBlob(blob); setAudioUrl(URL.createObjectURL(blob)); stream.getTracks().forEach(t => t.stop()); };
-          mr.start(500); mrRef.current = mr; setIsRecording(true); setElapsed(0);
-          onRecordingChange?.(true, 0, stopRec);
-          timerRef.current = setInterval(() => setElapsed(t => { const n = t + 1; onRecordingChange?.(true, n, null); return n; }), 1000);
-        } catch (err) { alert('無法取得麥克風：' + err.message); }
+          if (segments.length === 0) {
+            // 第一段：寫入 Supabase
+            const res = await db(`projects?id=eq.${projectId}`, {
+              method: 'PATCH',
+              body: JSON.stringify({
+                recording_confirmed: true,
+                recording_started_at: now.toISOString(),
+              }),
+            });
+            if (!res.ok) {
+              const err = await res.json().catch(() => ({}));
+              throw new Error(err.message || `HTTP ${res.status}`);
+            }
+            setRecordingStartedAt(now);
+          }
+          // 開始計這一段
+          setCurrentSegmentStart(now);
+          setRecordingState('in_progress');
+        } catch (err) {
+          alert('無法開始會議，請重試。\n(' + err.message + ')');
+        }
       };
 
-      const stopRec = () => { if (mrRef.current?.state !== 'inactive') mrRef.current.stop(); setIsRecording(false); clearInterval(timerRef.current); onRecordingChange?.(false, 0, null); };
-      useEffect(() => () => clearInterval(timerRef.current), []);
-      useEffect(() => { onRegisterStart?.(startRec); }, []);
-      const toggleActive = (id) => { setActiveId(prev => prev === id ? null : id); setExpanded(e => ({ ...e, [id]: !e[id] })); };
+      // 使用者按「結束這段」→ 進入確認 Modal（讓使用者先去 iPhone 按停止）
+      const requestPause = () => {
+        setRecordingState('pending_pause_confirm');
+      };
+
+      // Modal 確認「已關閉錄音」→ 記錄這段，進入 paused
+      const confirmPause = () => {
+        const now = new Date();
+        if (currentSegmentStart) {
+          const durationSeconds = Math.floor((now.getTime() - currentSegmentStart.getTime()) / 1000);
+          setSegments(prev => [...prev, { startedAt: currentSegmentStart, endedAt: now, durationSeconds }]);
+        }
+        setCurrentSegmentStart(null);
+        setRecordingState('paused');
+      };
+
+      // 暫停狀態按「繼續開新一段」→ 先走 unconfirmed 防呆（和第一段一樣的紅色 Modal）
+      // confirmRecording 會判斷 segments.length > 0 跳過 Supabase 寫入，直接開新段計時
+      const continueRecording = () => {
+        setRecordingState('unconfirmed');
+      };
+
+      // 暫停後「前往會後整理」→ 靜默寫入 Supabase 總時長，直接跳 phase 2
+      // 不需要「整場結束」確認動作，以累積段落時長作為紀錄即可
+      const finishAndGoToPostMeeting = async () => {
+        const now = new Date();
+        const totalSec = segments.reduce((sum, s) => sum + s.durationSeconds, 0);
+        // 靜默寫入（失敗不阻擋導航）
+        db(`projects?id=eq.${projectId}`, {
+          method: 'PATCH',
+          body: JSON.stringify({
+            recording_ended_at: now.toISOString(),
+            duration_seconds: totalSec,
+          }),
+        }).catch(() => {});
+        setPhase(2);
+      };
+
+      const cancelMeeting = () => {
+        if (confirm('確定要取消這場會議？已填的提案會保留。')) {
+          onGoHome();
+        }
+      };
+
+      // 會議結束後「開新一場」→ 清除 Supabase 錄音欄位，前端回到 preparing
+      const openNewRound = async () => {
+        try {
+          await db(`projects?id=eq.${projectId}`, {
+            method: 'PATCH',
+            body: JSON.stringify({
+              recording_confirmed: false,
+              recording_started_at: null,
+              recording_ended_at: null,
+              duration_seconds: null,
+            }),
+          });
+        } catch {}
+        setSegments([]);
+        setCurrentSegmentStart(null);
+        setTotalEndedSeconds(0);
+        setRecordingStartedAt(null);
+        setRecordingEndedAt(null);
+        setRecordingState('preparing');
+      };
+
+      const toggleActive = (id) => {
+        // 只有 ended 狀態才凍結；in_progress / paused / pending_pause_confirm 都允許標記議程
+        if (recordingState === 'ended') return;
+        setActiveId(prev => prev === id ? null : id);
+        setExpanded(e => ({ ...e, [id]: !e[id] }));
+      };
 
       return (
-        <div style={{ maxWidth: 1100, margin: '0 auto', padding: '28px 20px' }}>
+        <>
+          <div style={{ maxWidth: 1100, margin: '0 auto', padding: '28px 20px' }}>
           {briefing && (
             <div style={{ ...S.panel, marginBottom: 20, borderLeft: `3px solid ${C.accent}` }} className="fade-in">
               <div style={{ display: 'flex', alignItems: 'center', gap: 10, cursor: 'pointer' }} onClick={() => setBriefingOpen(v => !v)}>
@@ -1088,7 +1456,7 @@
                             {mFiles.length > 0 ? (
                               <div style={{ marginTop: 12 }}>
                                 <div style={{ fontSize: 11, color: C.textMut, letterSpacing: '0.04em', fontWeight: 600, marginBottom: 6 }}>簡報 / 文件</div>
-                                <FileAttachments files={mFiles} recState={{ isRecording, elapsed, onStop: stopRec, onStart: startRec }} />
+                                <FileAttachments files={mFiles} recState={null} />
                               </div>
                             ) : (
                               <div style={{ marginTop: 10, fontSize: 12, color: C.textMut }}>（無附件）</div>
@@ -1103,31 +1471,338 @@
             </div>
 
             <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
-              <div style={S.panel} className="fade-in">
-                <div style={{ fontSize: 15, fontWeight: 600, marginBottom: 20 }}>🎙️ 全場錄音</div>
-                <div style={{ textAlign: 'center', padding: '16px 0' }}>
-                  <div style={{ width: 88, height: 88, borderRadius: '50%', margin: '0 auto 20px', background: isRecording ? C.dangerBg : C.bgCard, border: `2px solid ${isRecording ? C.danger : C.border}`, display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 32, animation: isRecording ? 'pulse 1.5s infinite' : 'none', transition: 'all 0.3s' }}>🎤</div>
-                  {isRecording && <div style={{ fontSize: 28, fontWeight: 700, color: C.danger, marginBottom: 6, fontVariantNumeric: 'tabular-nums', letterSpacing: '0.05em' }}>{fmt(elapsed)}</div>}
-                  <div style={{ color: C.textSec, fontSize: 13, marginBottom: 20 }}>{isRecording ? '錄音中，請勿關閉頁面' : audioUrl ? '✓ 錄音完成' : '準備好後開始錄音'}</div>
-                  <button style={{ ...btn(isRecording ? 'danger' : 'primary'), width: '100%', padding: 13, fontSize: 15 }} onClick={isRecording ? stopRec : startRec}>
-                    {isRecording ? '⏹ 停止錄音' : audioUrl ? '⏺ 重新錄音' : '⏺ 開始錄音'}
+              {recordingState === 'preparing' && (
+                <div style={S.panel} className="fade-in">
+                  <div style={{ fontSize: 15, fontWeight: 600, marginBottom: 12 }}>📋 準備中</div>
+                  <div style={{ fontSize: 13, color: C.textSec, lineHeight: 1.8, marginBottom: 20 }}>
+                    檢查附件、確認簡報，準備好後按下方按鈕開始錄音。
+                  </div>
+                  <button
+                    style={{ ...btn('primary'), width: '100%', padding: 13, fontSize: 14, background: '#16a34a', borderColor: '#16a34a' }}
+                    onClick={() => setRecordingState('unconfirmed')}
+                  >
+                    ▶ 開始錄音
                   </button>
                 </div>
-                {audioUrl && (
-                  <div style={{ marginTop: 4 }}>
-                    <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 6 }}>
-                      <label style={{ ...S.label, marginBottom: 0 }}>預覽錄音</label>
-                      <a href={audioUrl} download={`meetkit-rec-${new Date().toISOString().slice(0,16).replace('T','-')}.webm`}
-                        style={{ fontSize: 12, color: C.textSec, textDecoration: 'none', opacity: 0.8 }}>⬇ 下載錄音檔</a>
-                    </div>
-                    <audio controls src={audioUrl} style={{ width: '100%', borderRadius: 8, height: 40 }} />
+              )}
+              {recordingState === 'in_progress' && (
+                <MeetingTimer
+                  accumulatedSeconds={accumulatedSeconds}
+                  currentSegmentStart={currentSegmentStart}
+                  onRequestPause={requestPause}
+                />
+              )}
+              {recordingState === 'paused' && (
+                <PausedPanel
+                  accumulatedSeconds={accumulatedSeconds}
+                  segmentCount={segments.length}
+                  onContinue={continueRecording}
+                  onGoToPostMeeting={finishAndGoToPostMeeting}
+                />
+              )}
+              {recordingState === 'ended' && (
+                <div style={S.panel} className="fade-in">
+                  <div style={{ fontSize: 15, fontWeight: 600, marginBottom: 20 }}>✅ 會議已結束</div>
+                  <div style={{ textAlign: 'center', padding: '16px 0' }}>
+                    {(() => {
+                      const total = totalEndedSeconds;
+                      const h = Math.floor(total / 3600);
+                      const m2 = Math.floor((total % 3600) / 60);
+                      const s2 = total % 60;
+                      const pad = n => String(n).padStart(2, '0');
+                      return (
+                        <>
+                          <div style={{ fontSize: 13, color: C.textSec, marginBottom: 8 }}>總會議時長</div>
+                          <div style={{ fontSize: 32, fontWeight: 700, color: C.success, marginBottom: 24, fontVariantNumeric: 'tabular-nums' }}>
+                            {pad(h)}:{pad(m2)}:{pad(s2)}
+                          </div>
+                        </>
+                      );
+                    })()}
+                    <button
+                      style={{ ...btn('primary'), width: '100%', padding: 13, fontSize: 14, marginBottom: 10 }}
+                      onClick={() => setPhase(2)}
+                    >
+                      前往會後整理 →
+                    </button>
+                    <button
+                      style={{ ...btn('ghost'), width: '100%', padding: 10, fontSize: 13 }}
+                      onClick={openNewRound}
+                    >
+                      ↺ 開新一場會議
+                    </button>
                   </div>
-                )}
-              </div>
-              <div style={{ ...S.card, padding: '12px 14px', fontSize: 13, color: C.textSec, background: C.textSec + '11', borderColor: C.textSec + '33', lineHeight: 1.7 }}>
-                💡 點選左側議程可標記目前討論中的項目。
+                </div>
+              )}
+              {(recordingState === 'preparing' || recordingState === 'paused') && (
+                <div style={{ ...S.card, padding: '12px 14px', fontSize: 13, color: C.textSec, background: C.textSec + '11', borderColor: C.textSec + '33', lineHeight: 1.7 }}>
+                  💡 點選左側議程可標記目前討論中的項目。
+                </div>
+              )}
+            </div>
+          </div>
+          </div>
+          {recordingState === 'unconfirmed' && (
+            <RecordingConfirmModal onConfirm={confirmRecording} onCancel={cancelMeeting} />
+          )}
+          {recordingState === 'pending_pause_confirm' && (
+            <PauseConfirmModal
+              currentSegmentStart={currentSegmentStart}
+              onConfirm={confirmPause}
+            />
+          )}
+        </>
+      );
+    }
+
+    // ─── BLOCKING MODAL (通用攔截 Modal) ─────────────────────────────────────────
+    // 未來任何頁面需要「阻擋使用者互動直到完成某個動作」都可以重用
+    // ─────────────────────────────────────────────────────────────────────────────
+
+    function BlockingModal({ show, children }) {
+      if (!show) return null;
+      return (
+        <div style={{
+          position: 'fixed', inset: 0, zIndex: 1000,
+          display: 'flex', alignItems: 'center', justifyContent: 'center',
+          animation: 'fadeIn 0.3s ease',
+        }}>
+          <div style={{
+            position: 'absolute', inset: 0,
+            background: '#DC2626', opacity: 0.45, mixBlendMode: 'multiply',
+          }} />
+          <div style={{ position: 'relative', zIndex: 10 }}>
+            {children}
+          </div>
+        </div>
+      );
+    }
+
+    // ─── RECORDING CONFIRM MODAL (會議錄音確認) ───────────────────────────────────
+
+    function RecordingConfirmModal({ onConfirm, onCancel }) {
+      const qrRef = useRef();
+      useEffect(() => {
+        if (typeof QRCode === 'undefined' || !qrRef.current) return;
+        qrRef.current.innerHTML = '';
+        new QRCode(qrRef.current, {
+          text: 'https://qmorechi.github.io/meetkit/open-voicememos.html',
+          width: 120, height: 120,
+          colorDark: '#000000', colorLight: '#ffffff',
+        });
+      }, []);
+
+      return (
+        <BlockingModal show={true}>
+          <div style={{
+            background: C.bgCard, border: `1px solid ${C.border}`,
+            borderRadius: 12, padding: '32px 36px', maxWidth: 460,
+            boxShadow: '0 20px 60px rgba(0,0,0,0.5)',
+          }}>
+            <div style={{ fontSize: 22, fontWeight: 700, marginBottom: 20, textAlign: 'center' }}>
+              🎙 會議錄音
+            </div>
+
+            {/* QR Code 區塊 */}
+            <div style={{ display: 'flex', gap: 20, alignItems: 'center', marginBottom: 24, padding: '16px', background: C.bg, borderRadius: 10, border: `1px solid ${C.border}` }}>
+              <div ref={qrRef} style={{ width: 120, height: 120, flexShrink: 0, borderRadius: 6, overflow: 'hidden', background: '#fff' }} />
+              <div>
+                <div style={{ fontSize: 13, fontWeight: 600, marginBottom: 4 }}>📱 掃描開啟語音備忘錄</div>
+                <div style={{ fontSize: 12, color: C.textSec, lineHeight: 1.7 }}>
+                  用 iPhone 相機掃描 QR Code，直接跳到語音備忘錄 app，按下錄音後回到這裡確認。
+                </div>
+                <div style={{ fontSize: 11, color: C.textMut, marginTop: 6 }}>
+                  💡 手機快沒電？把畫面給旁邊的人掃。
+                </div>
               </div>
             </div>
+
+            <button
+              style={{ ...btn('primary'), width: '100%', padding: 14, fontSize: 15 }}
+              onClick={onConfirm}
+            >
+              ✓ 已確認開始錄音
+            </button>
+            <div style={{ textAlign: 'center', marginTop: 16 }}>
+              <a
+                onClick={onCancel}
+                style={{ fontSize: 12, color: C.textMut, textDecoration: 'underline', cursor: 'pointer' }}
+              >
+                ← 取消，不開這場會議
+              </a>
+            </div>
+          </div>
+        </BlockingModal>
+      );
+    }
+
+    // ─── MEETING TIMER (純計時器，不錄音) ────────────────────────────────────────
+
+    // MeetingTimer：顯示「歷史段落累積 + 目前這段」的總時間
+    // accumulatedSeconds：前幾段的秒數加總
+    // currentSegmentStart：這一段的開始時間（Date）
+    // onRequestPause：使用者按「結束這段」時觸發，進入 pending_pause_confirm
+    function MeetingTimer({ accumulatedSeconds, currentSegmentStart, onRequestPause }) {
+      const [currentSec, setCurrentSec] = useState(0);
+      useEffect(() => {
+        const tick = () => setCurrentSec(Math.floor((Date.now() - currentSegmentStart.getTime()) / 1000));
+        tick();
+        const id = setInterval(tick, 1000);
+        return () => clearInterval(id);
+      }, [currentSegmentStart]);
+
+      // 總時間 = 歷史累積 + 本段已過秒數
+      const total = accumulatedSeconds + currentSec;
+      const h = Math.floor(total / 3600);
+      const m = Math.floor((total % 3600) / 60);
+      const s = total % 60;
+      const pad = n => String(n).padStart(2, '0');
+
+      return (
+        <div style={S.panel} className="fade-in">
+          <div style={{ fontSize: 15, fontWeight: 600, marginBottom: 20 }}>⏱ 會議進行中</div>
+          <div style={{ textAlign: 'center', padding: '16px 0' }}>
+            <div style={{
+              fontSize: 42, fontWeight: 700, color: C.accent, marginBottom: 24,
+              fontVariantNumeric: 'tabular-nums', letterSpacing: '0.05em',
+            }}>
+              {pad(h)}:{pad(m)}:{pad(s)}
+            </div>
+            <div style={{ color: C.textSec, fontSize: 13, marginBottom: 20 }}>
+              記得 iPhone 繼續錄音中
+            </div>
+            <button
+              style={{ ...btn('danger'), width: '100%', padding: 13, fontSize: 15 }}
+              onClick={onRequestPause}
+            >
+              ⏹ 結束這段
+            </button>
+          </div>
+        </div>
+      );
+    }
+
+    // ─── PAUSE CONFIRM MODAL (確認 iPhone 已停止錄音 — 暫停這段) ─────────────────
+    // 每段結束時的對稱防呆：確保使用者去 iPhone 按停止錄音，再進入 paused 狀態
+    // 綠色覆蓋層，對稱於開會前的紅色 RecordingConfirmModal
+    // ─────────────────────────────────────────────────────────────────────────────
+
+    function PauseConfirmModal({ currentSegmentStart, onConfirm }) {
+      // 計算這段已過多少秒（快照，不即時更新）
+      const segmentSec = Math.floor((Date.now() - currentSegmentStart.getTime()) / 1000);
+      const h = Math.floor(segmentSec / 3600);
+      const m = Math.floor((segmentSec % 3600) / 60);
+      const s = segmentSec % 60;
+      const pad = n => String(n).padStart(2, '0');
+
+      const handleNotYet = () => {
+        alert('請打開 iPhone 的「語音備忘錄」按下停止錄音，完成後回到這裡按「✓ 已關閉錄音」');
+      };
+
+      return (
+        <div style={{
+          position: 'fixed', inset: 0, zIndex: 1000,
+          display: 'flex', alignItems: 'center', justifyContent: 'center',
+          animation: 'fadeIn 0.3s ease',
+        }}>
+          <div style={{
+            position: 'absolute', inset: 0,
+            background: '#22C55E', opacity: 0.45, mixBlendMode: 'multiply',
+          }} />
+          <div style={{
+            position: 'relative', zIndex: 10,
+            background: C.bgCard, border: `1px solid ${C.border}`,
+            borderRadius: 12, padding: '32px 36px', maxWidth: 460,
+            boxShadow: '0 20px 60px rgba(0,0,0,0.5)',
+          }}>
+            <div style={{ fontSize: 22, fontWeight: 700, marginBottom: 16, textAlign: 'center' }}>
+              ⏸ 這段結束
+            </div>
+            <div style={{ fontSize: 13, color: C.textMut, marginBottom: 6, textAlign: 'center' }}>
+              這段時長
+            </div>
+            <div style={{
+              fontSize: 32, fontWeight: 700, color: C.success,
+              marginBottom: 24, textAlign: 'center', fontVariantNumeric: 'tabular-nums',
+            }}>
+              {pad(h)}:{pad(m)}:{pad(s)}
+            </div>
+            <div style={{ fontSize: 15, lineHeight: 1.8, color: C.textSec, marginBottom: 12, textAlign: 'center' }}>
+              📱 請打開 iPhone「語音備忘錄」<br />
+              按下停止錄音
+            </div>
+            <div style={{ fontSize: 12, color: C.textMut, textAlign: 'center', marginBottom: 20, lineHeight: 1.6 }}>
+              會議完全結束了嗎？還是只是暫停？<br />
+              稍後可以續開新一段
+            </div>
+            <div style={{
+              fontSize: 12, color: C.textMut, lineHeight: 1.6, marginBottom: 24,
+              padding: '10px 14px', background: C.dangerBg, borderRadius: 6,
+              border: `1px solid ${C.danger}33`,
+            }}>
+              ⚠️ 沒關掉的話，這段音檔會多很多空白
+            </div>
+            <button
+              style={{ ...btn('primary'), width: '100%', padding: 14, fontSize: 15 }}
+              onClick={onConfirm}
+            >
+              ✓ 已關閉錄音
+            </button>
+            <div style={{ textAlign: 'center', marginTop: 16 }}>
+              <a
+                onClick={handleNotYet}
+                style={{ fontSize: 12, color: C.textMut, textDecoration: 'underline', cursor: 'pointer' }}
+              >
+                ← 還沒，讓我去按一下
+              </a>
+            </div>
+          </div>
+        </div>
+      );
+    }
+
+    // ─── PAUSED PANEL (暫停狀態的右側面板) ────────────────────────────────────
+    // 顯示在 paused 狀態，讓使用者選擇「續開新一段」或「整場會議完全結束」
+    // ─────────────────────────────────────────────────────────────────────────────
+
+    function PausedPanel({ accumulatedSeconds, segmentCount, onContinue, onGoToPostMeeting }) {
+      const h = Math.floor(accumulatedSeconds / 3600);
+      const m = Math.floor((accumulatedSeconds % 3600) / 60);
+      const s = accumulatedSeconds % 60;
+      const pad = n => String(n).padStart(2, '0');
+
+      return (
+        <div style={S.panel} className="fade-in">
+          <div style={{ fontSize: 15, fontWeight: 600, marginBottom: 20 }}>⏸ 已暫停</div>
+          <div style={{ textAlign: 'center', padding: '8px 0 16px' }}>
+            <div style={{ fontSize: 12, color: C.textMut, marginBottom: 4 }}>
+              已累積（{segmentCount} 段）
+            </div>
+            <div style={{
+              fontSize: 36, fontWeight: 700, color: C.textSec,
+              marginBottom: 24, fontVariantNumeric: 'tabular-nums', letterSpacing: '0.05em',
+            }}>
+              {pad(h)}:{pad(m)}:{pad(s)}
+            </div>
+            <button
+              style={{ ...btn('primary'), width: '100%', padding: 13, fontSize: 14, marginBottom: 10 }}
+              onClick={onContinue}
+            >
+              ↻ 繼續開新一段
+            </button>
+            <button
+              style={{ ...btn('ghost'), width: '100%', padding: 11, fontSize: 13 }}
+              onClick={onGoToPostMeeting}
+            >
+              前往會後整理 →
+            </button>
+          </div>
+          <div style={{
+            fontSize: 11, color: C.textMut, lineHeight: 1.6, marginTop: 4,
+            padding: '10px 12px', background: C.textSec + '08',
+            borderRadius: 6, border: `1px solid ${C.border}`,
+          }}>
+            💡 如果還有事情要討論，點「繼續開新一段」可以開新的錄音段。會後上傳時記得上傳所有段的音檔。
           </div>
         </div>
       );
@@ -1137,14 +1812,38 @@
     function PostMeeting({ proposals, audioBlob, onSaveJournal, projectId, projectTitle }) {
       const [openaiKey,    setOpenaiKey]    = useState(() => localStorage.getItem('mk_openai_key') || '');
       const [anthropicKey, setAnthropicKey] = useState(() => localStorage.getItem('mk_anthropic_key') || '');
+
+      // 從 Supabase config 表自動載入公用 API Key
+      useEffect(() => {
+        db('config?select=key,value')
+          .then(r => r.json())
+          .then(data => {
+            if (!Array.isArray(data)) return;
+            data.forEach(row => {
+              if (row.key === 'openai_api_key' && row.value) {
+                setOpenaiKey(row.value);
+                localStorage.setItem('mk_openai_key', row.value);
+              }
+              if (row.key === 'anthropic_api_key' && row.value) {
+                setAnthropicKey(row.value);
+                localStorage.setItem('mk_anthropic_key', row.value);
+              }
+            });
+          }).catch(() => {});
+      }, []);
       const [uploadFile,   setUploadFile]   = useState(null);
       const [status,       setStatus]       = useState('idle');
       const [transcript,   setTranscript]   = useState('');
       const [summary,      setSummary]      = useState('');
       const [errMsg,       setErrMsg]       = useState('');
       const [whisperInfo,  setWhisperInfo]  = useState(null);
-      const [archiving,    setArchiving]    = useState(false);
-      const [archiveSteps, setArchiveSteps] = useState([]);
+      const [archiving,        setArchiving]        = useState(false);
+      const [archiveSteps,     setArchiveSteps]     = useState([]);
+      const [compressProgress, setCompressProgress] = useState(0);
+      const [segmentProgress,  setSegmentProgress]  = useState(0);
+      const [uploadProgress,   setUploadProgress]   = useState(0);
+      const [segmentCount,     setSegmentCount]     = useState(0);
+      const [failedSegments,   setFailedSegments]   = useState([]);
       const fileRef = useRef();
       const audioSrc = uploadFile || audioBlob;
 
@@ -1156,21 +1855,56 @@
 
       const run = async () => {
         if (!openaiKey.trim()) { setErrMsg('請輸入 OpenAI API Key'); return; }
-        if (!audioSrc) { setErrMsg('請先錄音或上傳音檔'); return; }
-        setErrMsg(''); setStatus('transcribing');
+        if (!audioSrc) { setErrMsg('請先上傳 iPhone 錄音檔'); return; }
+        if ((audioSrc.size || 0) > AUDIO_CONFIG.maxFileSizeMB * 1024 * 1024) {
+          setErrMsg(`檔案過大，請上傳 ${AUDIO_CONFIG.maxFileSizeMB} MB 以內的音檔`); return;
+        }
+        setErrMsg('');
+        setCompressProgress(0); setSegmentProgress(0); setUploadProgress(0); setFailedSegments([]);
         let txText = '';
-        try {
-          const fd = new FormData();
-          fd.append('file', audioSrc, uploadFile?.name || 'recording.webm');
-          fd.append('model', 'whisper-1'); fd.append('language', 'zh');
-          const res = await fetch('https://api.openai.com/v1/audio/transcriptions', { method: 'POST', headers: { Authorization: `Bearer ${openaiKey.trim()}` }, body: fd });
-          if (!res.ok) { const e = await res.json(); throw new Error(e.error?.message || `HTTP ${res.status}`); }
-          txText = (await res.json()).text; setTranscript(txText);
-          const dur = await getAudioDuration(audioSrc);
-          const mins = Math.ceil(dur / 60) || 1;
-          setWhisperInfo({ mins, cost: (mins * 0.006).toFixed(3) });
-        } catch (e) { setErrMsg('語音轉文字失敗：' + e.message); setStatus('error'); return; }
 
+        try {
+          // ── 階段 1：壓縮 ──────────────────────────────────────────────────
+          setStatus('compressing');
+          const compressed = await compressAudio(audioSrc, p => setCompressProgress(p));
+
+          // ── 階段 2：取得時長 + 靜音切段 ──────────────────────────────────
+          setStatus('segmenting');
+          const duration = await getAudioDuration(audioSrc);
+          let segs;
+          try {
+            // 加 15 秒 timeout，ffmpeg 無法使用時直接跳過
+            const segResult = await Promise.race([
+              (async () => {
+                const boundaries = await calculateSegmentBoundaries(compressed, duration);
+                return await segmentAudio(compressed, boundaries, p => setSegmentProgress(p));
+              })(),
+              new Promise((_, reject) => setTimeout(() => reject(new Error('segmentation timeout')), 15000)),
+            ]);
+            segs = segResult;
+          } catch (e) {
+            console.warn('切段失敗，改用原始檔案作為單一段落：', e.message);
+            // fallback：整個音檔當一段直接送 Whisper
+            segs = [{ index: 0, blob: compressed, startSec: 0, durationSec: duration }];
+          }
+          setSegmentProgress(1);
+          setSegmentCount(segs.length);
+
+          // ── 階段 3：並行上傳 Whisper ──────────────────────────────────────
+          setStatus('transcribing');
+          const transcripts = await transcribeAllSegments(segs, openaiKey.trim(), p => setUploadProgress(p));
+          const failed = transcripts.filter(t => t.error);
+          if (failed.length > 0) setFailedSegments(failed);
+
+          // ── 階段 4：合併逐字稿 ────────────────────────────────────────────
+          const { fullText } = mergeTranscripts(transcripts);
+          txText = fullText;
+          setTranscript(txText);
+          const mins = Math.ceil(duration / 60) || 1;
+          setWhisperInfo({ mins, cost: (mins * 0.006).toFixed(3) });
+        } catch (e) { setErrMsg('處理失敗：' + e.message); setStatus('error'); return; }
+
+        // ── 階段 5：AI 摘要 ───────────────────────────────────────────────
         setStatus('summarizing');
         // 抽取每個提案的附件文字
         const proposalsWithText = await Promise.all(proposals.map(async (p) => {
@@ -1250,15 +1984,34 @@ ${txText}
 （根據整體會議內容，提出 3-5 點具體可行的策略建議，包含優先順序推薦與注意事項）`;
         try {
           let summaryText = '';
+          // 優先嘗試 Anthropic，失敗（含 CORS）自動 fallback 到 GPT-4o
+          let usedEngine = 'gpt-4o';
           if (anthropicKey.trim()) {
-            const res = await fetch('https://api.anthropic.com/v1/messages', { method: 'POST', headers: { 'x-api-key': anthropicKey.trim(), 'anthropic-version': '2023-06-01', 'anthropic-dangerous-request-allow-browsers': 'true', 'Content-Type': 'application/json' }, body: JSON.stringify({ model: 'claude-sonnet-4-6', max_tokens: 4096, messages: [{ role: 'user', content: prompt }] }) });
-            if (!res.ok) { const e = await res.json(); throw new Error(e.error?.message || `HTTP ${res.status}`); }
-            summaryText = (await res.json()).content[0].text;
-          } else {
+            try {
+              const res = await fetch('https://api.anthropic.com/v1/messages', {
+                method: 'POST',
+                headers: {
+                  'x-api-key': anthropicKey.trim(),
+                  'anthropic-version': '2023-06-01',
+                  'anthropic-dangerous-request-allow-browsers': 'true',
+                  'Content-Type': 'application/json',
+                },
+                body: JSON.stringify({ model: 'claude-opus-4-5', max_tokens: 4096, messages: [{ role: 'user', content: prompt }] }),
+              });
+              if (!res.ok) { const e = await res.json(); throw new Error(e.error?.message || `HTTP ${res.status}`); }
+              summaryText = (await res.json()).content[0].text;
+              usedEngine = 'claude';
+            } catch (anthropicErr) {
+              console.warn('Anthropic 摘要失敗，改用 GPT-4o：', anthropicErr.message);
+              // fallback 到 GPT-4o
+            }
+          }
+          if (!summaryText) {
             const res = await fetch('https://api.openai.com/v1/chat/completions', { method: 'POST', headers: { Authorization: `Bearer ${openaiKey.trim()}`, 'Content-Type': 'application/json' }, body: JSON.stringify({ model: 'gpt-4o', messages: [{ role: 'user', content: prompt }] }) });
             if (!res.ok) { const e = await res.json(); throw new Error(e.error?.message || `HTTP ${res.status}`); }
             summaryText = (await res.json()).choices[0].message.content;
           }
+          console.log('摘要引擎：', usedEngine);
           setSummary(summaryText);
           // 自動存前情提要到 Supabase
           if (projectId) {
@@ -1279,7 +2032,7 @@ ${txText}
         a.download = `meetkit-${new Date().toISOString().slice(0,10)}.md`; a.click();
       };
 
-      const running = status === 'transcribing' || status === 'summarizing';
+      const running = ['compressing', 'segmenting', 'transcribing', 'summarizing'].includes(status);
 
       const handleArchive = async () => {
         setArchiving(true);
@@ -1329,10 +2082,39 @@ ${txText}
             )}
             <div>
               <label style={S.label}>{audioBlob ? '或改用上傳的音檔' : '上傳音檔'}</label>
-              <div style={{ display: 'flex', gap: 10, alignItems: 'center' }}>
-                <input ref={fileRef} type="file" accept="audio/*,video/webm" style={{ display: 'none' }} onChange={e => setUploadFile(e.target.files[0])} />
-                <button style={{ ...btn(), padding: '9px 16px' }} onClick={() => fileRef.current.click()}>📂 選擇音檔</button>
-                {uploadFile && <span style={{ fontSize: 13, color: C.textSec }}>{uploadFile.name}</span>}
+              <input ref={fileRef} type="file" accept="audio/*,video/webm" style={{ display: 'none' }} onChange={e => setUploadFile(e.target.files[0])} />
+              {/* 拖曳區域 */}
+              <div
+                onDragOver={e => { e.preventDefault(); e.currentTarget.style.borderColor = C.accent; e.currentTarget.style.background = C.accent + '11'; }}
+                onDragLeave={e => { e.currentTarget.style.borderColor = C.border; e.currentTarget.style.background = 'transparent'; }}
+                onDrop={e => {
+                  e.preventDefault();
+                  e.currentTarget.style.borderColor = C.border;
+                  e.currentTarget.style.background = 'transparent';
+                  const f = e.dataTransfer.files[0];
+                  if (f) setUploadFile(f);
+                }}
+                onClick={() => fileRef.current.click()}
+                style={{
+                  border: `2px dashed ${uploadFile ? C.success : C.border}`,
+                  borderRadius: 10, padding: '24px 16px', textAlign: 'center',
+                  cursor: 'pointer', transition: 'all 0.15s',
+                  background: uploadFile ? C.successBg : 'transparent',
+                }}
+              >
+                {uploadFile ? (
+                  <>
+                    <div style={{ fontSize: 28, marginBottom: 6 }}>✅</div>
+                    <div style={{ fontSize: 14, fontWeight: 600, color: C.success }}>{uploadFile.name}</div>
+                    <div style={{ fontSize: 12, color: C.textMut, marginTop: 4 }}>點擊重新選擇</div>
+                  </>
+                ) : (
+                  <>
+                    <div style={{ fontSize: 28, marginBottom: 6 }}>🎵</div>
+                    <div style={{ fontSize: 14, fontWeight: 500 }}>拖曳音檔到此處</div>
+                    <div style={{ fontSize: 12, color: C.textMut, marginTop: 4 }}>或點擊選擇檔案 · m4a / mp3 / wav / webm</div>
+                  </>
+                )}
               </div>
             </div>
           </div>
@@ -1346,9 +2128,50 @@ ${txText}
           {errMsg && <div style={{ ...S.card, padding: '12px 16px', background: C.dangerBg, borderColor: C.danger + '66', color: '#ff8a80', fontSize: 13 }}>⚠️ {errMsg}</div>}
 
           {status !== 'done' && (
-            <button style={{ ...btn('primary'), padding: 14, fontSize: 15, opacity: running ? 0.7 : 1 }} onClick={run} disabled={running}>
-              {status === 'transcribing' ? <><Spinner /> 語音轉文字中…</> : status === 'summarizing' ? <><Spinner /> AI 摘要生成中…</> : '▶ 開始轉文字 & 摘要'}
-            </button>
+            <>
+              {running && status !== 'summarizing' && (
+                <div style={{ ...S.card, padding: '14px 16px', display: 'flex', flexDirection: 'column', gap: 8 }}>
+                  {status === 'compressing' && <>
+                    <div style={{ fontSize: 13, color: C.textSec }}>⚙️ 壓縮音訊中…</div>
+                    <div style={{ height: 6, background: C.border, borderRadius: 3, overflow: 'hidden' }}>
+                      <div style={{ height: '100%', width: `${Math.round(compressProgress * 100)}%`, background: C.accent, borderRadius: 3, transition: 'width 0.3s' }} />
+                    </div>
+                    <div style={{ fontSize: 11, color: C.textMut }}>{Math.round(compressProgress * 100)}%</div>
+                  </>}
+                  {status === 'segmenting' && <>
+                    <div style={{ fontSize: 13, color: C.textSec }}>✂️ 靜音偵測切段中…</div>
+                    <div style={{ height: 6, background: C.border, borderRadius: 3, overflow: 'hidden' }}>
+                      <div style={{ height: '100%', width: `${Math.round(segmentProgress * 100)}%`, background: C.accent, borderRadius: 3, transition: 'width 0.3s' }} />
+                    </div>
+                    <div style={{ fontSize: 11, color: C.textMut }}>{Math.round(segmentProgress * 100)}%</div>
+                  </>}
+                  {status === 'transcribing' && <>
+                    <div style={{ fontSize: 13, color: C.textSec }}>
+                      ⏳ Whisper 轉錄中…
+                      {segmentCount > 0 && <span style={{ color: C.textMut, marginLeft: 6 }}>
+                        {Math.round(uploadProgress * segmentCount)}/{segmentCount} 段
+                      </span>}
+                    </div>
+                    <div style={{ height: 6, background: C.border, borderRadius: 3, overflow: 'hidden' }}>
+                      <div style={{ height: '100%', width: `${Math.round(uploadProgress * 100)}%`, background: C.accent, borderRadius: 3, transition: 'width 0.3s' }} />
+                    </div>
+                    <div style={{ fontSize: 11, color: C.textMut }}>{Math.round(uploadProgress * 100)}%</div>
+                  </>}
+                </div>
+              )}
+              <button style={{ ...btn('primary'), padding: 14, fontSize: 15, opacity: running ? 0.7 : 1 }} onClick={run} disabled={running}>
+                {status === 'compressing'  ? <><Spinner /> 壓縮音訊中…</> :
+                 status === 'segmenting'   ? <><Spinner /> 切段中…</> :
+                 status === 'transcribing' ? <><Spinner /> 語音轉文字中…</> :
+                 status === 'summarizing'  ? <><Spinner /> AI 摘要生成中…</> :
+                 '▶ 開始轉文字 & 摘要'}
+              </button>
+              {failedSegments.length > 0 && (
+                <div style={{ ...S.card, padding: '12px 16px', background: C.dangerBg, borderColor: C.danger + '66', fontSize: 12, color: '#ff8a80' }}>
+                  ⚠️ {failedSegments.length} 段轉錄失敗（{failedSegments.map(s => `段 ${s.index + 1}`).join('、')}），其餘已合併，可手動補充逐字稿。
+                </div>
+              )}
+            </>
           )}
 
           {transcript && (
@@ -1625,9 +2448,12 @@ ${txText}
       const [journal,   setJournal]   = useState([]);
       const [briefing,  setBriefing]  = useState('');
       const [isRecording, setIsRecording] = useState(false);
-      const [recElapsed,  setRecElapsed]  = useState(0);
-      const stopRecRef  = useRef(null);
-      const startRecRef = useRef(null);
+      const [recordingSeconds, setRecordingSeconds] = useState(0);
+      // Meeting 每秒回呼：active=是否錄音中, seconds=累積總秒數
+      const handleRecordingChange = (active, seconds = 0) => {
+        setIsRecording(active);
+        if (active) setRecordingSeconds(seconds);
+      };
 
       useEffect(() => {
         if (!projectId) return;
@@ -1681,34 +2507,20 @@ ${txText}
             journalCount={journal.length}
             projectId={projectId} projectTitle={projectTitle}
             onTitleSave={setProjectTitle}
+            isRecording={isRecording}
+            recordingSeconds={recordingSeconds}
           />
           {phase === 0 && <PreMeeting projectId={projectId} proposals={proposals} setProposals={setProposals} setSyncOk={setSyncOk} journal={journal} projectTitle={projectTitle} meetingDate={meetingDate} setMeetingDate={setMeetingDate} meetingTime={meetingTime} setMeetingTime={setMeetingTime} briefing={briefing} />}
-          {phase === 1 && <Meeting proposals={proposals} setProposals={setProposals} projectId={projectId} audioBlob={audioBlob} setAudioBlob={setAudioBlob} briefing={briefing}
-            onRecordingChange={(recording, elapsed, stopFn) => { setIsRecording(recording); setRecElapsed(elapsed); if (stopFn) stopRecRef.current = stopFn; }}
-            onRegisterStart={(fn) => { startRecRef.current = fn; }} />}
+          {/* Meeting: 永遠掛載，避免切換 tab 時 unmount 導致計時狀態歸零 */}
+          <div style={{ display: phase === 1 ? 'block' : 'none' }}>
+            <Meeting proposals={proposals} setProposals={setProposals} projectId={projectId} briefing={briefing}
+              onGoHome={() => { setProjectId(null); window.history.pushState({}, '', window.location.pathname); }}
+              setPhase={setPhase}
+              onRecordingStateChange={handleRecordingChange} />
+          </div>
           {phase === 2 && <PostMeeting proposals={proposals} audioBlob={audioBlob} onSaveJournal={saveToJournal} projectId={projectId} projectTitle={projectTitle} />}
           {phase === 3 && <Journal journal={journal} setJournal={setJournal} projectId={projectId} />}
 
-          {/* 常駐錄音指示器 */}
-          {phase === 1 && (
-            <div style={{ position: 'fixed', top: 68, right: 16, zIndex: 600, display: 'flex', alignItems: 'center', gap: 10 }}>
-              {isRecording ? (
-                <div style={{ display: 'flex', alignItems: 'center', gap: 10, background: C.dangerBg, border: `1px solid ${C.danger}`, borderRadius: 40, padding: '10px 18px', boxShadow: '0 4px 24px rgba(0,0,0,0.5)', animation: 'pulse 1.5s infinite' }}>
-                  <span style={{ width: 10, height: 10, borderRadius: '50%', background: C.danger, flexShrink: 0 }} />
-                  <span style={{ fontSize: 14, fontWeight: 700, color: C.danger, fontVariantNumeric: 'tabular-nums' }}>
-                    {`${String(Math.floor(recElapsed/60)).padStart(2,'0')}:${String(recElapsed%60).padStart(2,'0')}`}
-                  </span>
-                  <span style={{ fontSize: 13, color: '#ff8a80' }}>錄音中</span>
-                  <button style={{ ...btn('danger'), padding: '5px 12px', fontSize: 12, borderRadius: 20 }} onClick={() => stopRecRef.current?.()}>⏹ 停止</button>
-                </div>
-              ) : (
-                <div style={{ display: 'flex', alignItems: 'center', gap: 10, background: C.bgPanel, border: `1px solid ${C.warn}88`, borderRadius: 40, padding: '8px 8px 8px 16px', boxShadow: '0 4px 24px rgba(0,0,0,0.5)' }}>
-                  <span style={{ fontSize: 13, color: C.warn, whiteSpace: 'nowrap' }}>⚠ 尚未錄音</span>
-                  <button style={{ ...btn('primary'), padding: '5px 14px', fontSize: 12, borderRadius: 20, whiteSpace: 'nowrap' }} onClick={() => startRecRef.current?.()}>⏺ 開始錄音</button>
-                </div>
-              )}
-            </div>
-          )}
         </div>
       );
     }
