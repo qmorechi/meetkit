@@ -1211,39 +1211,6 @@
       const [briefingOpen, setBriefingOpen] = useState(false);
       const [cardUploading, setCardUploading] = useState({});
       const cardFileRefs = useRef({});
-      const [isFullscreen, setIsFullscreen] = useState(false);
-
-      // 全螢幕 toggle（含 Safari webkit 前綴）
-      const toggleFullscreen = () => {
-        const isFS = document.fullscreenElement || document.webkitFullscreenElement;
-        if (isFS) {
-          if (document.exitFullscreen) document.exitFullscreen().catch(() => {});
-          else if (document.webkitExitFullscreen) document.webkitExitFullscreen();
-        } else {
-          // Chrome 在頁面有 iframe 時，對 body 的全螢幕請求會被擋
-          // 改成：有 iframe（PDF/文件預覽）→ 對 iframe 全螢幕；沒有 → 對 body 全螢幕
-          const iframe = document.querySelector('iframe');
-          const target = iframe || document.body;
-          if (target.requestFullscreen) {
-            target.requestFullscreen().catch(e => console.warn('全螢幕失敗:', e));
-          } else if (target.webkitRequestFullscreen) {
-            target.webkitRequestFullscreen();
-          }
-        }
-      };
-
-      // 監聽全螢幕狀態變化，更新按鈕圖示
-      useEffect(() => {
-        const onFSChange = () => {
-          setIsFullscreen(!!(document.fullscreenElement || document.webkitFullscreenElement));
-        };
-        document.addEventListener('fullscreenchange', onFSChange);
-        document.addEventListener('webkitfullscreenchange', onFSChange);
-        return () => {
-          document.removeEventListener('fullscreenchange', onFSChange);
-          document.removeEventListener('webkitfullscreenchange', onFSChange);
-        };
-      }, []);
 
       // 錄音確認狀態機：preparing / unconfirmed / in_progress / pending_pause_confirm / paused / ended
       // preparing = 預設，自由瀏覽議程；unconfirmed = 紅色 Modal 要求確認錄音
@@ -1606,24 +1573,6 @@
               onConfirm={confirmPause}
             />
           )}
-          {/* 全螢幕浮動按鈕：固定右下角 */}
-          <button
-            onClick={toggleFullscreen}
-            style={{
-              position: 'fixed', bottom: 24, right: 24, zIndex: 9999,
-              background: isFullscreen ? C.accent : C.bgPanel,
-              border: `1px solid ${isFullscreen ? C.accent : C.border}`,
-              borderRadius: 10, padding: '8px 14px',
-              display: 'flex', alignItems: 'center', gap: 6,
-              fontSize: 13, fontWeight: 600,
-              color: isFullscreen ? '#fff' : C.textSec,
-              cursor: 'pointer', backdropFilter: 'blur(12px)',
-              boxShadow: '0 2px 16px rgba(0,0,0,0.4)',
-              transition: 'all 0.2s',
-            }}
-          >
-            {isFullscreen ? '↙ 縮小' : '↗ 全螢幕'}
-          </button>
         </>
       );
     }
@@ -2523,7 +2472,34 @@ ${txText}
       const [isRecording, setIsRecording] = useState(false);
       const [recordingSeconds, setRecordingSeconds] = useState(0);
       const [headerHidden, setHeaderHidden] = useState(false);
+      const [isFullscreen, setIsFullscreen] = useState(false);
       const lastScrollY = useRef(0);
+
+      // ─── App 層全螢幕按鈕（Meeting 元件外，確保 position:fixed 不受父層影響）─────
+      useEffect(() => {
+        const onFSChange = () => {
+          setIsFullscreen(!!(document.fullscreenElement || document.webkitFullscreenElement));
+        };
+        document.addEventListener('fullscreenchange', onFSChange);
+        document.addEventListener('webkitfullscreenchange', onFSChange);
+        return () => {
+          document.removeEventListener('fullscreenchange', onFSChange);
+          document.removeEventListener('webkitfullscreenchange', onFSChange);
+        };
+      }, []);
+
+      const toggleFullscreen = () => {
+        const isFS = document.fullscreenElement || document.webkitFullscreenElement;
+        if (isFS) {
+          if (document.exitFullscreen) document.exitFullscreen().catch(() => {});
+          else if (document.webkitExitFullscreen) document.webkitExitFullscreen();
+        } else {
+          const iframe = document.querySelector('iframe');
+          const target = iframe || document.body;
+          if (target.requestFullscreen) target.requestFullscreen().catch(e => console.warn('全螢幕失敗:', e));
+          else if (target.webkitRequestFullscreen) target.webkitRequestFullscreen();
+        }
+      };
 
       // Meeting 每秒回呼：active=是否錄音中, seconds=累積總秒數
       const handleRecordingChange = (active, seconds = 0) => {
@@ -2651,7 +2627,22 @@ ${txText}
           </div>
           {phase === 2 && <PostMeeting proposals={proposals} audioBlob={audioBlob} onSaveJournal={saveToJournal} projectId={projectId} projectTitle={projectTitle} />}
           {phase === 3 && <Journal journal={journal} setJournal={setJournal} projectId={projectId} />}
-
+          {/* 全螢幕按鈕：只在會議進行時顯示，放在 App 最外層確保 position:fixed 正常 */}
+          {phase === 1 && (
+            <button onClick={toggleFullscreen} style={{
+              position: 'fixed', bottom: 24, right: 24, zIndex: 9999,
+              background: isFullscreen ? C.accent : C.bgPanel,
+              border: `1px solid ${isFullscreen ? C.accent : C.border}`,
+              borderRadius: 10, padding: '8px 14px',
+              display: 'flex', alignItems: 'center', gap: 6,
+              fontSize: 13, fontWeight: 600,
+              color: isFullscreen ? '#fff' : C.textSec,
+              cursor: 'pointer', backdropFilter: 'blur(12px)',
+              boxShadow: '0 4px 20px rgba(0,0,0,0.5)',
+            }}>
+              {isFullscreen ? '↙ 縮小' : '↗ 全螢幕'}
+            </button>
+          )}
         </div>
       );
     }
