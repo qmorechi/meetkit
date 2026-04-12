@@ -563,8 +563,8 @@
                   <button
                     onClick={() => {
                       setPhase(p.id);
-                      const el = document.documentElement;
-                      // 切到「會議進行」：請求全螢幕（含 Safari webkit 前綴）
+                      const el = document.body;
+                      // 切到「會議進行」：請求全螢幕（含 Safari webkit 前綴；用 body 比 documentElement 更可靠）
                       if (p.id === 1) {
                         if (el.requestFullscreen) el.requestFullscreen().catch(() => {});
                         else if (el.webkitRequestFullscreen) el.webkitRequestFullscreen();
@@ -1219,9 +1219,13 @@
           if (document.exitFullscreen) document.exitFullscreen().catch(() => {});
           else if (document.webkitExitFullscreen) document.webkitExitFullscreen();
         } else {
-          const el = document.documentElement;
-          if (el.requestFullscreen) el.requestFullscreen().catch(() => {});
-          else if (el.webkitRequestFullscreen) el.webkitRequestFullscreen();
+          // document.body 比 documentElement 在有 iframe 的頁面更可靠
+          const el = document.body;
+          if (el.requestFullscreen) {
+            el.requestFullscreen().catch(e => console.warn('全螢幕失敗:', e));
+          } else if (el.webkitRequestFullscreen) {
+            el.webkitRequestFullscreen();
+          }
         }
       };
 
