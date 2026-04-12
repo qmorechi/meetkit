@@ -1795,6 +1795,25 @@
     function PostMeeting({ proposals, audioBlob, onSaveJournal, projectId, projectTitle }) {
       const [openaiKey,    setOpenaiKey]    = useState(() => localStorage.getItem('mk_openai_key') || '');
       const [anthropicKey, setAnthropicKey] = useState(() => localStorage.getItem('mk_anthropic_key') || '');
+
+      // 從 Supabase config 表自動載入公用 API Key
+      useEffect(() => {
+        db('config?select=key,value')
+          .then(r => r.json())
+          .then(data => {
+            if (!Array.isArray(data)) return;
+            data.forEach(row => {
+              if (row.key === 'openai_api_key' && row.value) {
+                setOpenaiKey(row.value);
+                localStorage.setItem('mk_openai_key', row.value);
+              }
+              if (row.key === 'anthropic_api_key' && row.value) {
+                setAnthropicKey(row.value);
+                localStorage.setItem('mk_anthropic_key', row.value);
+              }
+            });
+          }).catch(() => {});
+      }, []);
       const [uploadFile,   setUploadFile]   = useState(null);
       const [status,       setStatus]       = useState('idle');
       const [transcript,   setTranscript]   = useState('');
