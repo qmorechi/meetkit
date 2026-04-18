@@ -2272,9 +2272,26 @@ ${txText}
       const [search, setSearch] = useState('');
       const [expanded, setExpanded] = useState({});
       const [syncingId, setSyncingId] = useState(null);
+      const [batchSyncing, setBatchSyncing] = useState(false);
       const [syncedIds, setSyncedIds] = useState(() => new Set(
         journal.filter(j => j.notionSynced).map(j => j.id)
       ));
+
+      const handleBatchSync = async () => {
+        if (!onSyncToNotion) return;
+        const unsynced = journal.filter(j => !syncedIds.has(j.id) && !j.notionSynced);
+        if (unsynced.length === 0) { alert('所有日誌都已同步到 Notion'); return; }
+        if (!confirm(`準備同步 ${unsynced.length} 筆日誌到 Notion，確定繼續？`)) return;
+        setBatchSyncing(true);
+        let ok = 0;
+        for (const entry of unsynced) {
+          const result = await onSyncToNotion(entry);
+          if (result.ok) { setSyncedIds(prev => new Set([...prev, entry.id])); ok++; }
+          await new Promise(r => setTimeout(r, 400)); // 避免太快觸發 rate limit
+        }
+        setBatchSyncing(false);
+        alert(`同步完成！成功 ${ok} 筆，失敗 ${unsynced.length - ok} 筆`);
+      };
 
       const handleSyncOne = async (e, entry) => {
         e.stopPropagation();
@@ -2328,6 +2345,11 @@ ${txText}
             <div style={{ fontSize: 18, fontWeight: 600, display: 'flex', alignItems: 'center', gap: 10, flex: 1 }}>
               📚 會議日誌 <span style={badge(C.accent)}>{journal.length} 場</span>
             </div>
+            {onSyncToNotion && (
+              <button style={{ ...btn('ghost'), fontSize: 12, padding: '5px 12px', color: C.textSec, opacity: batchSyncing ? 0.5 : 1 }} disabled={batchSyncing} onClick={handleBatchSync}>
+                {batchSyncing ? '同步中…' : '↗ 全部同步到 Notion'}
+              </button>
+            )}
             <button style={{ ...btn('ghost'), fontSize: 12, padding: '5px 12px', color: C.textSec }} onClick={importFromLocal}>⬆ 從本機匯入</button>
           </div>
           <input style={{ ...S.input, marginBottom: 20 }} placeholder="🔍 搜尋關鍵字、日期、提案者…" value={search} onChange={e => setSearch(e.target.value)} />
