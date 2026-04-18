@@ -2268,9 +2268,27 @@ ${txText}
     }
 
     // ─── JOURNAL ─────────────────────────────────────────────────────────────────
-    function Journal({ journal, setJournal, projectId }) {
+    function Journal({ journal, setJournal, projectId, projectTitle, onSyncToNotion }) {
       const [search, setSearch] = useState('');
       const [expanded, setExpanded] = useState({});
+      const [syncingId, setSyncingId] = useState(null);
+      const [syncedIds, setSyncedIds] = useState(() => new Set(
+        journal.filter(j => j.notionSynced).map(j => j.id)
+      ));
+
+      const handleSyncOne = async (e, entry) => {
+        e.stopPropagation();
+        if (!onSyncToNotion) return;
+        setSyncingId(entry.id);
+        const result = await onSyncToNotion(entry);
+        setSyncingId(null);
+        if (result.ok) {
+          setSyncedIds(prev => new Set([...prev, entry.id]));
+          if (result.url) window.open(result.url, '_blank');
+        } else {
+          alert('同步到 Notion 失敗，請稍後再試');
+        }
+      };
 
       const filtered = journal.slice().reverse().filter(m => {
         if (!search.trim()) return true;
@@ -2333,6 +2351,15 @@ ${txText}
                       <div style={{ fontSize: 12, color: C.textSec, marginTop: 2 }}>{m.proposals?.length || 0} 項議程{m.transcript ? ' · 有逐字稿' : ''}</div>
                     </div>
                     <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                      {onSyncToNotion && (
+                        syncedIds.has(m.id) || m.notionSynced
+                          ? <span style={{ ...badge('#2ecc71', '#e8faf0'), fontSize: 10, padding: '2px 7px' }}>✓ Notion</span>
+                          : <button
+                              style={{ ...btn('ghost'), padding: '3px 8px', fontSize: 11, color: '#666', borderColor: 'transparent', opacity: syncingId === m.id ? 0.5 : 1 }}
+                              disabled={syncingId === m.id}
+                              onClick={e => handleSyncOne(e, m)}
+                            >{syncingId === m.id ? '同步中…' : '↗ Notion'}</button>
+                      )}
                       <span style={{ color: C.textMut, fontSize: 12 }}>{expanded[m.id] ? '▲' : '▼'}</span>
                       <button style={{ ...btn('ghost'), padding: '3px 8px', fontSize: 13, color: C.danger, borderColor: 'transparent' }} onClick={e => { e.stopPropagation(); if (confirm('確定刪除？')) deleteEntry(m.id); }}>✕</button>
                     </div>
@@ -2610,6 +2637,27 @@ ${txText}
         } catch {}
       };
 
+      // ─── 同步單筆日誌到 Notion ───────────────────────────────────
+      const syncEntryToNotion = async (entry) => {
+        const isoDate = new Date().toISOString().split('T')[0];
+        try {
+          const res = await fetch(`${SB_URL}/functions/v1/notion-sync`, {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              'Authorization': `Bearer ${SB_KEY}`,
+            },
+            body: JSON.stringify({ journal: entry, projectTitle, isoDate }),
+          });
+          const data = await res.json();
+          if (!res.ok) throw new Error(data.error || 'Notion 同步失敗');
+          return { ok: true, url: data.notionUrl };
+        } catch (e) {
+          console.error('Notion sync failed:', e);
+          return { ok: false };
+        }
+      };
+
       const saveToJournal = async ({ proposals, transcript, summary }) => {
         const entry = {
           id: Date.now().toString(),
@@ -2621,7 +2669,13 @@ ${txText}
         try {
           await db('journals', { method: 'POST', body: JSON.stringify(entry) });
         } catch (e) { console.error('Journal save failed', e); }
-        setJournal(prev => [...prev, entry]);
+        // 同步到 Notion（背景執行，不阻擋流程）
+        syncEntryToNotion(entry).then(result => {
+          if (result.ok) {
+            setJournal(prev => prev.map(j => j.id === entry.id ? { ...j, notionSynced: true, notionUrl: result.url } : j));
+          }
+        });
+        setJournal(prev => [...prev, { ...entry, notionSynced: false }]);
         setPhase(3);
       };
 
@@ -2648,7 +2702,7 @@ ${txText}
               onRecordingStateChange={handleRecordingChange} />
           </div>
           {phase === 2 && <PostMeeting proposals={proposals} audioBlob={audioBlob} onSaveJournal={saveToJournal} projectId={projectId} projectTitle={projectTitle} />}
-          {phase === 3 && <Journal journal={journal} setJournal={setJournal} projectId={projectId} />}
+          {phase === 3 && <Journal journal={journal} setJournal={setJournal} projectId={projectId} projectTitle={projectTitle} onSyncToNotion={syncEntryToNotion} />}
           {/* 全螢幕按鈕：只在會議進行時顯示，放在 App 最外層確保 position:fixed 正常 */}
           {phase === 1 && (
             <button onClick={toggleFullscreen} style={{
