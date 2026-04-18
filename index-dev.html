@@ -1527,6 +1527,12 @@
                   >
                     ▶ 開始錄音
                   </button>
+                  <button
+                    style={{ ...btn('ghost'), width: '100%', padding: 10, fontSize: 13, marginTop: 8, color: C.textSec }}
+                    onClick={() => setPhase(0)}
+                  >
+                    ← 回會前提案
+                  </button>
                 </div>
               )}
               {recordingState === 'in_progress' && (
