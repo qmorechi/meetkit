@@ -510,3 +510,14 @@ ALTER TABLE projects
 ---
 
 _這份路線圖會隨開發進展持續更新。_
+
+## 摘要
+完成 MeetKit 安全事件處理 Phase C。
+- 前端三處 API 呼叫改走 Edge Function 代理
+- API Key UI 拿掉
+- 修正 whisper-proxy Content-Type bug
+- OpenAI / Anthropic 設定花費上限
+下次從 Phase D 開始(Supabase RLS 設定)。
+
+## 下次從這裡開始
+回 claude.ai 做 Phase D(SQL 設定 config/projects/proposals/journals 的 RLS)
