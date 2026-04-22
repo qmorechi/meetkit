@@ -1879,27 +1879,7 @@
 
     // ─── POST-MEETING ────────────────────────────────────────────────────────────
     function PostMeeting({ proposals, audioBlob, onSaveJournal, projectId, projectTitle }) {
-      const [openaiKey,    setOpenaiKey]    = useState(() => localStorage.getItem('mk_openai_key') || '');
-      const [anthropicKey, setAnthropicKey] = useState(() => localStorage.getItem('mk_anthropic_key') || '');
-
-      // 從 Supabase config 表自動載入公用 API Key
-      useEffect(() => {
-        db('config?select=key,value')
-          .then(r => r.json())
-          .then(data => {
-            if (!Array.isArray(data)) return;
-            data.forEach(row => {
-              if (row.key === 'openai_api_key' && row.value) {
-                setOpenaiKey(row.value);
-                localStorage.setItem('mk_openai_key', row.value);
-              }
-              if (row.key === 'anthropic_api_key' && row.value) {
-                setAnthropicKey(row.value);
-                localStorage.setItem('mk_anthropic_key', row.value);
-              }
-            });
-          }).catch(() => {});
-      }, []);
+      const [summaryEngine, setSummaryEngine] = useState('');
       const [uploadFile,   setUploadFile]   = useState(null);
       const [status,       setStatus]       = useState('idle');
       const [transcript,   setTranscript]   = useState('');
@@ -1923,7 +1903,6 @@
       });
 
       const run = async () => {
-        if (!openaiKey.trim()) { setErrMsg('請輸入 OpenAI API Key'); return; }
         if (!audioSrc) { setErrMsg('請先上傳 iPhone 錄音檔'); return; }
         if ((audioSrc.size || 0) > AUDIO_CONFIG.maxFileSizeMB * 1024 * 1024) {
           setErrMsg(`檔案過大，請上傳 ${AUDIO_CONFIG.maxFileSizeMB} MB 以內的音檔`); return;
@@ -1961,7 +1940,7 @@
 
           // ── 階段 3：並行上傳 Whisper ──────────────────────────────────────
           setStatus('transcribing');
-          const transcripts = await transcribeAllSegments(segs, openaiKey.trim(), p => setUploadProgress(p));
+          const transcripts = await transcribeAllSegments(segs, '', p => setUploadProgress(p));
           const failed = transcripts.filter(t => t.error);
           if (failed.length > 0) setFailedSegments(failed);
 
@@ -2053,38 +2032,33 @@ ${txText}
 （根據整體會議內容，提出 3-5 點具體可行的策略建議，包含優先順序推薦與注意事項）`;
         try {
           let summaryText = '';
-          // 優先嘗試 Anthropic，失敗（含 CORS）自動 fallback 到 GPT-4o
+          // 優先用 Anthropic Claude，失敗才 fallback 到 GPT-4o
           let usedEngine = 'gpt-4o';
-          if (anthropicKey.trim()) {
-            try {
-              // Phase C：改走 Edge Function 代理（ai-proxy 原樣轉發 Anthropic 回應）
-              const res = await fetch(`${EDGE_BASE}/ai-proxy`, {
-                method: 'POST',
-                headers: EDGE_HEADERS,
-                body: JSON.stringify({
-                  provider: 'anthropic',
-                  payload: {
-                    model: 'claude-opus-4-5',
-                    max_tokens: 4096,
-                    messages: [{ role: 'user', content: prompt }],
-                  },
-                }),
-              });
-              if (!res.ok) { const e = await res.json(); throw new Error(e.error?.message || `HTTP ${res.status}`); }
-              summaryText = (await res.json()).content[0].text;
-              usedEngine = 'claude';
-            } catch (anthropicErr) {
-              console.warn('Anthropic 摘要失敗，改用 GPT-4o：', anthropicErr.message);
-              // fallback 到 GPT-4o
-            }
+          try {
+            const res = await fetch(`${EDGE_BASE}/ai-proxy`, {
+              method: 'POST',
+              headers: EDGE_HEADERS,
+              body: JSON.stringify({
+                provider: 'anthropic',
+                payload: {
+                  model: 'claude-opus-4-5',
+                  max_tokens: 4096,
+                  messages: [{ role: 'user', content: prompt }],
+                },
+              }),
+            });
+            if (!res.ok) { const e = await res.json(); throw new Error(e.error?.message || `HTTP ${res.status}`); }
+            summaryText = (await res.json()).content[0].text;
+            usedEngine = 'claude';
+          } catch (anthropicErr) {
+            console.warn('Anthropic 摘要失敗，改用 GPT-4o：', anthropicErr.message);
           }
           if (!summaryText) {
-            // Phase C：改走 Edge Function 代理（ai-proxy 原樣轉發 OpenAI 回應）
             const res = await fetch(`${EDGE_BASE}/ai-proxy`, { method: 'POST', headers: EDGE_HEADERS, body: JSON.stringify({ provider: 'openai', payload: { model: 'gpt-4o', messages: [{ role: 'user', content: prompt }] } }) });
             if (!res.ok) { const e = await res.json(); throw new Error(e.error?.message || `HTTP ${res.status}`); }
             summaryText = (await res.json()).choices[0].message.content;
           }
-          console.log('摘要引擎：', usedEngine);
+          setSummaryEngine(usedEngine);
           setSummary(summaryText);
           // 自動存前情提要到 Supabase
           if (projectId) {
@@ -2124,23 +2098,6 @@ ${txText}
 
       return (
         <div style={{ maxWidth: 800, margin: '0 auto', padding: '28px 20px', display: 'flex', flexDirection: 'column', gap: 18 }}>
-          <div style={S.panel} className="fade-in">
-            <div style={{ fontSize: 15, fontWeight: 600, marginBottom: 18 }}>🔑 API 設定</div>
-            <div className="grid-2col" style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 14 }}>
-              <div>
-                <label style={S.label}>OpenAI API Key（必填，語音轉文字）</label>
-                <input style={S.input} type="password" placeholder="sk-…" value={openaiKey} onChange={e => { setOpenaiKey(e.target.value); localStorage.setItem('mk_openai_key', e.target.value); }} autoComplete="off" />
-              </div>
-              <div>
-                <label style={S.label}>Anthropic API Key（選填，優先用 Claude 摘要）</label>
-                <input style={S.input} type="password" placeholder="sk-ant-…" value={anthropicKey} onChange={e => { setAnthropicKey(e.target.value); localStorage.setItem('mk_anthropic_key', e.target.value); }} autoComplete="off" />
-              </div>
-            </div>
-            <div style={{ marginTop: 12, fontSize: 12, color: C.textMut, lineHeight: 1.6 }}>
-              🔒 API Key 儲存於本機瀏覽器，不傳送至任何第三方。未填 Anthropic Key 時自動改用 GPT-4o 摘要。
-            </div>
-          </div>
-
           <div style={S.panel} className="fade-in">
             <div style={{ fontSize: 15, fontWeight: 600, marginBottom: 16 }}>🎵 音檔來源</div>
             {audioBlob && (
@@ -2258,7 +2215,7 @@ ${txText}
             <div style={S.panel} className="fade-in">
               <div style={{ fontSize: 15, fontWeight: 600, marginBottom: 14 }}>
                 📝 AI 摘要整理
-                <span style={{ ...badge(anthropicKey ? C.accent : C.warn), marginLeft: 10, fontSize: 11 }}>{anthropicKey ? 'Claude' : 'GPT-4o'}</span>
+                <span style={{ ...badge(summaryEngine === 'claude' ? C.accent : C.warn), marginLeft: 10, fontSize: 11 }}>{summaryEngine === 'claude' ? 'Claude' : 'GPT-4o'}</span>
               </div>
               <textarea style={{ ...S.input, minHeight: 260, lineHeight: 1.9, resize: 'vertical' }} value={summary} onChange={e => setSummary(e.target.value)} />
             </div>
