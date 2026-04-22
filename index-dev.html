@@ -172,19 +172,20 @@
         const ffmpeg = await getFFmpeg();
         await ffmpeg.writeFile('input.m4a', new Uint8Array(await inputBlob.arrayBuffer()));
         ffmpeg.on('progress', ({ progress }) => { if (onProgress) onProgress(Math.min(progress, 1)); });
+        // 用 .ogg 容器包 opus codec（Whisper 支援 .ogg，不支援純 .opus）
         await ffmpeg.exec([
           '-i', 'input.m4a',
           '-ar', String(AUDIO_CONFIG.sampleRate),
           '-ac', String(AUDIO_CONFIG.channels),
           '-c:a', AUDIO_CONFIG.codec,
           '-b:a', AUDIO_CONFIG.bitrate,
-          'output.opus',
+          'output.ogg',
         ]);
-        const out = await ffmpeg.readFile('output.opus');
+        const out = await ffmpeg.readFile('output.ogg');
         await ffmpeg.deleteFile('input.m4a');
-        await ffmpeg.deleteFile('output.opus');
+        await ffmpeg.deleteFile('output.ogg');
         if (onProgress) onProgress(1);
-        return new Blob([out.buffer], { type: 'audio/opus' });
+        return new Blob([out.buffer], { type: 'audio/ogg' });
       } catch (e) {
         console.warn('ffmpeg 壓縮失敗，改用原始檔案直接上傳：', e.message);
         if (onProgress) onProgress(1);
@@ -195,7 +196,7 @@
     // 階段 2a：靜音偵測
     const detectSilence = async (audioBlob, silenceDurationSec) => {
       const ffmpeg = await getFFmpeg();
-      await ffmpeg.writeFile('detect.opus', new Uint8Array(await audioBlob.arrayBuffer()));
+      await ffmpeg.writeFile('detect.ogg', new Uint8Array(await audioBlob.arrayBuffer()));
       const marks = [];
       ffmpeg.on('log', ({ message }) => {
         const s = message.match(/silence_start: ([\d.]+)/);
@@ -203,10 +204,10 @@
         if (s) marks.push({ type: 'start', time: parseFloat(s[1]) });
         if (e) marks.push({ type: 'end', time: parseFloat(e[1]) });
       });
-      await ffmpeg.exec(['-i', 'detect.opus', '-af',
+      await ffmpeg.exec(['-i', 'detect.ogg', '-af',
         `silencedetect=noise=${AUDIO_CONFIG.silenceThresholdDb}dB:d=${silenceDurationSec}`,
         '-f', 'null', '-']);
-      await ffmpeg.deleteFile('detect.opus');
+      await ffmpeg.deleteFile('detect.ogg');
       const silences = [];
       for (let i = 0; i < marks.length - 1; i++) {
         if (marks[i].type === 'start' && marks[i + 1].type === 'end') {
@@ -249,19 +250,19 @@
     // 階段 2c：依邊界切出各段 Blob
     const segmentAudio = async (compressedBlob, boundaries, onProgress) => {
       const ffmpeg = await getFFmpeg();
-      await ffmpeg.writeFile('full.opus', new Uint8Array(await compressedBlob.arrayBuffer()));
+      await ffmpeg.writeFile('full.ogg', new Uint8Array(await compressedBlob.arrayBuffer()));
       const segments = [];
       for (let i = 0; i < boundaries.length - 1; i++) {
         const start = boundaries[i];
         const dur   = boundaries[i + 1] - boundaries[i];
-        const name  = `seg_${i}.opus`;
-        await ffmpeg.exec(['-i', 'full.opus', '-ss', String(start), '-t', String(dur), '-c', 'copy', name]);
+        const name  = `seg_${i}.ogg`;
+        await ffmpeg.exec(['-i', 'full.ogg', '-ss', String(start), '-t', String(dur), '-c', 'copy', name]);
         const data  = await ffmpeg.readFile(name);
-        segments.push({ index: i, blob: new Blob([data.buffer], { type: 'audio/opus' }), startSec: start, durationSec: dur });
+        segments.push({ index: i, blob: new Blob([data.buffer], { type: 'audio/ogg' }), startSec: start, durationSec: dur });
         await ffmpeg.deleteFile(name);
         if (onProgress) onProgress((i + 1) / (boundaries.length - 1));
       }
-      await ffmpeg.deleteFile('full.opus');
+      await ffmpeg.deleteFile('full.ogg');
       return segments;
     };
 
@@ -273,7 +274,7 @@
         const blobType = segment.blob.type || '';
         const ext = blobType.includes('mp4') || blobType.includes('m4a') ? 'm4a'
                   : blobType.includes('webm') ? 'webm'
-                  : blobType.includes('opus') ? 'opus'
+                  : blobType.includes('ogg') || blobType.includes('opus') ? 'ogg'
                   : blobType.includes('mpeg') || blobType.includes('mp3') ? 'mp3'
                   : 'm4a'; // 預設
         fd.append('file', segment.blob, `segment-${segment.index}.${ext}`);
