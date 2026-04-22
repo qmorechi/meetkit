@@ -70,6 +70,15 @@
     const SB_URL = "https://yrugcgzkomydmorgzwhb.supabase.co";
     const SB_KEY = "sb_publishable_m3Qi3HdfMT2pbcQHVuGxNw_696C0jYa";
 
+    // ─── EDGE FUNCTION 代理（Phase C：API key 不再暴露於前端） ────────────────
+    // 所有 OpenAI / Anthropic 呼叫都改走這裡，key 存在 Supabase Edge Function secrets
+    const EDGE_BASE = `${SB_URL}/functions/v1`;
+    const EDGE_HEADERS = {
+      'Authorization': `Bearer ${SB_KEY}`,
+      'apikey': SB_KEY,
+      'Content-Type': 'application/json',
+    };
+
     const db = (path, opts = {}) =>
       fetch(`${SB_URL}/rest/v1/${path}`, {
         headers: {
@@ -272,8 +281,11 @@
         fd.append('language', AUDIO_CONFIG.whisperLanguage);
         fd.append('prompt', AUDIO_CONFIG.whisperPrompt);
         fd.append('response_format', 'verbose_json');
-        const res = await fetch('https://api.openai.com/v1/audio/transcriptions', {
-          method: 'POST', headers: { Authorization: `Bearer ${openaiKey}` }, body: fd,
+        // Phase C：改走 Edge Function 代理。不設 Content-Type，讓 fetch 自動帶 multipart boundary
+        const res = await fetch(`${EDGE_BASE}/whisper-proxy`, {
+          method: 'POST',
+          headers: { 'Authorization': `Bearer ${SB_KEY}`, 'apikey': SB_KEY },
+          body: fd,
         });
         if (!res.ok) { const e = await res.json(); throw new Error(e.error?.message || `HTTP ${res.status}`); }
         const data = await res.json();
@@ -2044,15 +2056,18 @@ ${txText}
           let usedEngine = 'gpt-4o';
           if (anthropicKey.trim()) {
             try {
-              const res = await fetch('https://api.anthropic.com/v1/messages', {
+              // Phase C：改走 Edge Function 代理（ai-proxy 原樣轉發 Anthropic 回應）
+              const res = await fetch(`${EDGE_BASE}/ai-proxy`, {
                 method: 'POST',
-                headers: {
-                  'x-api-key': anthropicKey.trim(),
-                  'anthropic-version': '2023-06-01',
-                  'anthropic-dangerous-request-allow-browsers': 'true',
-                  'Content-Type': 'application/json',
-                },
-                body: JSON.stringify({ model: 'claude-opus-4-5', max_tokens: 4096, messages: [{ role: 'user', content: prompt }] }),
+                headers: EDGE_HEADERS,
+                body: JSON.stringify({
+                  provider: 'anthropic',
+                  payload: {
+                    model: 'claude-opus-4-5',
+                    max_tokens: 4096,
+                    messages: [{ role: 'user', content: prompt }],
+                  },
+                }),
               });
               if (!res.ok) { const e = await res.json(); throw new Error(e.error?.message || `HTTP ${res.status}`); }
               summaryText = (await res.json()).content[0].text;
@@ -2063,7 +2078,8 @@ ${txText}
             }
           }
           if (!summaryText) {
-            const res = await fetch('https://api.openai.com/v1/chat/completions', { method: 'POST', headers: { Authorization: `Bearer ${openaiKey.trim()}`, 'Content-Type': 'application/json' }, body: JSON.stringify({ model: 'gpt-4o', messages: [{ role: 'user', content: prompt }] }) });
+            // Phase C：改走 Edge Function 代理（ai-proxy 原樣轉發 OpenAI 回應）
+            const res = await fetch(`${EDGE_BASE}/ai-proxy`, { method: 'POST', headers: EDGE_HEADERS, body: JSON.stringify({ provider: 'openai', payload: { model: 'gpt-4o', messages: [{ role: 'user', content: prompt }] } }) });
             if (!res.ok) { const e = await res.json(); throw new Error(e.error?.message || `HTTP ${res.status}`); }
             summaryText = (await res.json()).choices[0].message.content;
           }
