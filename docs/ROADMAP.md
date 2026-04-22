@@ -521,3 +521,62 @@ _這份路線圖會隨開發進展持續更新。_
 
 ## 下次從這裡開始
 回 claude.ai 做 Phase D(SQL 設定 config/projects/proposals/journals 的 RLS)
+## 2026/04/22 — MeetKit Supabase API key 外洩事件處理
+
+### 觸發
+Supabase 寄警告信,提到 MX Meeting Kit 的 table 在 public 且 RLS disabled。
+
+### 根本原因(三重組合)
+1. meetkit repo 是 public(GitHub Pages Free 帳號限制)
+2. Supabase URL + anon key 寫死在 index.html 第 63-64 行
+3. 一張 config 表存了 OpenAI + Anthropic API key,且 RLS 沒開
+→ 任何人 curl 都能撈走 API key。
+
+### 檢查結論
+OpenAI 和 Anthropic 用量兩邊都沒異常,幸運沒被爬到。
+
+### 戰果
+**Phase A 止血**
+- 舊 OpenAI key 作廢
+- 舊 Anthropic key 判定為孤兒,放棄作廢(已驗證無盜刷)
+- Supabase config 表 row 清空
+
+**Phase B 架構升級**
+- 產新 API key → Supabase Edge Function Secrets
+- 部署 ai-proxy(處理 Anthropic / OpenAI chat)
+- 部署 whisper-proxy(處理 OpenAI Whisper 音檔轉文字)
+
+**Phase C 前端接上**
+- index.html 三處 fetch 改走 Edge Function
+- API Key UI 整個拿掉,順手清掉 config 表的自動載入邏輯
+- OpenAI + Anthropic 設 $100 硬上限 + 警示
+
+**額外 bug 修復(實戰才發現)**
+- whisper-proxy Content-Type 轉發 bug(前端 fetch 不能手動設 Content-Type,
+  否則 multipart boundary 壞掉)
+- ffmpeg 輸出格式改 .ogg 容器(符合 Whisper 官方支援格式,修掉潛伏的 400 錯誤)
+
+### 實戰驗證
+音檔上傳 → 逐字稿 → 摘要 全流程端到端跑通。
+
+### 重要學習
+1. Supabase anon key 設計上就是可公開的,**真正的防護是 RLS**,不是藏 key
+2. API key **絕對不能**存在 DB table 裡,即使 RLS 開著也不該,要放 Edge Function Secrets
+3. GitHub Pages Free 帳號強制 repo public,基礎設施等級限制
+4. 第三方 API key 三層防護:存在正確位置 + 前端不接觸 + 設定花費上限
+5. fetch 送 multipart/form-data **絕對不要**手動設 Content-Type,讓瀏覽器自動帶 boundary
+6. Whisper 支援容器格式清單要查清楚,ffmpeg 輸出要符合
+7. 好的架構重構會順便暴露潛伏 bug
+8. Claude Code 做中型架構改造時,Opus 比 Sonnet 穩,值得多花 NT$50
+
+### Cosmoship 的含義
+Cosmoship 上 production 時這整套經驗全部適用:
+- 所有第三方 API(Shopline、Google Ads、Meta Pixel 等)key 走 Edge Function Secrets
+- 不能存在前端,不能存在 DB 表,上 production 前開 RLS
+- 花費上限一定要設好
+- 重要流程要端到端實戰驗證,不能只做單元測試
+
+### 待辦
+- [ ] Phase D:Supabase RLS 設定(config / projects / proposals / journals)
+- [ ] ffmpeg 切段 15 秒 timeout 調整(不影響使用,有 fallback)
+- [ ] 清 localStorage 殘留 mk_openai_key / mk_anthropic_key(無害)
