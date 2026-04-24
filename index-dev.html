@@ -152,45 +152,44 @@
     };
 
     // ffmpeg 懶載入（第一次呼叫時初始化，之後重用）
+    // 載入失敗時會拋錯，讓上層走 Web Audio API 備援路線
     let ffmpegInstance = null;
+    let ffmpegLoadPromise = null;
     const getFFmpeg = async () => {
       if (ffmpegInstance) return ffmpegInstance;
+      if (ffmpegLoadPromise) return ffmpegLoadPromise;
       const { FFmpeg } = FFmpegWASM;
-      ffmpegInstance = new FFmpeg();
-      // 10 秒 timeout：GitHub Pages 沒有 COOP/COEP headers 時 SharedArrayBuffer 會卡住
-      await Promise.race([
-        ffmpegInstance.load({ coreURL: 'https://unpkg.com/@ffmpeg/core@0.12.6/dist/umd/ffmpeg-core.js' }),
-        new Promise((_, reject) => setTimeout(() => reject(new Error('ffmpeg timeout')), 10000)),
-      ]);
-      return ffmpegInstance;
+      const inst = new FFmpeg();
+      // 90 秒 timeout：core 首次要下載 ~30MB，Safari + 慢網路很容易超過 10 秒
+      ffmpegLoadPromise = Promise.race([
+        inst.load({ coreURL: 'https://unpkg.com/@ffmpeg/core@0.12.6/dist/umd/ffmpeg-core.js' }),
+        new Promise((_, reject) => setTimeout(() => reject(new Error('ffmpeg timeout')), 90000)),
+      ]).then(() => { ffmpegInstance = inst; return inst; })
+        .catch((e) => { ffmpegLoadPromise = null; throw e; });
+      return ffmpegLoadPromise;
     };
 
     // 階段 1：壓縮 → 16kHz mono opus 24kbps
-    // 若 ffmpeg 無法載入（例如 GitHub Pages 無 SharedArrayBuffer），直接回傳原始檔案
-    const compressAudio = async (inputBlob, onProgress) => {
-      try {
-        const ffmpeg = await getFFmpeg();
-        await ffmpeg.writeFile('input.m4a', new Uint8Array(await inputBlob.arrayBuffer()));
-        ffmpeg.on('progress', ({ progress }) => { if (onProgress) onProgress(Math.min(progress, 1)); });
-        // 用 .ogg 容器包 opus codec（Whisper 支援 .ogg，不支援純 .opus）
-        await ffmpeg.exec([
-          '-i', 'input.m4a',
-          '-ar', String(AUDIO_CONFIG.sampleRate),
-          '-ac', String(AUDIO_CONFIG.channels),
-          '-c:a', AUDIO_CONFIG.codec,
-          '-b:a', AUDIO_CONFIG.bitrate,
-          'output.ogg',
-        ]);
-        const out = await ffmpeg.readFile('output.ogg');
-        await ffmpeg.deleteFile('input.m4a');
-        await ffmpeg.deleteFile('output.ogg');
-        if (onProgress) onProgress(1);
-        return new Blob([out.buffer], { type: 'audio/ogg' });
-      } catch (e) {
-        console.warn('ffmpeg 壓縮失敗，改用原始檔案直接上傳：', e.message);
-        if (onProgress) onProgress(1);
-        return inputBlob; // 直接用原始音檔
-      }
+    // 嚴格版：失敗直接拋錯，讓上層決定要不要走 Web Audio fallback
+    // （不能靜默吞錯回傳原檔，否則後續切段也會掛，最後整個 80 分鐘原檔送上 Whisper 變成 413）
+    const compressAudioStrict = async (inputBlob, onProgress) => {
+      const ffmpeg = await getFFmpeg();
+      await ffmpeg.writeFile('input.m4a', new Uint8Array(await inputBlob.arrayBuffer()));
+      ffmpeg.on('progress', ({ progress }) => { if (onProgress) onProgress(Math.min(progress, 1)); });
+      // 用 .ogg 容器包 opus codec（Whisper 支援 .ogg，不支援純 .opus）
+      await ffmpeg.exec([
+        '-i', 'input.m4a',
+        '-ar', String(AUDIO_CONFIG.sampleRate),
+        '-ac', String(AUDIO_CONFIG.channels),
+        '-c:a', AUDIO_CONFIG.codec,
+        '-b:a', AUDIO_CONFIG.bitrate,
+        'output.ogg',
+      ]);
+      const out = await ffmpeg.readFile('output.ogg');
+      await ffmpeg.deleteFile('input.m4a');
+      await ffmpeg.deleteFile('output.ogg');
+      if (onProgress) onProgress(1);
+      return new Blob([out.buffer], { type: 'audio/ogg' });
     };
 
     // 階段 2a：靜音偵測
@@ -276,6 +275,7 @@
                   : blobType.includes('webm') ? 'webm'
                   : blobType.includes('ogg') || blobType.includes('opus') ? 'ogg'
                   : blobType.includes('mpeg') || blobType.includes('mp3') ? 'mp3'
+                  : blobType.includes('wav') ? 'wav'
                   : 'm4a'; // 預設
         fd.append('file', segment.blob, `segment-${segment.index}.${ext}`);
         fd.append('model', 'whisper-1');
@@ -288,12 +288,27 @@
           headers: { 'Authorization': `Bearer ${SB_KEY}`, 'apikey': SB_KEY },
           body: fd,
         });
-        if (!res.ok) { const e = await res.json(); throw new Error(e.error?.message || `HTTP ${res.status}`); }
+        if (!res.ok) {
+          // 4xx 永久錯誤（413 太大、400 格式錯、401/403 認證）：再試也沒用，直接失敗
+          if (res.status >= 400 && res.status < 500 && res.status !== 408 && res.status !== 429) {
+            let msg;
+            try { msg = (await res.json()).error?.message || `HTTP ${res.status}`; }
+            catch { msg = `HTTP ${res.status}`; }
+            const err = new Error(msg);
+            err.permanent = true;
+            throw err;
+          }
+          let msg;
+          try { msg = (await res.json()).error?.message || `HTTP ${res.status}`; }
+          catch { msg = `HTTP ${res.status}`; }
+          throw new Error(msg);
+        }
         const data = await res.json();
         return { index: segment.index, startSec: segment.startSec, durationSec: segment.durationSec, text: data.text };
       } catch (err) {
-        if (attempt >= AUDIO_CONFIG.retryAttempts) {
-          return { index: segment.index, error: `段 ${segment.index + 1} 失敗（重試 ${attempt} 次）：${err.message}` };
+        // 永久錯誤不重試；超過重試次數也不再試
+        if (err.permanent || attempt >= AUDIO_CONFIG.retryAttempts) {
+          return { index: segment.index, error: `段 ${segment.index + 1} 失敗：${err.message}` };
         }
         await new Promise(r => setTimeout(r, AUDIO_CONFIG.retryDelayMs));
         return transcribeSegment(segment, openaiKey, attempt + 1);
@@ -325,6 +340,87 @@
         fullText: sorted.map(t => t.text).join('\n\n'),
         failedSegments: transcripts.filter(t => t.error),
       };
+    };
+
+    // ─── WEB AUDIO FALLBACK ──────────────────────────────────────────────────
+    // ffmpeg.wasm 無法載入時的備援路線（Safari 無 COOP/COEP、核心下載失敗等）
+    // 全程使用瀏覽器原生 AudioContext，保證任何環境都能切段上傳
+
+    // 每段 10 分鐘：16kHz mono 16-bit WAV ≈ 19.2MB，安全在 Whisper 25MB 上限內
+    const WEBAUDIO_SEGMENT_MINUTES = 10;
+
+    // 將 m4a/mp3/wav 解碼成 16kHz mono AudioBuffer
+    const decodeAudioBlob = async (blob) => {
+      const Ctx = window.AudioContext || window.webkitAudioContext;
+      // Safari 舊版不支援建構子 sampleRate 參數，但新版會用它來 resample
+      let ctx;
+      try { ctx = new Ctx({ sampleRate: AUDIO_CONFIG.sampleRate }); }
+      catch { ctx = new Ctx(); }
+      const arrBuf = await blob.arrayBuffer();
+      const audioBuf = await new Promise((resolve, reject) => {
+        // callback 形式相容 Safari 舊版
+        const p = ctx.decodeAudioData(arrBuf, resolve, reject);
+        if (p && p.then) p.then(resolve, reject);
+      });
+      return audioBuf;
+    };
+
+    // AudioBuffer 某個時間區段 → 16-bit PCM mono WAV Blob
+    const encodeWavSegment = (audioBuffer, startSec, durationSec) => {
+      const sr = audioBuffer.sampleRate;
+      const startIdx = Math.max(0, Math.floor(startSec * sr));
+      const endIdx   = Math.min(audioBuffer.length, Math.floor((startSec + durationSec) * sr));
+      const len = endIdx - startIdx;
+      const chans = audioBuffer.numberOfChannels;
+      // 混多聲道成 mono
+      const mono = new Float32Array(len);
+      for (let c = 0; c < chans; c++) {
+        const ch = audioBuffer.getChannelData(c);
+        for (let i = 0; i < len; i++) mono[i] += ch[startIdx + i] / chans;
+      }
+      // WAV header (44 bytes) + 16-bit PCM samples
+      const buf = new ArrayBuffer(44 + len * 2);
+      const dv  = new DataView(buf);
+      const wStr = (o, s) => { for (let i = 0; i < s.length; i++) dv.setUint8(o + i, s.charCodeAt(i)); };
+      wStr(0, 'RIFF');
+      dv.setUint32(4, 36 + len * 2, true);
+      wStr(8, 'WAVE');
+      wStr(12, 'fmt ');
+      dv.setUint32(16, 16, true);          // PCM chunk size
+      dv.setUint16(20, 1, true);           // format = PCM
+      dv.setUint16(22, 1, true);           // mono
+      dv.setUint32(24, sr, true);
+      dv.setUint32(28, sr * 2, true);      // byte rate
+      dv.setUint16(32, 2, true);           // block align
+      dv.setUint16(34, 16, true);          // bits per sample
+      wStr(36, 'data');
+      dv.setUint32(40, len * 2, true);
+      let off = 44;
+      for (let i = 0; i < len; i++) {
+        const s = Math.max(-1, Math.min(1, mono[i]));
+        dv.setInt16(off, s < 0 ? s * 0x8000 : s * 0x7FFF, true);
+        off += 2;
+      }
+      return new Blob([buf], { type: 'audio/wav' });
+    };
+
+    // Web Audio 版等時切段（不做靜音偵測，按固定時間切）
+    const segmentAudioWebAudio = async (audioBlob, onProgress) => {
+      const audioBuffer = await decodeAudioBlob(audioBlob);
+      const total  = audioBuffer.duration;
+      const segSec = WEBAUDIO_SEGMENT_MINUTES * 60;
+      const segments = [];
+      let startSec = 0;
+      let idx = 0;
+      while (startSec < total) {
+        const dur  = Math.min(segSec, total - startSec);
+        const blob = encodeWavSegment(audioBuffer, startSec, dur);
+        segments.push({ index: idx, blob, startSec, durationSec: dur });
+        startSec += dur;
+        idx += 1;
+        if (onProgress) onProgress(Math.min(startSec / total, 1));
+      }
+      return { segments, duration: total };
     };
 
     // ─────────────────────────────────────────────────────────────────────────────
@@ -1911,32 +2007,36 @@
         setCompressProgress(0); setSegmentProgress(0); setUploadProgress(0); setFailedSegments([]);
         let txText = '';
 
+        let segs, duration;
         try {
-          // ── 階段 1：壓縮 ──────────────────────────────────────────────────
-          setStatus('compressing');
-          const compressed = await compressAudio(audioSrc, p => setCompressProgress(p));
-
-          // ── 階段 2：取得時長 + 靜音切段 ──────────────────────────────────
-          setStatus('segmenting');
-          const duration = await getAudioDuration(audioSrc);
-          let segs;
+          // ── 階段 1-2：ffmpeg 主路線（壓縮 + 靜音切段） ─────────────────────
+          // ffmpeg 載入失敗或切段失敗，一律退到 Web Audio API 備援路線
           try {
-            // 加 15 秒 timeout，ffmpeg 無法使用時直接跳過
-            const segResult = await Promise.race([
-              (async () => {
-                const boundaries = await calculateSegmentBoundaries(compressed, duration);
-                return await segmentAudio(compressed, boundaries, p => setSegmentProgress(p));
-              })(),
-              new Promise((_, reject) => setTimeout(() => reject(new Error('segmentation timeout')), 15000)),
-            ]);
-            segs = segResult;
-          } catch (e) {
-            console.warn('切段失敗，改用原始檔案作為單一段落：', e.message);
-            // fallback：整個音檔當一段直接送 Whisper
-            segs = [{ index: 0, blob: compressed, startSec: 0, durationSec: duration }];
+            setStatus('compressing');
+            const compressed = await compressAudioStrict(audioSrc, p => setCompressProgress(p));
+
+            setStatus('segmenting');
+            duration = await getAudioDuration(audioSrc);
+            const boundaries = await calculateSegmentBoundaries(compressed, duration);
+            segs = await segmentAudio(compressed, boundaries, p => setSegmentProgress(p));
+          } catch (ffmpegErr) {
+            // Web Audio fallback：原生瀏覽器 API，無 WASM 依賴，一定能切
+            console.warn('ffmpeg 路線失敗，改走 Web Audio API 備援：', ffmpegErr.message);
+            setStatus('segmenting');
+            setCompressProgress(1);
+            const webResult = await segmentAudioWebAudio(audioSrc, p => setSegmentProgress(p));
+            segs = webResult.segments;
+            duration = webResult.duration;
           }
           setSegmentProgress(1);
           setSegmentCount(segs.length);
+
+          // ── 硬檢查：任何段落超過 24MB 直接拒送（Whisper 上限 25MB） ──────
+          const WHISPER_MAX_BYTES = 24 * 1024 * 1024;
+          const oversize = segs.find(s => s.blob.size > WHISPER_MAX_BYTES);
+          if (oversize) {
+            throw new Error(`段 ${oversize.index + 1} 檔案過大（${(oversize.blob.size / 1024 / 1024).toFixed(1)} MB），無法送 Whisper。請重新整理頁面再試一次。`);
+          }
 
           // ── 階段 3：並行上傳 Whisper ──────────────────────────────────────
           setStatus('transcribing');
