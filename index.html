@@ -57,9 +57,8 @@
       .hide-mobile { display: none !important; }
     }
   </style>
-  <script src="https://unpkg.com/@ffmpeg/ffmpeg@0.12.10/dist/umd/ffmpeg.js"></script>
-  <script src="https://unpkg.com/@ffmpeg/util@0.12.1/dist/umd/index.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/qrcodejs@1.0.0/qrcode.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/jszip@3.10.1/dist/jszip.min.js"></script>
 </head>
 <body>
   <div id="root"></div>
@@ -92,177 +91,272 @@
       });
 
     // ─── 附件文字抽取 ─────────────────────────────────────────────────────────────
-    const extractFileText = async (fileUrl, fileName) => {
+    // ─── ATTACHMENT EXTRACTION (text + vision) ───────────────────────────────
+    // 提案附件可能是 PDF/圖片/DOCX/TXT/PPT。支援範圍：
+    //   PDF → 每頁 render 成 JPEG，送 Claude vision（保留圖片/版面）
+    //   PNG/JPG/WEBP/GIF → 直接 base64 送 Claude vision
+    //   DOCX/TXT/MD/RTF → 抽純文字
+    //   PPT/PPTX/KEY → 提示使用者匯出 PDF（瀏覽器無法可靠解析）
+    // 回傳: { kind, fileName, blocks?, text? }
+    //   blocks 是 Claude API 相容的圖片 content blocks（也可轉成 OpenAI vision 格式）
+
+    const PDF_VISION_MAX_PAGES = 30; // 超過只取前 N 頁，避免 token 爆炸
+    const PDF_VISION_SCALE = 1.5;    // 約 1280×960，Claude 閱讀足夠
+
+    // Blob → base64 純字串（去掉 data:...;base64, 前綴）
+    const blobToBase64 = (blob) => new Promise((resolve, reject) => {
+      const r = new FileReader();
+      r.onloadend = () => resolve(r.result.split(',')[1]);
+      r.onerror = reject;
+      r.readAsDataURL(blob);
+    });
+
+    // canvas → JPEG base64（JPEG 比 PNG 小 5-10 倍,視覺無損）
+    const canvasToJpegBase64 = (canvas, quality = 0.8) => {
+      const dataUrl = canvas.toDataURL('image/jpeg', quality);
+      return dataUrl.split(',')[1];
+    };
+
+    // base64 → Blob（Storage 上傳要 binary body）
+    const base64ToBlob = (b64, mime) => {
+      const bin = atob(b64);
+      const buf = new Uint8Array(bin.length);
+      for (let i = 0; i < bin.length; i++) buf[i] = bin.charCodeAt(i);
+      return new Blob([buf], { type: mime });
+    };
+
+    // 把已 render 的圖片上傳到 Supabase Storage（Notion 需要公開 URL 才能嵌入）
+    // 路徑: presentations/{projectId}/renders/{fileName}
+    // 回傳公開 URL,失敗回 null
+    const uploadRenderedToStorage = async (projectId, fileName, blob, mime) => {
+      const path = `${projectId}/renders/${fileName}`;
+      try {
+        const res = await fetch(`${SB_URL}/storage/v1/object/presentations/${path}`, {
+          method: 'POST',
+          headers: {
+            apikey: SB_KEY,
+            Authorization: `Bearer ${SB_KEY}`,
+            'Content-Type': mime || 'application/octet-stream',
+            'x-upsert': 'true',
+          },
+          body: blob,
+        });
+        if (!res.ok) return null;
+        return `${SB_URL}/storage/v1/object/public/presentations/${path}`;
+      } catch {
+        return null;
+      }
+    };
+
+    // 清理檔名,僅保留 Storage 安全字元
+    const safeStem = (name) => {
+      const stem = (name || 'file').replace(/\.[^.]+$/, '');
+      return stem.replace(/[^a-zA-Z0-9._-]/g, '_').slice(0, 60) || 'file';
+    };
+
+    const pdfToImageBlocks = async (fileUrl) => {
+      if (typeof pdfjsLib === 'undefined') return [];
+      const res = await fetch(fileUrl);
+      if (!res.ok) return [];
+      const buf = await res.arrayBuffer();
+      const pdf = await pdfjsLib.getDocument({ data: buf }).promise;
+      const pages = Math.min(pdf.numPages, PDF_VISION_MAX_PAGES);
+      const blocks = [];
+      for (let i = 1; i <= pages; i++) {
+        const page = await pdf.getPage(i);
+        const viewport = page.getViewport({ scale: PDF_VISION_SCALE });
+        const canvas = document.createElement('canvas');
+        canvas.width = viewport.width;
+        canvas.height = viewport.height;
+        await page.render({ canvasContext: canvas.getContext('2d'), viewport }).promise;
+        blocks.push({
+          type: 'image',
+          source: { type: 'base64', media_type: 'image/jpeg', data: canvasToJpegBase64(canvas) },
+        });
+      }
+      return { blocks, totalPages: pdf.numPages, includedPages: pages };
+    };
+
+    // PPTX 半解：JSZip 拆 zip → 抽每張 slide 的 XML 文字 + ppt/media/ 裡的圖片
+    // 版面配置會遺失，但文字+原圖都保留，比純文字好很多
+    const PPTX_MAX_IMAGES = 40;
+    const pptxToParts = async (fileUrl) => {
+      if (typeof JSZip === 'undefined') return null;
+      const res = await fetch(fileUrl);
+      if (!res.ok) return null;
+      const buf = await res.arrayBuffer();
+      const zip = await JSZip.loadAsync(buf);
+
+      // 1) 每張 slide 的文字（按 slide1.xml, slide2.xml... 排序）
+      const slideEntries = Object.keys(zip.files)
+        .filter(k => /^ppt\/slides\/slide\d+\.xml$/.test(k))
+        .sort((a, b) => {
+          const na = parseInt(a.match(/slide(\d+)/)[1], 10);
+          const nb = parseInt(b.match(/slide(\d+)/)[1], 10);
+          return na - nb;
+        });
+      const slideTexts = [];
+      for (const key of slideEntries) {
+        const xml = await zip.files[key].async('string');
+        // <a:t>...</a:t> 是實際文字內容
+        const matches = [...xml.matchAll(/<a:t[^>]*>([^<]*)<\/a:t>/g)];
+        const text = matches.map(m => m[1]).join(' ').replace(/\s+/g, ' ').trim();
+        const n = parseInt(key.match(/slide(\d+)/)[1], 10);
+        if (text) slideTexts.push(`【Slide ${n}】${text}`);
+      }
+
+      // 2) 內嵌圖片（PNG/JPG/JPEG/GIF/WEBP）→ base64 image blocks
+      const mediaEntries = Object.keys(zip.files)
+        .filter(k => /^ppt\/media\/.*\.(png|jpg|jpeg|gif|webp)$/i.test(k))
+        .sort()
+        .slice(0, PPTX_MAX_IMAGES);
+      const blocks = [];
+      for (const key of mediaEntries) {
+        const ext = key.split('.').pop().toLowerCase();
+        const mime = ext === 'jpg' ? 'image/jpeg' : `image/${ext}`;
+        const blob = await zip.files[key].async('blob');
+        const data = await blobToBase64(blob);
+        blocks.push({ type: 'image', source: { type: 'base64', media_type: mime, data } });
+      }
+
+      return {
+        text: slideTexts.join('\n'),
+        blocks,
+        totalImages: mediaEntries.length,
+      };
+    };
+
+    const extractAttachmentParts = async (fileUrl, fileName) => {
+      const base = { fileName, originalUrl: fileUrl };
       try {
         const ext = (fileName || fileUrl).split('.').pop().toLowerCase().split('?')[0];
-        const res = await fetch(fileUrl);
-        if (!res.ok) return '';
+
+        // Apple 專有 / 2003 舊格式 → 提示匯出
+        if (['key', 'pages', 'numbers'].includes(ext)) {
+          return { ...base, kind: 'needs-export', hint: '請在 Keynote/Pages/Numbers 裡按 Cmd+E 匯出為 PDF，再重新上傳' };
+        }
+        if (['ppt', 'doc', 'xls'].includes(ext)) {
+          return { ...base, kind: 'needs-export', hint: `${ext.toUpperCase()} 為 2003 舊格式，請另存新檔為 .${ext}x 或匯出 PDF` };
+        }
+
+        if (ext === 'pptx') {
+          const r = await pptxToParts(fileUrl);
+          if (!r) return { ...base, kind: 'empty' };
+          // 混合回傳：文字 + 圖片 blocks（上層會同時塞進 messages）
+          return { ...base, kind: 'pptx', text: r.text, blocks: r.blocks, note: `（PPTX 半解：文字 + ${r.totalImages} 張內嵌圖，版面配置已遺失）` };
+        }
 
         if (ext === 'pdf') {
-          if (typeof pdfjsLib === 'undefined') return '';
-          const buf = await res.arrayBuffer();
-          const pdf = await pdfjsLib.getDocument({ data: buf }).promise;
-          const pages = await Promise.all(
-            Array.from({ length: pdf.numPages }, (_, i) =>
-              pdf.getPage(i + 1).then(p => p.getTextContent()).then(tc => tc.items.map(it => it.str).join(' '))
-            )
-          );
-          return pages.join('\n');
+          const r = await pdfToImageBlocks(fileUrl);
+          if (!r || !r.blocks.length) return { ...base, kind: 'empty' };
+          return { ...base, kind: 'vision', blocks: r.blocks, totalPages: r.totalPages, includedPages: r.includedPages, note: r.totalPages > r.includedPages ? `（共 ${r.totalPages} 頁，只分析前 ${r.includedPages} 頁）` : '' };
+        }
+
+        if (['png', 'jpg', 'jpeg', 'webp', 'gif'].includes(ext)) {
+          const res = await fetch(fileUrl);
+          if (!res.ok) return { ...base, kind: 'empty' };
+          const blob = await res.blob();
+          const data = await blobToBase64(blob);
+          const mime = ext === 'jpg' ? 'image/jpeg' : `image/${ext}`;
+          // 圖片原檔已在 Storage（file_url 就是 public URL）,Notion 可直接用 originalUrl,不需重傳
+          return { ...base, kind: 'vision', blocks: [{ type: 'image', source: { type: 'base64', media_type: mime, data } }], isDirectImage: true };
         }
 
         if (ext === 'docx') {
-          if (typeof mammoth === 'undefined') return '';
+          if (typeof mammoth === 'undefined') return { ...base, kind: 'empty' };
+          const res = await fetch(fileUrl);
+          if (!res.ok) return { ...base, kind: 'empty' };
           const buf = await res.arrayBuffer();
           const result = await mammoth.extractRawText({ arrayBuffer: buf });
-          return result.value || '';
+          return { ...base, kind: 'text', text: result.value || '' };
         }
 
         if (['txt', 'md', 'rtf'].includes(ext)) {
-          return await res.text();
+          const res = await fetch(fileUrl);
+          if (!res.ok) return { ...base, kind: 'empty' };
+          return { ...base, kind: 'text', text: await res.text() };
         }
 
-        return '';
-      } catch { return ''; }
+        return { ...base, kind: 'empty' };
+      } catch (e) {
+        console.warn('附件抽取失敗：', fileName, e.message);
+        return { ...base, kind: 'empty' };
+      }
+    };
+
+    // 把提案附件的圖片 render 結果上傳到 Storage,產出 Notion-ready 的附件資料
+    // 回傳 proposals 陣列（每個 proposal 多一個 attachments 欄位）,給 Edge Function 組 Notion blocks
+    const archiveAttachmentsToStorage = async (projectId, proposalsWithParts) => {
+      const result = [];
+      for (const p of proposalsWithParts) {
+        const attachments = [];
+        for (const part of (p.parts || [])) {
+          const att = {
+            kind: part.kind,
+            fileName: part.fileName,
+            originalUrl: part.originalUrl,
+            isDirectImage: !!part.isDirectImage,
+            note: part.note || '',
+            hint: part.hint || '',
+            text: part.text || '',
+            images: [],
+          };
+
+          // needs-export / text / empty → 無須上傳,直接保留
+          if (part.kind === 'vision' && part.isDirectImage) {
+            // 直接用原檔 URL,不重傳
+            att.images.push({ url: part.originalUrl, caption: part.fileName });
+          } else if (part.kind === 'vision' && part.blocks?.length) {
+            // PDF → 每頁 render 上傳
+            const stem = safeStem(part.fileName);
+            for (let i = 0; i < part.blocks.length; i++) {
+              const b = part.blocks[i];
+              if (b.type !== 'image') continue;
+              const blob = base64ToBlob(b.source.data, b.source.media_type);
+              const url = await uploadRenderedToStorage(projectId, `${stem}-p${i + 1}.jpg`, blob, b.source.media_type);
+              if (url) att.images.push({ url, caption: `${part.fileName} – 第 ${i + 1} 頁` });
+            }
+          } else if (part.kind === 'pptx' && part.blocks?.length) {
+            const stem = safeStem(part.fileName);
+            for (let i = 0; i < part.blocks.length; i++) {
+              const b = part.blocks[i];
+              if (b.type !== 'image') continue;
+              const ext = (b.source.media_type.split('/')[1] || 'jpg').replace('jpeg', 'jpg');
+              const blob = base64ToBlob(b.source.data, b.source.media_type);
+              const url = await uploadRenderedToStorage(projectId, `${stem}-img${i + 1}.${ext}`, blob, b.source.media_type);
+              if (url) att.images.push({ url, caption: `${part.fileName} – 圖 ${i + 1}` });
+            }
+          }
+
+          attachments.push(att);
+        }
+        result.push({
+          title: p.title,
+          author: p.author,
+          content: p.content,
+          attachments,
+        });
+      }
+      return result;
     };
 
     const genId = () => Math.random().toString(36).slice(2, 8).toUpperCase();
 
     // ─── AUDIO PIPELINE ──────────────────────────────────────────────────────────
-    // 壓縮 → 靜音切段 → 並行 Whisper 上傳 → 合併逐字稿
-    // 依賴：ffmpeg.wasm（<head> CDN 載入）
+    // Web Audio API 原生切段 → 並行 Whisper 上傳 → 合併逐字稿
+    // 完全不用 ffmpeg.wasm（實測在 Safari + 慢網路 + 長檔下載失敗率高，改走純瀏覽器 API）
     // 決策文件：docs/audio-pipeline.md
     // ─────────────────────────────────────────────────────────────────────────────
 
     const AUDIO_CONFIG = {
       sampleRate: 16000,
       channels: 1,
-      bitrate: '24k',
-      codec: 'libopus',
-      targetSegmentMinutes: 15,
-      maxSegmentMinutes: 20,
-      searchWindowMinutes: 2,
-      silenceThresholdDb: -40,
-      minSilenceSec: 0.8,
       parallelChannels: 2,
       retryAttempts: 5,
       retryDelayMs: 3000,
       maxFileSizeMB: 500,
       whisperLanguage: 'zh',
       whisperPrompt: 'Cosmoship, 宇宙小艇, SIPAI, 偷瞄的X, MX Design, Figma, Supabase, Anthropic, Claude, ComfyUI, Flux, MeetKit',
-    };
-
-    // ffmpeg 懶載入（第一次呼叫時初始化，之後重用）
-    // 載入失敗時會拋錯，讓上層走 Web Audio API 備援路線
-    let ffmpegInstance = null;
-    let ffmpegLoadPromise = null;
-    const getFFmpeg = async () => {
-      if (ffmpegInstance) return ffmpegInstance;
-      if (ffmpegLoadPromise) return ffmpegLoadPromise;
-      const { FFmpeg } = FFmpegWASM;
-      const inst = new FFmpeg();
-      // 90 秒 timeout：core 首次要下載 ~30MB，Safari + 慢網路很容易超過 10 秒
-      ffmpegLoadPromise = Promise.race([
-        inst.load({ coreURL: 'https://unpkg.com/@ffmpeg/core@0.12.6/dist/umd/ffmpeg-core.js' }),
-        new Promise((_, reject) => setTimeout(() => reject(new Error('ffmpeg timeout')), 90000)),
-      ]).then(() => { ffmpegInstance = inst; return inst; })
-        .catch((e) => { ffmpegLoadPromise = null; throw e; });
-      return ffmpegLoadPromise;
-    };
-
-    // 階段 1：壓縮 → 16kHz mono opus 24kbps
-    // 嚴格版：失敗直接拋錯，讓上層決定要不要走 Web Audio fallback
-    // （不能靜默吞錯回傳原檔，否則後續切段也會掛，最後整個 80 分鐘原檔送上 Whisper 變成 413）
-    const compressAudioStrict = async (inputBlob, onProgress) => {
-      const ffmpeg = await getFFmpeg();
-      await ffmpeg.writeFile('input.m4a', new Uint8Array(await inputBlob.arrayBuffer()));
-      ffmpeg.on('progress', ({ progress }) => { if (onProgress) onProgress(Math.min(progress, 1)); });
-      // 用 .ogg 容器包 opus codec（Whisper 支援 .ogg，不支援純 .opus）
-      await ffmpeg.exec([
-        '-i', 'input.m4a',
-        '-ar', String(AUDIO_CONFIG.sampleRate),
-        '-ac', String(AUDIO_CONFIG.channels),
-        '-c:a', AUDIO_CONFIG.codec,
-        '-b:a', AUDIO_CONFIG.bitrate,
-        'output.ogg',
-      ]);
-      const out = await ffmpeg.readFile('output.ogg');
-      await ffmpeg.deleteFile('input.m4a');
-      await ffmpeg.deleteFile('output.ogg');
-      if (onProgress) onProgress(1);
-      return new Blob([out.buffer], { type: 'audio/ogg' });
-    };
-
-    // 階段 2a：靜音偵測
-    const detectSilence = async (audioBlob, silenceDurationSec) => {
-      const ffmpeg = await getFFmpeg();
-      await ffmpeg.writeFile('detect.ogg', new Uint8Array(await audioBlob.arrayBuffer()));
-      const marks = [];
-      ffmpeg.on('log', ({ message }) => {
-        const s = message.match(/silence_start: ([\d.]+)/);
-        const e = message.match(/silence_end: ([\d.]+) \| silence_duration: ([\d.]+)/);
-        if (s) marks.push({ type: 'start', time: parseFloat(s[1]) });
-        if (e) marks.push({ type: 'end', time: parseFloat(e[1]) });
-      });
-      await ffmpeg.exec(['-i', 'detect.ogg', '-af',
-        `silencedetect=noise=${AUDIO_CONFIG.silenceThresholdDb}dB:d=${silenceDurationSec}`,
-        '-f', 'null', '-']);
-      await ffmpeg.deleteFile('detect.ogg');
-      const silences = [];
-      for (let i = 0; i < marks.length - 1; i++) {
-        if (marks[i].type === 'start' && marks[i + 1].type === 'end') {
-          silences.push({ midpoint: (marks[i].time + marks[i + 1].time) / 2 });
-        }
-      }
-      return silences;
-    };
-
-    // 階段 2b：計算切段邊界
-    const calculateSegmentBoundaries = async (audioBlob, totalDurationSec) => {
-      const targetSec = AUDIO_CONFIG.targetSegmentMinutes * 60;
-      const windowSec = AUDIO_CONFIG.searchWindowMinutes * 60;
-      const maxSec    = AUDIO_CONFIG.maxSegmentMinutes * 60;
-      let silences = await detectSilence(audioBlob, AUDIO_CONFIG.minSilenceSec);
-      if (silences.length === 0) silences = await detectSilence(audioBlob, 0.5); // 寬鬆 fallback
-      const boundaries = [0];
-      let pos = 0;
-      while (pos < totalDurationSec) {
-        const ideal = pos + targetSec;
-        if (ideal >= totalDurationSec) break;
-        const candidates = silences.filter(s => s.midpoint >= ideal - windowSec && s.midpoint <= ideal + windowSec);
-        let cut;
-        if (candidates.length > 0) {
-          cut = candidates.reduce((best, s) =>
-            Math.abs(s.midpoint - ideal) < Math.abs(best.midpoint - ideal) ? s : best
-          ).midpoint;
-        } else if (pos + maxSec < totalDurationSec) {
-          cut = pos + maxSec; // 找不到靜音，強制切
-        } else {
-          break;
-        }
-        boundaries.push(cut);
-        pos = cut;
-      }
-      boundaries.push(totalDurationSec);
-      return boundaries;
-    };
-
-    // 階段 2c：依邊界切出各段 Blob
-    const segmentAudio = async (compressedBlob, boundaries, onProgress) => {
-      const ffmpeg = await getFFmpeg();
-      await ffmpeg.writeFile('full.ogg', new Uint8Array(await compressedBlob.arrayBuffer()));
-      const segments = [];
-      for (let i = 0; i < boundaries.length - 1; i++) {
-        const start = boundaries[i];
-        const dur   = boundaries[i + 1] - boundaries[i];
-        const name  = `seg_${i}.ogg`;
-        await ffmpeg.exec(['-i', 'full.ogg', '-ss', String(start), '-t', String(dur), '-c', 'copy', name]);
-        const data  = await ffmpeg.readFile(name);
-        segments.push({ index: i, blob: new Blob([data.buffer], { type: 'audio/ogg' }), startSec: start, durationSec: dur });
-        await ffmpeg.deleteFile(name);
-        if (onProgress) onProgress((i + 1) / (boundaries.length - 1));
-      }
-      await ffmpeg.deleteFile('full.ogg');
-      return segments;
     };
 
     // 階段 3a：單段 Whisper（含重試）
@@ -342,9 +436,8 @@
       };
     };
 
-    // ─── WEB AUDIO FALLBACK ──────────────────────────────────────────────────
-    // ffmpeg.wasm 無法載入時的備援路線（Safari 無 COOP/COEP、核心下載失敗等）
-    // 全程使用瀏覽器原生 AudioContext，保證任何環境都能切段上傳
+    // ─── WEB AUDIO SEGMENTATION ──────────────────────────────────────────────
+    // 全程使用瀏覽器原生 AudioContext，無 WASM 依賴，任何環境都能切段上傳
 
     // 每段 5 分鐘：16kHz mono 16-bit WAV ≈ 9.6MB
     // 小段落換來:(1) 單次上傳失敗風險低(2) 平行連線總頻寬壓力小(3) Edge Function 處理時間短
@@ -1985,7 +2078,7 @@
       const [whisperInfo,  setWhisperInfo]  = useState(null);
       const [archiving,        setArchiving]        = useState(false);
       const [archiveSteps,     setArchiveSteps]     = useState([]);
-      const [compressProgress, setCompressProgress] = useState(0);
+      const [proposalsParts,   setProposalsParts]   = useState([]);
       const [segmentProgress,  setSegmentProgress]  = useState(0);
       const [uploadProgress,   setUploadProgress]   = useState(0);
       const [segmentCount,     setSegmentCount]     = useState(0);
@@ -2005,30 +2098,16 @@
           setErrMsg(`檔案過大，請上傳 ${AUDIO_CONFIG.maxFileSizeMB} MB 以內的音檔`); return;
         }
         setErrMsg('');
-        setCompressProgress(0); setSegmentProgress(0); setUploadProgress(0); setFailedSegments([]);
+        setSegmentProgress(0); setUploadProgress(0); setFailedSegments([]);
         let txText = '';
 
         let segs, duration;
         try {
-          // ── 階段 1-2：ffmpeg 主路線（壓縮 + 靜音切段） ─────────────────────
-          // ffmpeg 載入失敗或切段失敗，一律退到 Web Audio API 備援路線
-          try {
-            setStatus('compressing');
-            const compressed = await compressAudioStrict(audioSrc, p => setCompressProgress(p));
-
-            setStatus('segmenting');
-            duration = await getAudioDuration(audioSrc);
-            const boundaries = await calculateSegmentBoundaries(compressed, duration);
-            segs = await segmentAudio(compressed, boundaries, p => setSegmentProgress(p));
-          } catch (ffmpegErr) {
-            // Web Audio fallback：原生瀏覽器 API，無 WASM 依賴，一定能切
-            console.warn('ffmpeg 路線失敗，改走 Web Audio API 備援：', ffmpegErr.message);
-            setStatus('segmenting');
-            setCompressProgress(1);
-            const webResult = await segmentAudioWebAudio(audioSrc, p => setSegmentProgress(p));
-            segs = webResult.segments;
-            duration = webResult.duration;
-          }
+          // ── 階段 1：Web Audio API 切段（原生瀏覽器 API，無 WASM 依賴） ───
+          setStatus('segmenting');
+          const webResult = await segmentAudioWebAudio(audioSrc, p => setSegmentProgress(p));
+          segs = webResult.segments;
+          duration = webResult.duration;
           setSegmentProgress(1);
           setSegmentCount(segs.length);
 
@@ -2053,29 +2132,31 @@
           setWhisperInfo({ mins, cost: (mins * 0.006).toFixed(3) });
         } catch (e) { setErrMsg('處理失敗：' + e.message); setStatus('error'); return; }
 
-        // ── 階段 5：AI 摘要 ───────────────────────────────────────────────
+        // ── 階段 5：AI 摘要（附件抽取 + vision 整合） ────────────────────
         setStatus('summarizing');
-        // 抽取每個提案的附件文字
-        const proposalsWithText = await Promise.all(proposals.map(async (p) => {
-          let attachText = '';
+
+        // 5a) 抽取每個提案的附件為 Claude content parts（文字/圖片/格式警告）
+        const proposalsWithParts = await Promise.all(proposals.map(async (p) => {
+          let parts = [];
           try {
             const urls = JSON.parse(p.file_url || '[]');
             const names = JSON.parse(p.file_name || '[]');
-            const texts = await Promise.all(urls.map((url, i) => extractFileText(url, names[i] || url)));
-            attachText = texts.filter(Boolean).join('\n');
+            for (let i = 0; i < urls.length; i++) {
+              parts.push(await extractAttachmentParts(urls[i], names[i] || urls[i]));
+            }
           } catch {}
-          return { ...p, attachText };
+          return { ...p, parts };
         }));
-        const agendaDetail = proposalsWithText.length
-          ? proposalsWithText.map((p, i) => {
-              const base = `${i + 1}. 【${p.title}】提案人：${p.author}\n   ${p.content || '（無提案說明）'}`;
-              return p.attachText ? `${base}\n\n   【附件內容摘錄】\n${p.attachText.slice(0, 3000)}` : base;
-            }).join('\n\n')
-          : '（無提案議程）';
-        const prompt = `你是一位專業的會議記錄與策略分析師。以下是一場會議的完整逐字稿與議程提案，請用繁體中文產出一份結構完整的會後文件。
+        setProposalsParts(proposalsWithParts);
 
-━━━ 本次議程提案 ━━━
-${agendaDetail}
+        // 5b) 組 Claude content blocks（text + image 混合）
+        const intro = `你是一位專業的會議記錄與策略分析師。以下是一場會議的完整逐字稿、議程提案與提案附件。請用繁體中文產出一份結構完整的會後文件。
+
+注意：附件中的圖片（PDF 每頁、PPTX 內嵌圖、PNG/JPG）都是提案的一部分，請結合圖片中的視覺資訊（配色、排版、圖表、示意）與文字內容共同分析，不要只看文字。如附件有格式警告（例如 .key/.pages 無法讀取），請在摘要中明確提醒使用者。
+
+━━━ 本次議程提案 ━━━`;
+
+        const outroFormat = `
 
 ━━━ 會議逐字稿 ━━━
 ${txText}
@@ -2089,7 +2170,7 @@ ${txText}
 ## 提案 N：{提案標題}（{提案人}）
 
 ### 核心想法
-（一段話說明提案人的核心主張）
+（一段話說明提案人的核心主張；如有附件圖片，結合圖片中的視覺資訊）
 
 ### 會議 Findings
 - **支持點：** （與會者認同的觀點、正面回饋）
@@ -2131,6 +2212,43 @@ ${txText}
 # 💡 AI 綜合建議
 
 （根據整體會議內容，提出 3-5 點具體可行的策略建議，包含優先順序推薦與注意事項）`;
+
+        const claudeBlocks = [{ type: 'text', text: intro }];
+        if (proposalsWithParts.length === 0) {
+          claudeBlocks.push({ type: 'text', text: '\n\n（無提案議程）' });
+        } else {
+          proposalsWithParts.forEach((p, i) => {
+            claudeBlocks.push({ type: 'text', text: `\n\n【提案 ${i + 1}】${p.title}（提案人：${p.author}）\n${p.content || '（無提案說明）'}` });
+            for (const part of (p.parts || [])) {
+              if (part.kind === 'needs-export') {
+                claudeBlocks.push({ type: 'text', text: `\n⚠️ 附件「${part.fileName}」：${part.hint}（本次無法納入分析）` });
+              } else if (part.kind === 'vision') {
+                claudeBlocks.push({ type: 'text', text: `\n附件「${part.fileName}」${part.note || ''}：` });
+                claudeBlocks.push(...part.blocks);
+              } else if (part.kind === 'pptx') {
+                claudeBlocks.push({ type: 'text', text: `\n附件「${part.fileName}」${part.note || ''}\n${(part.text || '').slice(0, 8000)}` });
+                if (part.blocks && part.blocks.length) {
+                  claudeBlocks.push({ type: 'text', text: '（簡報內嵌圖）' });
+                  claudeBlocks.push(...part.blocks);
+                }
+              } else if (part.kind === 'text') {
+                claudeBlocks.push({ type: 'text', text: `\n附件「${part.fileName}」：\n${(part.text || '').slice(0, 10000)}` });
+              }
+              // kind === 'empty' 就不輸出任何東西
+            }
+          });
+        }
+        claudeBlocks.push({ type: 'text', text: outroFormat });
+
+        // 5c) 轉成 OpenAI vision 格式（fallback 用）
+        const openAIBlocks = claudeBlocks.map(b => {
+          if (b.type === 'text') return { type: 'text', text: b.text };
+          if (b.type === 'image') {
+            return { type: 'image_url', image_url: { url: `data:${b.source.media_type};base64,${b.source.data}` } };
+          }
+          return b;
+        });
+
         try {
           let summaryText = '';
           // 優先用 Anthropic Claude，失敗才 fallback 到 GPT-4o
@@ -2144,7 +2262,7 @@ ${txText}
                 payload: {
                   model: 'claude-opus-4-5',
                   max_tokens: 4096,
-                  messages: [{ role: 'user', content: prompt }],
+                  messages: [{ role: 'user', content: claudeBlocks }],
                 },
               }),
             });
@@ -2155,7 +2273,7 @@ ${txText}
             console.warn('Anthropic 摘要失敗，改用 GPT-4o：', anthropicErr.message);
           }
           if (!summaryText) {
-            const res = await fetch(`${EDGE_BASE}/ai-proxy`, { method: 'POST', headers: EDGE_HEADERS, body: JSON.stringify({ provider: 'openai', payload: { model: 'gpt-4o', messages: [{ role: 'user', content: prompt }] } }) });
+            const res = await fetch(`${EDGE_BASE}/ai-proxy`, { method: 'POST', headers: EDGE_HEADERS, body: JSON.stringify({ provider: 'openai', payload: { model: 'gpt-4o', messages: [{ role: 'user', content: openAIBlocks }] } }) });
             if (!res.ok) { const e = await res.json(); throw new Error(e.error?.message || `HTTP ${res.status}`); }
             summaryText = (await res.json()).choices[0].message.content;
           }
@@ -2180,21 +2298,27 @@ ${txText}
         a.download = `meetkit-${new Date().toISOString().slice(0,10)}.md`; a.click();
       };
 
-      const running = ['compressing', 'segmenting', 'transcribing', 'summarizing'].includes(status);
+      const running = ['segmenting', 'transcribing', 'summarizing'].includes(status);
 
       const handleArchive = async () => {
         setArchiving(true);
-        setArchiveSteps([]);
-        const steps = [
-          { msg: '💾 儲存日誌中…',    delay: 0 },
-          { msg: '📌 更新前情提要…',  delay: 900 },
-          { msg: '✅ 完成！前往日誌', delay: 1800 },
-        ];
-        steps.forEach(({ msg, delay }) => {
-          setTimeout(() => setArchiveSteps(prev => [...prev, msg]), delay);
-        });
-        await new Promise(r => setTimeout(r, 2200));
-        await onSaveJournal({ proposals, transcript, summary });
+        setArchiveSteps(['💾 儲存日誌中…']);
+
+        // 附件 render 圖上傳到 Storage（給 Notion 嵌入用）
+        let enrichedProposals = proposals.map(p => ({ title: p.title, author: p.author, content: p.content, attachments: [] }));
+        if (proposalsParts.length > 0) {
+          setArchiveSteps(prev => [...prev, '🖼 附件圖片上傳中…']);
+          try {
+            enrichedProposals = await archiveAttachmentsToStorage(projectId, proposalsParts);
+          } catch (e) {
+            console.error('附件上傳失敗:', e);
+          }
+        }
+
+        setArchiveSteps(prev => [...prev, '📌 同步到 Notion…']);
+        setArchiveSteps(prev => [...prev, '✅ 完成！前往日誌']);
+        await new Promise(r => setTimeout(r, 600));
+        await onSaveJournal({ proposals: enrichedProposals, transcript, summary });
       };
 
       return (
@@ -2262,15 +2386,8 @@ ${txText}
             <>
               {running && status !== 'summarizing' && (
                 <div style={{ ...S.card, padding: '14px 16px', display: 'flex', flexDirection: 'column', gap: 8 }}>
-                  {status === 'compressing' && <>
-                    <div style={{ fontSize: 13, color: C.textSec }}>⚙️ 壓縮音訊中…</div>
-                    <div style={{ height: 6, background: C.border, borderRadius: 3, overflow: 'hidden' }}>
-                      <div style={{ height: '100%', width: `${Math.round(compressProgress * 100)}%`, background: C.accent, borderRadius: 3, transition: 'width 0.3s' }} />
-                    </div>
-                    <div style={{ fontSize: 11, color: C.textMut }}>{Math.round(compressProgress * 100)}%</div>
-                  </>}
                   {status === 'segmenting' && <>
-                    <div style={{ fontSize: 13, color: C.textSec }}>✂️ 靜音偵測切段中…</div>
+                    <div style={{ fontSize: 13, color: C.textSec }}>✂️ 切段中…（5 分鐘/段）</div>
                     <div style={{ height: 6, background: C.border, borderRadius: 3, overflow: 'hidden' }}>
                       <div style={{ height: '100%', width: `${Math.round(segmentProgress * 100)}%`, background: C.accent, borderRadius: 3, transition: 'width 0.3s' }} />
                     </div>
@@ -2291,8 +2408,7 @@ ${txText}
                 </div>
               )}
               <button style={{ ...btn('primary'), padding: 14, fontSize: 15, opacity: running ? 0.7 : 1 }} onClick={run} disabled={running}>
-                {status === 'compressing'  ? <><Spinner /> 壓縮音訊中…</> :
-                 status === 'segmenting'   ? <><Spinner /> 切段中…</> :
+                {status === 'segmenting'   ? <><Spinner /> 切段中…</> :
                  status === 'transcribing' ? <><Spinner /> 語音轉文字中…</> :
                  status === 'summarizing'  ? <><Spinner /> AI 摘要生成中…</> :
                  '▶ 開始轉文字 & 摘要'}
@@ -2361,12 +2477,17 @@ ${txText}
       const [syncingId, setSyncingId] = useState(null);
       const [batchSyncing, setBatchSyncing] = useState(false);
       const [syncedIds, setSyncedIds] = useState(() => new Set(
-        journal.filter(j => j.notionSynced).map(j => j.id)
+        journal.filter(j => j.notion_page_id).map(j => j.id)
       ));
+
+      // journal 從 DB reload 後,同步 syncedIds 狀態（避免卡在舊 state）
+      useEffect(() => {
+        setSyncedIds(new Set(journal.filter(j => j.notion_page_id).map(j => j.id)));
+      }, [journal]);
 
       const handleBatchSync = async () => {
         if (!onSyncToNotion) return;
-        const unsynced = journal.filter(j => !syncedIds.has(j.id) && !j.notionSynced);
+        const unsynced = journal.filter(j => !syncedIds.has(j.id) && !j.notion_page_id);
         if (unsynced.length === 0) { alert('所有日誌都已同步到 Notion'); return; }
         if (!confirm(`準備同步 ${unsynced.length} 筆日誌到 Notion，確定繼續？`)) return;
         setBatchSyncing(true);
@@ -2432,11 +2553,19 @@ ${txText}
             <div style={{ fontSize: 18, fontWeight: 600, display: 'flex', alignItems: 'center', gap: 10, flex: 1 }}>
               📚 會議日誌 <span style={badge(C.accent)}>{journal.length} 場</span>
             </div>
-            {onSyncToNotion && (
-              <button style={{ ...btn('ghost'), fontSize: 12, padding: '5px 12px', color: C.textSec, opacity: batchSyncing ? 0.5 : 1 }} disabled={batchSyncing} onClick={handleBatchSync}>
-                {batchSyncing ? '同步中…' : '↗ 全部同步到 Notion'}
-              </button>
-            )}
+            {onSyncToNotion && (() => {
+              const pendingCount = journal.filter(j => !syncedIds.has(j.id) && !j.notion_page_id).length;
+              const allDone = pendingCount === 0;
+              return (
+                <button
+                  style={{ ...btn('ghost'), fontSize: 12, padding: '5px 12px', color: C.textSec, opacity: (batchSyncing || allDone) ? 0.4 : 1, cursor: allDone ? 'default' : 'pointer' }}
+                  disabled={batchSyncing || allDone}
+                  onClick={handleBatchSync}
+                >
+                  {batchSyncing ? '同步中…' : allDone ? '✓ 全部已同步' : `↗ 同步剩餘 ${pendingCount} 筆`}
+                </button>
+              );
+            })()}
             <button style={{ ...btn('ghost'), fontSize: 12, padding: '5px 12px', color: C.textSec }} onClick={importFromLocal}>⬆ 從本機匯入</button>
           </div>
           <input style={{ ...S.input, marginBottom: 20 }} placeholder="🔍 搜尋關鍵字、日期、提案者…" value={search} onChange={e => setSearch(e.target.value)} />
@@ -2461,7 +2590,7 @@ ${txText}
                     </div>
                     <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
                       {onSyncToNotion && (
-                        syncedIds.has(m.id) || m.notionSynced
+                        syncedIds.has(m.id) || m.notion_page_id
                           ? <span style={{ ...badge('#2ecc71', '#e8faf0'), fontSize: 10, padding: '2px 7px' }}>✓ Notion</span>
                           : <button
                               style={{ ...btn('ghost'), padding: '3px 8px', fontSize: 11, color: '#666', borderColor: 'transparent', opacity: syncingId === m.id ? 0.5 : 1 }}
@@ -2747,6 +2876,7 @@ ${txText}
       };
 
       // ─── 同步單筆日誌到 Notion ───────────────────────────────────
+      // 成功後把 notion_page_id 寫回 journals 表,避免重整/重開後重複同步
       const syncEntryToNotion = async (entry) => {
         const isoDate = new Date().toISOString().split('T')[0];
         try {
@@ -2760,7 +2890,18 @@ ${txText}
           });
           const data = await res.json();
           if (!res.ok) throw new Error(data.error || 'Notion 同步失敗');
-          return { ok: true, url: data.notionUrl };
+          // 持久化：把 notion_page_id 寫回 DB（schema 需要有此欄位,見 docs/README）
+          if (data.notionPageId && entry.id) {
+            try {
+              await db(`journals?id=eq.${entry.id}`, {
+                method: 'PATCH',
+                body: JSON.stringify({ notion_page_id: data.notionPageId }),
+              });
+            } catch (patchErr) {
+              console.warn('notion_page_id 寫回失敗（欄位可能未建立）:', patchErr);
+            }
+          }
+          return { ok: true, url: data.notionUrl, pageId: data.notionPageId };
         } catch (e) {
           console.error('Notion sync failed:', e);
           return { ok: false };
@@ -2768,23 +2909,26 @@ ${txText}
       };
 
       const saveToJournal = async ({ proposals, transcript, summary }) => {
-        const entry = {
+        // DB 存的是精簡版（journals 表沒有 attachments 欄位）
+        const dbEntry = {
           id: Date.now().toString(),
           project_id: projectId,
           date: new Date().toLocaleDateString('zh-TW', { year: 'numeric', month: 'long', day: 'numeric' }),
           proposals: proposals.map(p => ({ title: p.title, author: p.author, content: p.content })),
           transcript, summary,
         };
+        // Notion 用的完整版（含附件 render 圖 URLs、抽取文字、格式警告）
+        const notionEntry = { ...dbEntry, proposals };
         try {
-          await db('journals', { method: 'POST', body: JSON.stringify(entry) });
+          await db('journals', { method: 'POST', body: JSON.stringify(dbEntry) });
         } catch (e) { console.error('Journal save failed', e); }
         // 同步到 Notion（背景執行，不阻擋流程）
-        syncEntryToNotion(entry).then(result => {
+        syncEntryToNotion(notionEntry).then(result => {
           if (result.ok) {
-            setJournal(prev => prev.map(j => j.id === entry.id ? { ...j, notionSynced: true, notionUrl: result.url } : j));
+            setJournal(prev => prev.map(j => j.id === dbEntry.id ? { ...j, notion_page_id: result.pageId, notionUrl: result.url } : j));
           }
         });
-        setJournal(prev => [...prev, { ...entry, notionSynced: false }]);
+        setJournal(prev => [...prev, { ...dbEntry }]);
         setPhase(3);
       };
 
