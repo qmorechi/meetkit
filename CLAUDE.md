@@ -133,38 +133,79 @@ cp index-dev.html index.html
 
 ---
 
-## 3. 權限模型(現況)
+## 3. 權限模型:邀請白名單(2026-04-25 起)
 
-**現階段 MeetKit 的權限機制非常輕量:**
+**MeetKit 走「邀請制 + magic-link 登入」,不再是「誰知道代碼誰就能進」。**
 
-- **6 碼專案代碼** — 每個專案有一組自動產生的 6 碼代碼(例如 `A3X9KP`),知道代碼的人就能加入
-- **可選的密碼保護** — 機密專案(SIPAI、客戶會議)可以設密碼,進入前要輸入
-- **沒有使用者帳號系統** — 不需要註冊登入,大家靠「代碼 + 密碼」協作
+### 核心邏輯
 
-**這個設計的優缺點:**
+```
+發起者建專案(填一串 email 清單)
+  ↓
+專案寫進 projects,成員寫進 project_members
+  ↓
+Edge Function send-invite 用 Resend 寄 MeetKit 邀請信給每個 email
+  ↓
+被邀請者收信 → 點 MeetKit 連結 → 用自己的 email 登入(Supabase magic link)
+  ↓
+登入後 Home 自動顯示「📨 我被邀請的會議」清單,點進去就進會議室
+```
 
-| 優點 | 缺點 |
+**直到專案結束,同一個專案通知是延伸使用的** — 同一批成員在同一個 project code 下開多次會,不重發邀請。
+
+**中途要加人的話**,owner 在專案設定頁(⚙)的「📬 與會者」區手動加 email,系統自動再寄一封邀請信。
+
+### 實作層
+
+| 層 | 機制 |
 |---|---|
-| 設計師能獨立維護,不需要帳號系統 | 無法追蹤「誰做了什麼」 |
-| 外部客戶也能直接加入專案(分享代碼即可) | 無法區分不同角色的權限 |
-| 無註冊門檻 | 密碼外流就無法擋 |
-| 符合 Phase 2-3 階段的實際需求 | Phase 4 全公司 rollout 時可能要升級 |
+| 登入 | Supabase Auth `signInWithOtp` (email magic link) |
+| 權限 | Supabase RLS,`auth.jwt()->>'email'` 比對 `owner_email` 或 `project_members.member_email` |
+| 建立 | `projects.owner_email = 建立者 email`,`project_members` 存被邀請的 email |
+| 邀請 | Edge Function `send-invite`(Resend + `meetkit@mx.design` 寄件) |
+| UI | Home 分成「🧑‍💼 我建立的」+「📨 我被邀請的」兩份清單,**沒有**輸入 6 碼代碼的框 |
 
-### 未來的權限擴展(Phase 3+)
+### RLS Policies 摘要
 
-當 MeetKit 需要更嚴謹的權限時(例如「只有 Owner 能刪提案」、「Member 不能看到其他專案」),有兩條路:
+- `projects` SELECT: owner OR 我在 `project_members`
+- `projects` INSERT/UPDATE/DELETE: owner only
+- `proposals` / `journals` SELECT/INSERT/UPDATE: owner OR member
+- `proposals` DELETE: owner OR member(協作刪除沒問題)
+- `journals` DELETE: owner only(會議紀錄本身只有 owner 能刪)
+- `project_members` SELECT: 自己或 owner;INSERT/DELETE: owner only
 
-**路線 A:在 index.html 內部加簡單的 role 管理**
-- 在 Supabase `projects` 表加一個 `owner_id` 欄位
-- 在進入專案時用 localStorage 存 `is_owner` flag
-- 保持單檔案架構
+Helper functions `public.is_project_owner(pid)` 和 `public.is_project_member(pid)` 是 `SECURITY DEFINER`,避免 policy 跨表遞迴。
 
-**路線 B:升級到 Next.js + NextAuth**
-- 引入真正的使用者系統
-- 用 Supabase RLS 做 row-level 權限
-- 這是 Phase 4 全公司 rollout 的前置條件
+### 6 碼代碼還在嗎?
 
-**原則:不到必要時,不要升級。** 簡單的權限能用就用,不要過度工程化。
+**還在,但角色變了。**
+- 仍然是 `projects.id`(6 碼 TEXT 例如 `A3X9KP`)
+- 仍然是邀請信連結裡的 `?p=ABC123`
+- **但單純知道代碼進不去** — 不在白名單的 email 登入後連這個專案的 SELECT 都會被 RLS 擋
+- 代碼從「通行密碼」變成「專案識別碼 + URL slug」
+
+### 為什麼這樣改
+
+舊的「代碼隨便分享」模型對設計師工作坊夠用,但 MeetKit 現在處理 SIPAI、客戶會議,資料敏感。原本「知道代碼就能進」= 任何共享連結的人都看得到機密內容,風險過高。
+
+新模型的成本:
+- 每個與會者第一次進都要收信點連結(多一步)
+- 要維護 Resend domain + API key(mx.design 已驗證完畢)
+
+換到的好處:
+- RLS 從資料庫層就擋掉未授權存取 — 就算前端有 bug 漏洞,資料也不會外流
+- 每個動作都綁 email,審計能追到人
+- 可以完全移除密碼保護那個過時機制
+
+### Phase 4 時的擴展
+
+全公司 rollout 要加的:
+- SSO(mx.design domain 白名單)
+- 角色區分(viewer / editor / owner)
+- 邀請有效期 + 撤銷
+- 專案歸屬變更(owner transfer)
+
+但**現階段的 owner + member 兩層就夠用**,別過度工程化。
 
 ---
 
@@ -189,6 +230,8 @@ cp index-dev.html index.html
 | 語音轉文字 | OpenAI Whisper API | 使用者輸入 API Key(存 localStorage) |
 | AI 摘要 | Anthropic Claude(主)/ OpenAI GPT-4o(備) | 使用者輸入 API Key |
 | 音訊前置處理 | ffmpeg.wasm(Phase 2 待整合) | CDN: `@ffmpeg/ffmpeg` |
+| 登入 | Supabase Auth(magic link) | `@supabase/supabase-js@2` CDN |
+| 邀請信 | Resend(domain `mx.design` 已驗證) | Edge Function `send-invite` |
 
 **Supabase 配置:**
 - URL: `https://yrugcgzkomydmorgzwhb.supabase.co`
