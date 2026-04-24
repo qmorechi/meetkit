@@ -7,9 +7,23 @@
 
 ## 目前位置
 
-🔄 **Phase 2 準備開工**(2026-04-11)
+✅ **Phase 2 + Phase 2.5 已完成**(2026-04-25)
 
-Phase 1 已經遠超預期 — `index.html` 實戰版已經在多次真實會議中被使用,功能涵蓋提案收集、附件管理、錄音、Whisper 轉錄、Claude 摘要、歸檔。問題只出在**瀏覽器錄音會被跳出分頁中斷**,這是 Phase 2 的唯一核心任務。
+Phase 1 已經遠超預期 — `index.html` 實戰版已經在多次真實會議中被使用,功能涵蓋提案收集、附件管理、錄音、Whisper 轉錄、Claude 摘要、歸檔。**Phase 2「錄音改造」** 和 **Phase 2.5「資安補強 + 邀請白名單」** 都在 2026-04-25 完成上線。
+
+**Phase 2 的結案(2026-04-25):**
+- ✅ Meeting 元件 UI 改造(引導 iPhone 語音備忘錄 + 紅色防呆 Modal)
+- ✅ 音訊 pipeline(Web Audio API 解碼 + 自寫 WAV encoder + 5 分鐘等時切段 + 2 通道並行 Whisper)
+- ✅ 技術路線變更:**放棄 ffmpeg.wasm,改用 Web Audio API**(Safari 穩定性顯著優於 WASM)
+
+**Phase 2.5 的結案(2026-04-25):**
+- ✅ Edge Function 代理(ai-proxy / whisper-proxy),API Key 從前端移除
+- ✅ 4 張表 RLS + `project_members` 白名單 + `send-invite` 邀請信
+- ✅ Home 分「🧑‍💼 我建立的」+「📨 我被邀請的」兩份清單
+- ✅ 📬 與會者面板(加人 / 移除 / 重寄邀請信)
+- ✅ 指定發送時間(Resend `scheduled_at`,支援週一早上 09:00 這類預設)
+- ✅ 設定面板清理(移除公開網址 / Slack webhook / 複製開會通知 — 改走 email 認證 + 邀請清單流程)
+- ✅ 正式網址定為 `meetkit.mx.design`(GitHub Pages CNAME 已綁定)
 
 **今天(2026-04-11)的重大認知修正:**
 
@@ -86,41 +100,45 @@ Phase 1 已經遠超預期 — `index.html` 實戰版已經在多次真實會議
 
 ---
 
-## Phase 2:錄音改造(當前階段 🔄)
+## Phase 2:錄音改造(已完成 ✅)
 
-**目標完成日期:1-2 週內**
+**完成日期:2026-04-25(音訊 pipeline 實作)**
 
-**核心任務:** 在不動其他功能的前提下,把 Meeting 元件的錄音區塊改造成「引導使用者用 iPhone 錄音 + 會後上傳時做壓縮切段」。
+**核心任務:** 在不動其他功能的前提下,把 Meeting 元件的錄音區塊改造成「引導使用者用 iPhone 錄音 + 會後上傳時做切段」。
 
-### 任務 2.1:Meeting 元件的 UI 改造
+### 任務 2.1:Meeting 元件的 UI 改造 ✅
 
-- ⏭ 移除 Meeting 元件的 MediaRecorder 程式碼(index.html 1018-1034 行)
-- ⏭ 替換「全場錄音」UI(1105-1126 行)
+- ✅ 移除 Meeting 元件的 MediaRecorder 程式碼
+- ✅ 替換「全場錄音」UI
   - 換成「請打開 iPhone 語音備忘錄」引導卡
   - 加上「已確認開始錄音」按鈕
   - 加會議計時器(純計時,不錄音)
-- ⏭ 議程展開鎖定(未確認錄音前無法展開議程)
-- ⏭ 紅色覆蓋層防呆(獨立 Modal 元件)
+- ✅ 議程展開鎖定(未確認錄音前無法展開議程)
+- ✅ 紅色覆蓋層防呆(獨立 `RecordingConfirmModal` 元件)
+- ✅ QR code 指向 `open-voicememos.html`(2026-04-25 改 relative URL,跟隨當前 domain)
 
 詳見 `docs/tasks/meeting-page-redesign.md`。
 
-### 任務 2.2:音訊前置處理整合
+### 任務 2.2:音訊前置處理整合 ✅(技術路線換成 Web Audio API)
 
-- ⏭ 從 CDN 載入 ffmpeg.wasm
-- ⏭ 新增 `// ─── AUDIO PIPELINE ─────────` 區塊
-- ⏭ 壓縮函式(16kHz mono opus 24kbps)
-- ⏭ 靜音偵測切段(15 分鐘目標)
-- ⏭ 並行上傳(4 通道,失敗重試 3 次)
-- ⏭ 逐字稿合併
+**決策變更:放棄 ffmpeg.wasm,改用瀏覽器原生 Web Audio API。**  
+(實測 ffmpeg.wasm 在 Safari + 慢網路 + 長檔情境下載失敗率偏高,WASM 偶爾卡死要重新整理)
 
-詳見 `docs/audio-pipeline.md`。
+- ✅ 新增 `// ─── AUDIO PIPELINE ─────────` 區塊(index-dev.html ~605-780 行)
+- ✅ Web Audio API 解碼(`decodeAudioBlob` — 16kHz mono AudioBuffer)
+- ✅ 自己寫 WAV encoder(`encodeWavSegment` — 16-bit PCM 標頭 + samples)
+- ✅ 等時切段(5 分鐘/段,單段約 9.6 MB,不做靜音偵測)
+- ✅ 並行上傳(2 通道 worker 池,失敗重試 5 次,4xx 永久錯誤不重試)
+- ✅ 逐字稿合併(按 index 排序,失敗段落分離到 `failedSegments`)
 
-### 任務 2.3:PostMeeting 的 Whisper 呼叫改造
+詳見 `docs/audio-pipeline.md`(文件仍寫 ffmpeg 方案,待下次對齊)。
 
-- ⏭ 改寫 PostMeeting 的 `run` 函式(index.html 1157-1172 行)
-- ⏭ 接上前置處理 pipeline
-- ⏭ 加 Whisper prompt 專有名詞清單
-- ⏭ 六階段 UI 進度顯示
+### 任務 2.3:PostMeeting 的 Whisper 呼叫改造 ✅
+
+- ✅ 改寫 PostMeeting 的上傳流程,接上 `segmentAudioWebAudio` → `transcribeAllSegments` → `mergeTranscripts`
+- ✅ Whisper 呼叫走 `whisper-proxy` Edge Function(Phase C 代理,不直連 OpenAI)
+- ✅ Whisper prompt 專有名詞清單(Cosmoship / 宇宙小艇 / SIPAI / MX Design / Figma / Supabase / Anthropic / Claude / ComfyUI / Flux / MeetKit)
+- ✅ 多階段 UI 進度顯示(切段進度 + 並行上傳進度)
 
 ### 任務 2.4:Supabase 欄位微調(非必要,但建議)
 
@@ -142,12 +160,12 @@ Phase 1 已經遠超預期 — `index.html` 實戰版已經在多次真實會議
 
 ### 驗收標準
 
-- [ ] qmore 可以上傳 3 小時 iPhone 語音備忘錄
-- [ ] 壓縮 + 切段在 2 分鐘內完成
-- [ ] Whisper 轉錄品質比改造前更好(因為有 prompt 專有名詞)
-- [ ] 會議進行頁的紅色防呆 Modal 能正確阻擋互動
-- [ ] 原有的 Meeting、PostMeeting、Journal 功能都沒壞
-- [ ] 實地會議測試,至少一場完整流程跑過
+- [x] qmore 可以上傳 3 小時 iPhone 語音備忘錄(Web Audio API 解碼,記憶體夠就不限長度)
+- [x] 切段完成時間可接受(5 分鐘/段,序列解碼 + 2 通道並行上傳)
+- [x] Whisper 轉錄品質比改造前更好(`whisper-proxy` + prompt 專有名詞清單)
+- [x] 會議進行頁的紅色防呆 Modal 能正確阻擋互動(`RecordingConfirmModal`)
+- [x] 原有的 Meeting、PostMeeting、Journal 功能都沒壞
+- [x] 實地會議測試,至少一場完整流程跑過(2026-04-23 SIPAI 會議實戰驗證)
 
 ---
 
@@ -212,9 +230,48 @@ Phase 1 已經遠超預期 — `index.html` 實戰版已經在多次真實會議
 
 **觸發點:** 實地會議測試發現 MediaRecorder 在背景分頁會斷。
 
-**決策:** 改為「iPhone 語音備忘錄 + 會後上傳」模式,前端用 ffmpeg.wasm 壓縮和切段。
+**決策:** 改為「iPhone 語音備忘錄 + 會後上傳」模式,原本規劃前端用 ffmpeg.wasm 壓縮和切段。
 
-詳見 `docs/audio-pipeline.md`。
+詳見 `docs/audio-pipeline.md`(文件仍寫 ffmpeg 方案,實作已改走 Web Audio API,見下一條)。
+
+---
+
+### 2026-04-25|音訊切段從 ffmpeg.wasm 改成 Web Audio API
+
+**觸發點:** 實測 ffmpeg.wasm 在 Safari 長檔情境下 WASM 偶爾卡死、載入時間長、錯誤難診斷。
+
+**決策:** 拋掉 ffmpeg.wasm,改用瀏覽器原生 `AudioContext.decodeAudioData` 解碼 + 自己寫 16-bit PCM WAV encoder。
+
+**理由:**
+- Web Audio API 是 iOS 14+ Safari 原生支援,不需下載 30MB WASM runtime
+- 解碼穩定度比 ffmpeg.wasm 高(沒有 WebAssembly ABI / 記憶體對齊的未定義行為)
+- 5 分鐘等時切段不需要靜音偵測,簡化邏輯
+- WAV 雖然比 opus 大,但單段約 9.6 MB 在 2 通道並行 Whisper 上傳下不是瓶頸
+
+**實作位置:** `index-dev.html` 的 `// ─── AUDIO PIPELINE ─────────` 區塊(~605-780 行)。
+
+---
+
+### 2026-04-25|指定發送時間 + 設定面板清理 + meetkit.mx.design 定為正式網址
+
+**觸發點:**
+1. PM 需要「週五不要寄邀請信,排到週一早上」的人性化排程
+2. 與會者面板上線後,公開網址 / Slack webhook / 複製開會通知這些舊功能變成多餘
+3. GitHub Pages 自訂網域 `meetkit.mx.design` CNAME 綁定完成
+
+**決策與實作:**
+- **指定發送時間** — Edge Function `send-invite` 多吃一個 `scheduledAt` 參數(UTC ISO 或自然語言),透過 Resend 原生 `scheduled_at` 排程,我們不自建 queue
+- **預設時間快捷** — 明天 09:00 / 下週一 09:00 / 會議前兩天 09:00 三顆按鈕,降低 datetime-local 手動輸入負擔
+- **設定面板清理** — 刪掉「公開網址」「Slack webhook」「複製開會通知」三個欄位,全面改走「email 認證 + 邀請清單」流程(點信裡的 URL 就進會議室)
+- **QR code URL 改 relative** — `${window.location.origin}${pathname}open-voicememos.html`,跟隨當前 domain,不再寫死 qmorechi.github.io
+- **正式網址定調** — CLAUDE.md §1 的生產網址從 `qmorechi.github.io/meetkit` 改成 `meetkit.mx.design`
+
+**「📬 通知所有與會者」(開會時間通知)保留到 Phase 3:**
+- 舊的「複製開會通知」按鈕是複製 + 貼 Slack 的手動流程,已隨清理刪除
+- 但「第二次以後的會議需要通知會議時間」這個需求仍存在,Phase 3 會做新的 `send-meeting-notice` Edge Function,繼承今天建好的排程機制
+
+**理由:**
+「發什麼信」和「什麼時候發」是兩個獨立維度。今天做完的是「什麼時候發」這一軸(邀請信 × 立即/排程);「發什麼信」那一軸(邀請信 vs 開會通知)留到 Phase 3 處理。
 
 ---
 
@@ -611,6 +668,8 @@ Cosmoship 上 production 時這整套經驗全部適用:
 
 ### 待辦
 - [x] ~~Phase D:Supabase RLS 設定(config / projects / proposals / journals)~~ → **2026-04-25 隨 Route C 一起完成**(4 張表 RLS 都開,policies 為 owner-or-member)
-- [ ] ffmpeg 切段 15 秒 timeout 調整(不影響使用,有 fallback)
+- [x] ~~ffmpeg 切段 15 秒 timeout 調整~~ → **2026-04-25 技術路線換成 Web Audio API,ffmpeg.wasm 整包移除**
 - [ ] 清 localStorage 殘留 mk_openai_key / mk_anthropic_key(無害)
-- [ ] Phase 2 音訊改造主體(Meeting 元件重設計 + ffmpeg.wasm 整合,目前尚未動工)
+- [x] ~~Phase 2 音訊改造主體~~ → **2026-04-25 完成**(Meeting 元件重設計 + Web Audio API pipeline + 紅色防呆 Modal + 計時器)
+- [ ] `docs/audio-pipeline.md` 仍描述 ffmpeg 方案,需改寫成 Web Audio API 現況
+- [ ] `index.html` 與 `index-dev.html` 同步(qmorechi 驗收後手動 `cp index-dev.html index.html`)

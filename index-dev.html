@@ -1212,8 +1212,9 @@
       const [expanded, setExpanded] = useState({});
       const [cardUploading, setCardUploading] = useState({});
       const [toast, setToast] = useState('');
-      const [publicUrl, setPublicUrl] = useState(() => localStorage.getItem('mk_public_url') || '');
-      const [slackWebhook, setSlackWebhook] = useState(() => localStorage.getItem('mk_slack_webhook') || '');
+      // (2026-04-25 Route C 清理)原有「公開網址」「Slack Webhook」兩個 state 已拿掉:
+      //   - 分享連結改用 window.location 自動組,不需要使用者填
+      //   - Slack 通知已被邀請信 (Resend) 取代,日後要整合 Slack 再另外做
       // Route C:此專案要同步到哪個 Notion 頁(pageId 或完整 URL)
       // 空值 = 沿用舊行為(notion-sync 用 NOTION_DB_ID env 寫到預設資料庫)
       const [notionTarget, setNotionTarget] = useState('');
@@ -1615,21 +1616,6 @@
         await db(`projects?id=eq.${projectId}`, { method: 'PATCH', body: JSON.stringify({ meeting_date: date, meeting_time: time }) });
       };
 
-      const savePublicUrl = (val) => {
-        const clean = val.trim().replace(/\?.*$/, '').replace(/\/$/, '');
-        setPublicUrl(clean);
-        localStorage.setItem('mk_public_url', clean);
-        setShowUrlInput(false);
-        showToast('✓ 網址已儲存');
-      };
-
-      const saveSlackWebhook = (val) => {
-        const clean = val.trim();
-        setSlackWebhook(clean);
-        localStorage.setItem('mk_slack_webhook', clean);
-        showToast(clean ? '✓ Slack Webhook 已儲存' : '✓ Slack 通知已關閉');
-      };
-
       const openNewRound = async () => {
         if (proposals.length > 0) {
           await Promise.all(proposals.map(p => db(`proposals?id=eq.${p.id}`, { method: 'DELETE' }).catch(() => {})));
@@ -1638,36 +1624,9 @@
         showToast('✓ 準備室已開啟！');
       };
 
-      const sendNotice = () => {
-        const isLocal = window.location.protocol === 'file:' || window.location.hostname === 'localhost';
-        const base = publicUrl || (isLocal ? null : `${window.location.origin}${window.location.pathname}`);
-        if (!base) { showToast('⚠ 請先設定公開網址（點 ⚙）'); return; }
-        const url = `${base}?p=${projectId}`;
-        const weekdays = ['日','一','二','三','四','五','六'];
-        const dateObj = meetingDate ? new Date(meetingDate + 'T00:00') : null;
-        const shortDate = dateObj ? `${dateObj.getMonth()+1}/${dateObj.getDate()}(${weekdays[dateObj.getDay()]})` : '';
-        const timeStr = meetingTime || '';
-        const roomTitle = [shortDate, timeStr].filter(Boolean).join(' ') + '會議準備室';
-
-        // 複製到剪貼簿
-        navigator.clipboard.writeText(`${roomTitle}\n${url}`).catch(() => {});
-
-        // 發送到 Slack（若有設定 Webhook）
-        if (slackWebhook) {
-          const payload = JSON.stringify({
-            text: `📅 *${roomTitle}*\n請至以下連結提交議程提案：\n${url}`
-          });
-          fetch(slackWebhook, {
-            method: 'POST',
-            mode: 'no-cors',
-            headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-            body: `payload=${encodeURIComponent(payload)}`
-          }).catch(() => {});
-          showToast('✓ 開會通知已發送到 Slack！');
-        } else {
-          showToast('✓ 開會通知已複製！');
-        }
-      };
+      // (2026-04-25 Route C 清理)原 savePublicUrl / saveSlackWebhook / sendNotice 已拿掉:
+      //   - 分享不再靠「複製連結貼給人」— 同事登入後會在「我被邀請的會議」看到這個專案直接點進
+      //   - Slack 通知已被邀請信取代;要整合 Slack 以後再說
 
       return (
         <div style={{ maxWidth: 1100, margin: '0 auto', padding: '28px 20px' }}>
@@ -1696,7 +1655,6 @@
                 <input type="date" style={{ ...S.input, width: 'auto', fontSize: 13, colorScheme: 'dark' }} value={meetingDate} onChange={e => { setMeetingDate(e.target.value); saveMeetingInfo(e.target.value, meetingTime); }} />
                 <input type="time" style={{ ...S.input, width: 'auto', fontSize: 13, colorScheme: 'dark' }} value={meetingTime} onChange={e => { setMeetingTime(e.target.value); saveMeetingInfo(meetingDate, e.target.value); }} />
                 <button style={{ ...btn('primary'), padding: '7px 16px', fontSize: 13 }} onClick={() => { openNewRound(); setShowDatePicker(false); }}>✓ 確認開新準備室</button>
-                <button style={{ ...btn('ghost'), padding: '7px 14px', fontSize: 13 }} onClick={sendNotice}>📋 複製開會通知</button>
                 {(meetingDate || meetingTime) && (
                   <button style={{ ...btn('ghost'), padding: '6px 10px', fontSize: 12, color: C.textMut }} onClick={() => { setMeetingDate(''); setMeetingTime(''); saveMeetingInfo('', ''); }}>✕ 清除</button>
                 )}
@@ -1705,18 +1663,6 @@
 
             {showUrlInput && (
               <div style={{ marginTop: 16, paddingTop: 16, borderTop: `1px solid ${C.border}`, display: 'flex', flexDirection: 'column', gap: 10 }} className="fade-in">
-                <div style={{ display: 'flex', gap: 10, alignItems: 'center' }}>
-                  <span style={{ fontSize: 12, color: C.textMut, width: 72, flexShrink: 0 }}>🔗 公開網址</span>
-                  <input defaultValue={publicUrl} placeholder="https://qmorechi.github.io/meetkit" style={{ ...S.input, flex: 1, fontSize: 12, padding: '6px 10px' }} onKeyDown={e => e.key === 'Enter' && savePublicUrl(e.target.value)} id="public-url-input" />
-                  <button style={{ ...btn('primary'), padding: '6px 12px', fontSize: 12, flexShrink: 0 }} onClick={() => savePublicUrl(document.getElementById('public-url-input').value)}>儲存</button>
-                </div>
-                <div style={{ display: 'flex', gap: 10, alignItems: 'center' }}>
-                  <span style={{ fontSize: 12, color: C.textMut, width: 72, flexShrink: 0 }}>🔔 Slack</span>
-                  <input defaultValue={slackWebhook} placeholder="https://hooks.slack.com/services/…" style={{ ...S.input, flex: 1, fontSize: 12, padding: '6px 10px' }} onKeyDown={e => e.key === 'Enter' && saveSlackWebhook(e.target.value)} id="slack-webhook-input" />
-                  <button style={{ ...btn('primary'), padding: '6px 12px', fontSize: 12, flexShrink: 0 }} onClick={() => saveSlackWebhook(document.getElementById('slack-webhook-input').value)}>儲存</button>
-                </div>
-                {slackWebhook && <div style={{ fontSize: 11, color: C.success, paddingLeft: 82 }}>✓ Slack 通知已啟用</div>}
-
                 {/* Route C:Notion 目標頁 picker — 每個專案獨立綁一個 Notion 頁 */}
                 <div style={{ display: 'flex', gap: 10, alignItems: 'center' }}>
                   <span style={{ fontSize: 12, color: C.textMut, width: 72, flexShrink: 0 }}>📓 Notion</span>
@@ -2634,8 +2580,10 @@
       useEffect(() => {
         if (typeof QRCode === 'undefined' || !qrRef.current) return;
         qrRef.current.innerHTML = '';
+        // QR code 指向「當前部署網址底下的 open-voicememos.html」,不再硬編碼個人帳號路徑
+        // meetkit.mx.design 開 → 產出 meetkit.mx.design/open-voicememos.html
         new QRCode(qrRef.current, {
-          text: 'https://qmorechi.github.io/meetkit/open-voicememos.html',
+          text: `${window.location.origin}${window.location.pathname.replace(/[^/]*$/, '')}open-voicememos.html`,
           width: 120, height: 120,
           colorDark: '#000000', colorLight: '#ffffff',
         });

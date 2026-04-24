@@ -12,7 +12,8 @@
 
 ### 部署現況
 
-- **正式網址:** `https://qmorechi.github.io/meetkit/`
+- **正式網址:** `https://meetkit.mx.design/`(GitHub Pages custom domain,CNAME 已指向)
+- **備援網址:** `https://qmorechi.github.io/meetkit/` 仍然可訪問,但只是 fallback。分享、邀請信、文件內的連結一律用 `meetkit.mx.design`,別再暴露個人帳號路徑
 - **部署方式:** GitHub Pages 自動從 `main` branch 部署
 - **觸發條件:** 每次 `git push` 後,GitHub Pages 1-2 分鐘內自動更新
 - **有同事正在使用中**,裡面有真實的客戶會議、SIPAI 等機密專案
@@ -38,7 +39,7 @@ ls index-dev.html 2>/dev/null || cp index.html index-dev.html
 ### 測試方式
 
 - 本機:用瀏覽器打開 `index-dev.html`(有 `file://` 限制)
-- 部署:push 後開 `https://qmorechi.github.io/meetkit/index-dev.html?p=TEST001`
+- 部署:push 後開 `https://meetkit.mx.design/index-dev.html?p=TEST001`
 - **不要**用真實客戶專案測試,建一個測試專案(例如代碼 `TEST001`)
 
 ### 正式切換的流程
@@ -230,7 +231,7 @@ Helper functions `public.is_project_owner(pid)` 和 `public.is_project_member(pi
 | Storage | Supabase Storage | 直接 fetch,bucket 名 `presentations` |
 | 語音轉文字 | OpenAI Whisper API | 使用者輸入 API Key(存 localStorage) |
 | AI 摘要 | Anthropic Claude(主)/ OpenAI GPT-4o(備) | 使用者輸入 API Key |
-| 音訊前置處理 | ffmpeg.wasm(Phase 2 待整合) | CDN: `@ffmpeg/ffmpeg` |
+| 音訊前置處理 | Web Audio API(瀏覽器原生) | 無外部依賴,0 KB |
 | 登入 | Supabase Auth(magic link) | `@supabase/supabase-js@2` CDN |
 | 邀請信 | Resend(domain `mx.design` 已驗證) | Edge Function `send-invite` |
 
@@ -293,18 +294,20 @@ Helper functions `public.is_project_owner(pid)` 和 `public.is_project_member(pi
 ```
 使用者拖入 .m4a (50-200MB)
     ↓
-[1] ffmpeg.wasm 壓縮
-    16kHz mono opus 24kbps → 壓縮後約原檔 35%
+[1] Web Audio API 解碼
+    AudioContext 把 m4a/mp3/wav 解成 16kHz mono AudioBuffer
     ↓
-[2] 靜音偵測切段
-    目標 15 分鐘/段,最短 5 分鐘,最長 20 分鐘
-    切點:目標時間點 ±2 分鐘範圍內找 >0.8 秒的靜音
+[2] 等時切段(5 分鐘/段)
+    不做靜音偵測,按固定時間切
+    WAV 編碼(16-bit PCM mono),單段約 9.6MB
     ↓
-[3] 並行上傳到 Whisper API
-    4 條並行通道,rate limit 安全範圍
-    失敗自動重試 3 次,間隔 2 秒
+[3] 並行上傳到 Whisper API(經 whisper-proxy Edge Function)
+    2 條並行通道(conservative,避免 rate limit)
+    失敗自動重試 5 次,間隔 3 秒
+    4xx 永久錯誤(413/400/401/403)直接放棄不重試
     ↓
-[4] 按時間順序合併逐字稿
+[4] 按 index 排序合併逐字稿
+    失敗段落標記在 failedSegments,不影響其他段
     ↓
 [5] Anthropic API 分兩階段產出
     第一階段:結構化議程紀錄(議題/決議/Action Items)
@@ -313,35 +316,45 @@ Helper functions `public.is_project_owner(pid)` 和 `public.is_project_member(pi
 [6] 存進 Supabase + Resend 寄信通知與會者
 ```
 
-### 5.2 為什麼用 ffmpeg.wasm 前端處理
+### 5.2 為什麼改用 Web Audio API(原 ffmpeg.wasm 方案已放棄)
 
-- 完全沒有後端 — 整個 MeetKit 就是 `index.html`,從來沒有 serverless function 可以用
-- 前端處理 = 原檔不離開使用者電腦,只上傳壓縮後的片段 = SIPAI 機密會議更安全
-- ffmpeg.wasm 首次載入約 30MB,會被瀏覽器快取,之後使用無延遲
-- iOS 16+ Safari 對 ffmpeg.wasm 支援良好,全員 iPhone 的情境下風險很低
-- 從 CDN 載入 ffmpeg.wasm,延續 index.html「無 build、無 npm」的架構哲學
+**技術路線換過一次。** 原本規劃用 ffmpeg.wasm(壓縮成 opus 24kbps + 靜音偵測切段),後來在實測中遇到兩個致命問題:
 
-### 5.2.5 實作位置(重要)
+- ffmpeg.wasm 首次載入 ~30MB,Safari + 慢網路 + 長檔情境下載失敗率偏高
+- WASM 初始化偶爾卡死,使用者要重新整理頁面才能恢復
 
-所有音訊 pipeline 邏輯都寫在 `index.html` **內部**,不拆檔案。
+**現行方案:瀏覽器原生 Web Audio API。**
 
-- ffmpeg.wasm 從 CDN `unpkg.com/@ffmpeg/ffmpeg` 載入
-- 在 `<script type="text/babel">` 區塊內新增一個 `// ─── AUDIO PIPELINE ─────────────` 註解區塊,所有相關函式寫在這裡
-- `PostMeeting` 元件現有的 Whisper API 呼叫邏輯(1163-1168 行)要改寫,接上前置處理
+- `AudioContext.decodeAudioData` 解碼 m4a/mp3/wav → 16kHz mono AudioBuffer
+- 自己寫 WAV encoder(16-bit PCM 標頭 + samples) — 就是 40 行 code
+- 等時切段(5 分鐘/段),不做靜音偵測(實測「會議中 0.8 秒靜音」太稀有,不可靠)
 
-**現有 index.html 已經有的:**
-- ✅ 上傳音檔的 UI(1318-1338 行)
-- ✅ Whisper API 呼叫(1163-1168 行)
-- ✅ 成本計算(1169-1171 行)
-- ✅ Anthropic/GPT 雙引擎摘要(1192-1280 行的 prompt)
+**換掉 ffmpeg 後的額外優點:**
+- 零外部依賴,沒有 30MB CDN 下載風險
+- 全平台原生支援(iOS 16+ / Safari / Chrome / Firefox 都 OK)
+- 程式碼更短(~160 行 vs ffmpeg 方案預估的 ~250 行)
+- 單段 WAV 未壓縮但只有 9.6MB,並行 2 通道上傳 Whisper 完全吃得消
 
-**需要新增的:**
-- ❌ ffmpeg.wasm 載入和初始化
-- ❌ 壓縮函式(16kHz mono opus 24kbps)
-- ❌ 靜音偵測切段
-- ❌ 並行上傳邏輯
-- ❌ 逐字稿合併
-- ❌ 六階段 UI 進度顯示
+**保留不變的原則:**
+- 前端處理 = 原檔不離開使用者電腦,SIPAI 機密會議更安全(沒變)
+- 整個 MeetKit 就是 `index.html`,無後端架構哲學(沒變)
+- 延續「無 build、無 npm」(沒變,甚至更純 — 連 CDN 都不需要)
+
+### 5.2.5 實作位置(已完成,僅保留給未來維護者參考)
+
+所有音訊 pipeline 邏輯都寫在 `index-dev.html` **內部**,不拆檔案。
+
+- 在 `<script type="text/babel">` 區塊內有 `// ─── AUDIO PIPELINE ─────────────` 註解區塊(約 605-780 行)
+- `Meeting` 元件的上傳處理接這些函式(約 2812 / 2827 / 2832 行)
+- Whisper 呼叫走 Edge Function `whisper-proxy`(Phase C 代理,不直連 OpenAI)
+
+**實作完成的關鍵函式:**
+- ✅ `segmentAudioWebAudio(blob)` — 解碼 + 切段(回傳 segments 陣列)
+- ✅ `encodeWavSegment(buffer, start, dur)` — AudioBuffer 片段轉 WAV Blob
+- ✅ `transcribeSegment(seg, attempt)` — 單段 Whisper 呼叫,含重試 + 4xx 永久錯誤判斷
+- ✅ `transcribeAllSegments(segments, onProgress)` — 2 通道 worker 池並行處理
+- ✅ `mergeTranscripts(results)` — 按 index 排序合併,分離 failedSegments
+- ✅ `AUDIO_CONFIG` — 所有參數集中(sampleRate / channels / retry / prompt 等)
 
 ### 5.3 Whisper API 呼叫細節
 
@@ -419,23 +432,30 @@ const startRec = async () => {
 
 ## 7. Rollout 路線圖(詳見 `docs/ROADMAP.md`)
 
-目前位置:**Phase 2.5 完成、Phase 2 音訊主體尚未動工**
+目前位置:**Phase 2 + 2.5 皆完成,等待 Phase 3 開工時機**
 
 - ✅ Phase 0:需求與架構確立
 - ✅ Phase 1:index.html 實戰版上線,多次真實會議驗證
-- 🔄 Phase 2:錄音改造(放棄瀏覽器錄音 + 整合 ffmpeg.wasm + 切段上傳)← 音訊 pipeline 還沒動
+- ✅ Phase 2:錄音改造(放棄瀏覽器錄音 + Web Audio API 切段上傳)
+  - 技術路線換過一次:原規劃 ffmpeg.wasm 實測失敗率高 → 改 Web Audio API(詳 §5.2)
+  - Meeting 元件的 MediaRecorder 引導改為「請打開 iPhone 語音備忘錄」
+  - 音訊 pipeline 完整實作:解碼 / 切段 / WAV 編碼 / 並行 Whisper / 合併逐字稿
+  - Whisper 呼叫走 `whisper-proxy` Edge Function(不直連 OpenAI,和 Phase C 對齊)
 - ✅ Phase 2.5:資安補強 + 邀請白名單(2026-04-22 至 2026-04-25)
   - Phase A–C(2026-04-22):Edge Function 代理、API key 回收、前端改走 proxy
   - Route C(2026-04-25):4 張表 RLS、Supabase magic-link 登入、`project_members` 白名單、Resend 邀請信
   - 📬 與會者面板(2026-04-25):加人 / 移除 / 重寄邀請信
+  - 排程邀請信(2026-04-25):Resend `scheduled_at` + 前端立即/排程切換 + 3 個快捷預設時間
+  - 設定面板清理(2026-04-25):公開網址 / Slack webhook / 複製通知按鈕拿掉(邀請信已取代)
 - ⏭ Phase 3:多專案管理優化 + 跨專案搜尋 + 「專案 vs 會議」語義釐清(見 ROADMAP.md 根本議題)
+  - 預期新增功能:「📬 通知所有與會者」(第 N 次會議時間通知,複用排程機制)
 - ⏭ Phase 4:全公司 rollout — SSO(mx.design 白名單)、角色區分(viewer/editor/owner)、邀請有效期、owner transfer(可能的 Next.js 重寫時機)
 
 每一次 session 結束時,如果有里程碑變動,請更新 `docs/ROADMAP.md` 的狀態標記。
 
 **重要認知:** MeetKit 的 Phase 劃分**不是**「從零到 Next.js 正式版」的工程路線,而是「從單檔實戰版逐步擴充功能」的漸進路線。保留 index.html 作為主體,直到它不敷使用才考慮重寫。
 
-**Phase 2.5 插在 2 和 3 中間的理由:** 原本「使用者系統 + 權限」規劃在 Phase 4,但 2026/04/22 API key 外洩事件 + SIPAI 客戶資料敏感度,讓這塊的優先級拉到音訊改造前面。現在是先有登入和權限再談 Meeting 元件重設計,順序合理。
+**Phase 2.5 插在 2 和 3 中間的理由:** 原本「使用者系統 + 權限」規劃在 Phase 4,但 2026/04/22 API key 外洩事件 + SIPAI 客戶資料敏感度,讓這塊的優先級拉到音訊改造前面。事實上 Phase 2 和 2.5 實作順序並行了一陣子 — 音訊 pipeline 的 whisper-proxy 本身就是 Phase C 的產物。順序合理,兩塊互相強化。
 
 ---
 
@@ -516,4 +536,4 @@ qmore 是設計師不是工程師。以下情境**一定要停下來問**:
 
 ---
 
-_最後更新:2026-04-25 — Phase 2.5 完成(Route C 邀請白名單 + 📬 與會者面板 + 重寄邀請按鈕);Phase 2 音訊 pipeline 仍待開工_
+_最後更新:2026-04-25 — Phase 2 音訊 pipeline(Web Audio API)+ Phase 2.5(Route C 邀請白名單 + 排程邀請信 + 設定面板清理)皆完成;meetkit.mx.design 定為正式網址;下一步是 Phase 3 的「📬 通知所有與會者」新功能_
