@@ -76,6 +76,11 @@ drop policy if exists "projects_owner_select" on public.projects;
 drop policy if exists "projects_owner_insert" on public.projects;
 drop policy if exists "projects_owner_update" on public.projects;
 drop policy if exists "projects_owner_delete" on public.projects;
+-- 新 policies 也先 drop,讓 migration 可以重複跑(idempotent)
+drop policy if exists "projects_select" on public.projects;
+drop policy if exists "projects_insert" on public.projects;
+drop policy if exists "projects_update" on public.projects;
+drop policy if exists "projects_delete" on public.projects;
 
 -- 可見:owner 或 被邀請的 member
 create policy "projects_select" on public.projects
@@ -105,6 +110,10 @@ drop policy if exists "proposals_owner_select" on public.proposals;
 drop policy if exists "proposals_owner_insert" on public.proposals;
 drop policy if exists "proposals_owner_update" on public.proposals;
 drop policy if exists "proposals_owner_delete" on public.proposals;
+drop policy if exists "proposals_select" on public.proposals;
+drop policy if exists "proposals_insert" on public.proposals;
+drop policy if exists "proposals_update" on public.proposals;
+drop policy if exists "proposals_delete" on public.proposals;
 
 create policy "proposals_select" on public.proposals
   for select
@@ -140,6 +149,10 @@ drop policy if exists "journals_owner_select" on public.journals;
 drop policy if exists "journals_owner_insert" on public.journals;
 drop policy if exists "journals_owner_update" on public.journals;
 drop policy if exists "journals_owner_delete" on public.journals;
+drop policy if exists "journals_select" on public.journals;
+drop policy if exists "journals_insert" on public.journals;
+drop policy if exists "journals_update" on public.journals;
+drop policy if exists "journals_delete" on public.journals;
 
 create policy "journals_select" on public.journals
   for select
@@ -168,6 +181,10 @@ create policy "journals_delete" on public.journals
   using (public.is_project_owner(project_id));
 
 -- project_members ------------------------------
+drop policy if exists "members_select" on public.project_members;
+drop policy if exists "members_insert" on public.project_members;
+drop policy if exists "members_delete" on public.project_members;
+
 -- 可見:自己是成員(看到自己被邀請的專案)、或自己是該專案的 owner
 create policy "members_select" on public.project_members
   for select
