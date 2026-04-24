@@ -97,8 +97,10 @@
     // db(): REST API 呼叫 helper
     // Authorization 帶使用者 access_token(RLS 才能拿到 auth.jwt()->>'email')
     // apikey 永遠帶 SB_KEY(publishable),這是 Supabase REST 的必要欄位
+    // 注意 spread 順序:opts 先展開,headers 最後才合併,避免呼叫者傳 headers 時把預設的 apikey/Authorization 整個覆蓋掉(先前 2026-04-25 project_members 401 的根因)
     const db = (path, opts = {}) =>
       fetch(`${SB_URL}/rest/v1/${path}`, {
+        ...opts,
         headers: {
           apikey: SB_KEY,
           Authorization: `Bearer ${getBearer()}`,
@@ -106,7 +108,6 @@
           Prefer: "return=representation",
           ...opts.headers,
         },
-        ...opts,
       });
 
     // ─── 附件文字抽取 ─────────────────────────────────────────────────────────────
