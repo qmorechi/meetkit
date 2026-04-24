@@ -155,11 +155,16 @@ Deno.serve(async (req) => {
   if (req.method === 'OPTIONS') return new Response('ok', { headers: cors });
 
   try {
-    const { journal, projectTitle, isoDate } = await req.json();
+    // notionParentPageId: 可選。由前端從 projects.notion_parent_page_id 傳入。
+    //   - 有值 → 寫到該 page 底下(subpage),properties 只用 Name
+    //   - 沒值 → 沿用舊行為,寫到 NOTION_DB_ID 指定的資料庫
+    const { journal, projectTitle, isoDate, notionParentPageId } = await req.json();
 
     const token = Deno.env.get('NOTION_TOKEN');
     const dbId  = Deno.env.get('NOTION_DB_ID');
-    if (!token || !dbId) throw new Error('NOTION_TOKEN 或 NOTION_DB_ID 未設定');
+    if (!token) throw new Error('NOTION_TOKEN 未設定');
+    const useCustomPage = !!(notionParentPageId && String(notionParentPageId).trim());
+    if (!useCustomPage && !dbId) throw new Error('NOTION_DB_ID 未設定且未指定 notionParentPageId');
 
     const pageTitle = `${journal.date}｜${projectTitle || '未命名專案'}`;
     const summarySnippet = (journal.summary || '').slice(0, 2000);
@@ -193,6 +198,24 @@ Deno.serve(async (req) => {
     }
 
     // ─── 建立 Notion page（最多 100 blocks）───────────────────────
+    // 兩種 parent 模式:
+    //   1) page_id(useCustomPage) → 變成 subpage,只能用 Name 這種 title property
+    //   2) database_id(預設)      → 進指定資料庫,可帶完整 properties(會議日期/專案名稱/摘要)
+    const parent = useCustomPage
+      ? { page_id: notionParentPageId }
+      : { database_id: dbId };
+    const properties = useCustomPage
+      ? {
+          // subpage 只支援 title 類型的 property,欄位名固定為 "title"
+          title: [{ text: { content: pageTitle } }],
+        }
+      : {
+          'Name':   { title:     [{ text: { content: pageTitle } }] },
+          '會議日期': { date:      isoDate ? { start: isoDate } : null },
+          '專案名稱': { rich_text: [{ text: { content: projectTitle || '' } }] },
+          '摘要':    { rich_text: [{ text: { content: summarySnippet } }] },
+        };
+
     const res = await fetch(`${NOTION_API}/pages`, {
       method: 'POST',
       headers: {
@@ -201,13 +224,8 @@ Deno.serve(async (req) => {
         'Content-Type': 'application/json',
       },
       body: JSON.stringify({
-        parent: { database_id: dbId },
-        properties: {
-          'Name':   { title:     [{ text: { content: pageTitle } }] },
-          '會議日期': { date:      isoDate ? { start: isoDate } : null },
-          '專案名稱': { rich_text: [{ text: { content: projectTitle || '' } }] },
-          '摘要':    { rich_text: [{ text: { content: summarySnippet } }] },
-        },
+        parent,
+        properties,
         children: blocks.slice(0, 100),
       }),
     });
