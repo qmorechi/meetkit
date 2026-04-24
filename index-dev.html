@@ -119,6 +119,43 @@
       return dataUrl.split(',')[1];
     };
 
+    // base64 → Blob（Storage 上傳要 binary body）
+    const base64ToBlob = (b64, mime) => {
+      const bin = atob(b64);
+      const buf = new Uint8Array(bin.length);
+      for (let i = 0; i < bin.length; i++) buf[i] = bin.charCodeAt(i);
+      return new Blob([buf], { type: mime });
+    };
+
+    // 把已 render 的圖片上傳到 Supabase Storage（Notion 需要公開 URL 才能嵌入）
+    // 路徑: presentations/{projectId}/renders/{fileName}
+    // 回傳公開 URL,失敗回 null
+    const uploadRenderedToStorage = async (projectId, fileName, blob, mime) => {
+      const path = `${projectId}/renders/${fileName}`;
+      try {
+        const res = await fetch(`${SB_URL}/storage/v1/object/presentations/${path}`, {
+          method: 'POST',
+          headers: {
+            apikey: SB_KEY,
+            Authorization: `Bearer ${SB_KEY}`,
+            'Content-Type': mime || 'application/octet-stream',
+            'x-upsert': 'true',
+          },
+          body: blob,
+        });
+        if (!res.ok) return null;
+        return `${SB_URL}/storage/v1/object/public/presentations/${path}`;
+      } catch {
+        return null;
+      }
+    };
+
+    // 清理檔名,僅保留 Storage 安全字元
+    const safeStem = (name) => {
+      const stem = (name || 'file').replace(/\.[^.]+$/, '');
+      return stem.replace(/[^a-zA-Z0-9._-]/g, '_').slice(0, 60) || 'file';
+    };
+
     const pdfToImageBlocks = async (fileUrl) => {
       if (typeof pdfjsLib === 'undefined') return [];
       const res = await fetch(fileUrl);
@@ -192,59 +229,117 @@
     };
 
     const extractAttachmentParts = async (fileUrl, fileName) => {
+      const base = { fileName, originalUrl: fileUrl };
       try {
         const ext = (fileName || fileUrl).split('.').pop().toLowerCase().split('?')[0];
 
         // Apple 專有 / 2003 舊格式 → 提示匯出
         if (['key', 'pages', 'numbers'].includes(ext)) {
-          return { kind: 'needs-export', fileName, hint: '請在 Keynote/Pages/Numbers 裡按 Cmd+E 匯出為 PDF，再重新上傳' };
+          return { ...base, kind: 'needs-export', hint: '請在 Keynote/Pages/Numbers 裡按 Cmd+E 匯出為 PDF，再重新上傳' };
         }
         if (['ppt', 'doc', 'xls'].includes(ext)) {
-          return { kind: 'needs-export', fileName, hint: `${ext.toUpperCase()} 為 2003 舊格式，請另存新檔為 .${ext}x 或匯出 PDF` };
+          return { ...base, kind: 'needs-export', hint: `${ext.toUpperCase()} 為 2003 舊格式，請另存新檔為 .${ext}x 或匯出 PDF` };
         }
 
         if (ext === 'pptx') {
           const r = await pptxToParts(fileUrl);
-          if (!r) return { kind: 'empty', fileName };
+          if (!r) return { ...base, kind: 'empty' };
           // 混合回傳：文字 + 圖片 blocks（上層會同時塞進 messages）
-          return { kind: 'pptx', fileName, text: r.text, blocks: r.blocks, note: `（PPTX 半解：文字 + ${r.totalImages} 張內嵌圖，版面配置已遺失）` };
+          return { ...base, kind: 'pptx', text: r.text, blocks: r.blocks, note: `（PPTX 半解：文字 + ${r.totalImages} 張內嵌圖，版面配置已遺失）` };
         }
 
         if (ext === 'pdf') {
           const r = await pdfToImageBlocks(fileUrl);
-          if (!r || !r.blocks.length) return { kind: 'empty', fileName };
-          return { kind: 'vision', fileName, blocks: r.blocks, note: r.totalPages > r.includedPages ? `（共 ${r.totalPages} 頁，只分析前 ${r.includedPages} 頁）` : '' };
+          if (!r || !r.blocks.length) return { ...base, kind: 'empty' };
+          return { ...base, kind: 'vision', blocks: r.blocks, totalPages: r.totalPages, includedPages: r.includedPages, note: r.totalPages > r.includedPages ? `（共 ${r.totalPages} 頁，只分析前 ${r.includedPages} 頁）` : '' };
         }
 
         if (['png', 'jpg', 'jpeg', 'webp', 'gif'].includes(ext)) {
           const res = await fetch(fileUrl);
-          if (!res.ok) return { kind: 'empty', fileName };
+          if (!res.ok) return { ...base, kind: 'empty' };
           const blob = await res.blob();
           const data = await blobToBase64(blob);
           const mime = ext === 'jpg' ? 'image/jpeg' : `image/${ext}`;
-          return { kind: 'vision', fileName, blocks: [{ type: 'image', source: { type: 'base64', media_type: mime, data } }] };
+          // 圖片原檔已在 Storage（file_url 就是 public URL）,Notion 可直接用 originalUrl,不需重傳
+          return { ...base, kind: 'vision', blocks: [{ type: 'image', source: { type: 'base64', media_type: mime, data } }], isDirectImage: true };
         }
 
         if (ext === 'docx') {
-          if (typeof mammoth === 'undefined') return { kind: 'empty', fileName };
+          if (typeof mammoth === 'undefined') return { ...base, kind: 'empty' };
           const res = await fetch(fileUrl);
-          if (!res.ok) return { kind: 'empty', fileName };
+          if (!res.ok) return { ...base, kind: 'empty' };
           const buf = await res.arrayBuffer();
           const result = await mammoth.extractRawText({ arrayBuffer: buf });
-          return { kind: 'text', fileName, text: result.value || '' };
+          return { ...base, kind: 'text', text: result.value || '' };
         }
 
         if (['txt', 'md', 'rtf'].includes(ext)) {
           const res = await fetch(fileUrl);
-          if (!res.ok) return { kind: 'empty', fileName };
-          return { kind: 'text', fileName, text: await res.text() };
+          if (!res.ok) return { ...base, kind: 'empty' };
+          return { ...base, kind: 'text', text: await res.text() };
         }
 
-        return { kind: 'empty', fileName };
+        return { ...base, kind: 'empty' };
       } catch (e) {
         console.warn('附件抽取失敗：', fileName, e.message);
-        return { kind: 'empty', fileName };
+        return { ...base, kind: 'empty' };
       }
+    };
+
+    // 把提案附件的圖片 render 結果上傳到 Storage,產出 Notion-ready 的附件資料
+    // 回傳 proposals 陣列（每個 proposal 多一個 attachments 欄位）,給 Edge Function 組 Notion blocks
+    const archiveAttachmentsToStorage = async (projectId, proposalsWithParts) => {
+      const result = [];
+      for (const p of proposalsWithParts) {
+        const attachments = [];
+        for (const part of (p.parts || [])) {
+          const att = {
+            kind: part.kind,
+            fileName: part.fileName,
+            originalUrl: part.originalUrl,
+            isDirectImage: !!part.isDirectImage,
+            note: part.note || '',
+            hint: part.hint || '',
+            text: part.text || '',
+            images: [],
+          };
+
+          // needs-export / text / empty → 無須上傳,直接保留
+          if (part.kind === 'vision' && part.isDirectImage) {
+            // 直接用原檔 URL,不重傳
+            att.images.push({ url: part.originalUrl, caption: part.fileName });
+          } else if (part.kind === 'vision' && part.blocks?.length) {
+            // PDF → 每頁 render 上傳
+            const stem = safeStem(part.fileName);
+            for (let i = 0; i < part.blocks.length; i++) {
+              const b = part.blocks[i];
+              if (b.type !== 'image') continue;
+              const blob = base64ToBlob(b.source.data, b.source.media_type);
+              const url = await uploadRenderedToStorage(projectId, `${stem}-p${i + 1}.jpg`, blob, b.source.media_type);
+              if (url) att.images.push({ url, caption: `${part.fileName} – 第 ${i + 1} 頁` });
+            }
+          } else if (part.kind === 'pptx' && part.blocks?.length) {
+            const stem = safeStem(part.fileName);
+            for (let i = 0; i < part.blocks.length; i++) {
+              const b = part.blocks[i];
+              if (b.type !== 'image') continue;
+              const ext = (b.source.media_type.split('/')[1] || 'jpg').replace('jpeg', 'jpg');
+              const blob = base64ToBlob(b.source.data, b.source.media_type);
+              const url = await uploadRenderedToStorage(projectId, `${stem}-img${i + 1}.${ext}`, blob, b.source.media_type);
+              if (url) att.images.push({ url, caption: `${part.fileName} – 圖 ${i + 1}` });
+            }
+          }
+
+          attachments.push(att);
+        }
+        result.push({
+          title: p.title,
+          author: p.author,
+          content: p.content,
+          attachments,
+        });
+      }
+      return result;
     };
 
     const genId = () => Math.random().toString(36).slice(2, 8).toUpperCase();
@@ -2107,6 +2202,7 @@
       const [whisperInfo,  setWhisperInfo]  = useState(null);
       const [archiving,        setArchiving]        = useState(false);
       const [archiveSteps,     setArchiveSteps]     = useState([]);
+      const [proposalsParts,   setProposalsParts]   = useState([]);
       const [compressProgress, setCompressProgress] = useState(0);
       const [segmentProgress,  setSegmentProgress]  = useState(0);
       const [uploadProgress,   setUploadProgress]   = useState(0);
@@ -2190,6 +2286,7 @@
           } catch {}
           return { ...p, parts };
         }));
+        setProposalsParts(proposalsWithParts);
 
         // 5b) 組 Claude content blocks（text + image 混合）
         const intro = `你是一位專業的會議記錄與策略分析師。以下是一場會議的完整逐字稿、議程提案與提案附件。請用繁體中文產出一份結構完整的會後文件。
@@ -2344,17 +2441,23 @@ ${txText}
 
       const handleArchive = async () => {
         setArchiving(true);
-        setArchiveSteps([]);
-        const steps = [
-          { msg: '💾 儲存日誌中…',    delay: 0 },
-          { msg: '📌 更新前情提要…',  delay: 900 },
-          { msg: '✅ 完成！前往日誌', delay: 1800 },
-        ];
-        steps.forEach(({ msg, delay }) => {
-          setTimeout(() => setArchiveSteps(prev => [...prev, msg]), delay);
-        });
-        await new Promise(r => setTimeout(r, 2200));
-        await onSaveJournal({ proposals, transcript, summary });
+        setArchiveSteps(['💾 儲存日誌中…']);
+
+        // 附件 render 圖上傳到 Storage（給 Notion 嵌入用）
+        let enrichedProposals = proposals.map(p => ({ title: p.title, author: p.author, content: p.content, attachments: [] }));
+        if (proposalsParts.length > 0) {
+          setArchiveSteps(prev => [...prev, '🖼 附件圖片上傳中…']);
+          try {
+            enrichedProposals = await archiveAttachmentsToStorage(projectId, proposalsParts);
+          } catch (e) {
+            console.error('附件上傳失敗:', e);
+          }
+        }
+
+        setArchiveSteps(prev => [...prev, '📌 同步到 Notion…']);
+        setArchiveSteps(prev => [...prev, '✅ 完成！前往日誌']);
+        await new Promise(r => setTimeout(r, 600));
+        await onSaveJournal({ proposals: enrichedProposals, transcript, summary });
       };
 
       return (
@@ -2928,23 +3031,26 @@ ${txText}
       };
 
       const saveToJournal = async ({ proposals, transcript, summary }) => {
-        const entry = {
+        // DB 存的是精簡版（journals 表沒有 attachments 欄位）
+        const dbEntry = {
           id: Date.now().toString(),
           project_id: projectId,
           date: new Date().toLocaleDateString('zh-TW', { year: 'numeric', month: 'long', day: 'numeric' }),
           proposals: proposals.map(p => ({ title: p.title, author: p.author, content: p.content })),
           transcript, summary,
         };
+        // Notion 用的完整版（含附件 render 圖 URLs、抽取文字、格式警告）
+        const notionEntry = { ...dbEntry, proposals };
         try {
-          await db('journals', { method: 'POST', body: JSON.stringify(entry) });
+          await db('journals', { method: 'POST', body: JSON.stringify(dbEntry) });
         } catch (e) { console.error('Journal save failed', e); }
         // 同步到 Notion（背景執行，不阻擋流程）
-        syncEntryToNotion(entry).then(result => {
+        syncEntryToNotion(notionEntry).then(result => {
           if (result.ok) {
-            setJournal(prev => prev.map(j => j.id === entry.id ? { ...j, notionSynced: true, notionUrl: result.url } : j));
+            setJournal(prev => prev.map(j => j.id === dbEntry.id ? { ...j, notionSynced: true, notionUrl: result.url } : j));
           }
         });
-        setJournal(prev => [...prev, { ...entry, notionSynced: false }]);
+        setJournal(prev => [...prev, { ...dbEntry, notionSynced: false }]);
         setPhase(3);
       };
 

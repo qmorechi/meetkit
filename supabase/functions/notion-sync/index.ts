@@ -23,6 +23,82 @@ function heading3(text: string) {
   return { object: 'block', type: 'heading_3', heading_3: { rich_text: [{ type: 'text', text: { content: text } }] } };
 }
 
+function imageBlock(url: string, caption?: string) {
+  return {
+    object: 'block',
+    type: 'image',
+    image: {
+      type: 'external',
+      external: { url },
+      caption: caption ? [{ type: 'text', text: { content: caption.slice(0, 1900) } }] : [],
+    },
+  };
+}
+
+function fileBlock(url: string, name: string) {
+  return {
+    object: 'block',
+    type: 'file',
+    file: {
+      type: 'external',
+      external: { url },
+      caption: [{ type: 'text', text: { content: name.slice(0, 1900) } }],
+    },
+  };
+}
+
+function calloutBlock(emoji: string, text: string, color = 'yellow_background') {
+  return {
+    object: 'block',
+    type: 'callout',
+    callout: {
+      rich_text: [{ type: 'text', text: { content: text.slice(0, 1900) } }],
+      icon: { type: 'emoji', emoji },
+      color,
+    },
+  };
+}
+
+// 依附件 kind 組 Notion blocks（圖 + 文字 + 原檔下載連結 + 格式警告）
+function attachmentBlocks(att: any) {
+  const out: object[] = [];
+  const header = att.note ? `📎 附件：${att.fileName}　${att.note}` : `📎 附件：${att.fileName}`;
+  out.push(heading3(header));
+
+  if (att.kind === 'needs-export') {
+    out.push(calloutBlock('⚠️', `${att.fileName}：${att.hint}`, 'orange_background'));
+    return out;
+  }
+
+  if (att.kind === 'empty') {
+    out.push(calloutBlock('ℹ️', `${att.fileName}：無法擷取內容（可能是未支援的格式）`, 'gray_background'));
+    if (att.originalUrl) out.push(fileBlock(att.originalUrl, att.fileName));
+    return out;
+  }
+
+  // 圖片（PDF 每頁 render、PPTX 內嵌圖、直接上傳的圖片）
+  if (Array.isArray(att.images) && att.images.length > 0) {
+    for (const img of att.images) {
+      if (img?.url) out.push(imageBlock(img.url, img.caption || ''));
+    }
+  }
+
+  // 抽取的文字（DOCX/TXT/MD/PPTX 文字）→ 給 AI 讀懂用
+  if (att.text && att.text.trim()) {
+    out.push(...paragraphBlocks(att.text));
+  }
+
+  // 原檔下載連結：
+  //   直接圖片（isDirectImage）→ 不重複,images 已經是原檔
+  //   其它（PDF / PPTX / DOCX / TXT）→ 一律附原檔供下載
+  if (att.originalUrl && !att.isDirectImage) {
+    const label = att.kind === 'vision' ? `原始 PDF：${att.fileName}` : `原檔：${att.fileName}`;
+    out.push(fileBlock(att.originalUrl, label));
+  }
+
+  return out;
+}
+
 Deno.serve(async (req) => {
   const cors = {
     'Access-Control-Allow-Origin': '*',
@@ -50,6 +126,12 @@ Deno.serve(async (req) => {
         const label = p.author ? `${p.title}（${p.author}）` : p.title;
         blocks.push(heading3(label));
         if (p.content) blocks.push(...paragraphBlocks(p.content));
+        // 附件（圖 + 文字 + 原檔 + 警告）
+        if (Array.isArray(p.attachments)) {
+          for (const att of p.attachments) {
+            blocks.push(...attachmentBlocks(att));
+          }
+        }
       }
     }
 
