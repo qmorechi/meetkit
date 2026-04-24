@@ -143,9 +143,9 @@
       searchWindowMinutes: 2,
       silenceThresholdDb: -40,
       minSilenceSec: 0.8,
-      parallelChannels: 4,
-      retryAttempts: 3,
-      retryDelayMs: 2000,
+      parallelChannels: 2,
+      retryAttempts: 5,
+      retryDelayMs: 3000,
       maxFileSizeMB: 500,
       whisperLanguage: 'zh',
       whisperPrompt: 'Cosmoship, 宇宙小艇, SIPAI, 偷瞄的X, MX Design, Figma, Supabase, Anthropic, Claude, ComfyUI, Flux, MeetKit',
@@ -346,8 +346,9 @@
     // ffmpeg.wasm 無法載入時的備援路線（Safari 無 COOP/COEP、核心下載失敗等）
     // 全程使用瀏覽器原生 AudioContext，保證任何環境都能切段上傳
 
-    // 每段 10 分鐘：16kHz mono 16-bit WAV ≈ 19.2MB，安全在 Whisper 25MB 上限內
-    const WEBAUDIO_SEGMENT_MINUTES = 10;
+    // 每段 5 分鐘：16kHz mono 16-bit WAV ≈ 9.6MB
+    // 小段落換來:(1) 單次上傳失敗風險低(2) 平行連線總頻寬壓力小(3) Edge Function 處理時間短
+    const WEBAUDIO_SEGMENT_MINUTES = 5;
 
     // 將 m4a/mp3/wav 解碼成 16kHz mono AudioBuffer
     const decodeAudioBlob = async (blob) => {
