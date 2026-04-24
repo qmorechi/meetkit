@@ -60,6 +60,7 @@
   <script src="https://unpkg.com/@ffmpeg/ffmpeg@0.12.10/dist/umd/ffmpeg.js"></script>
   <script src="https://unpkg.com/@ffmpeg/util@0.12.1/dist/umd/index.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/qrcodejs@1.0.0/qrcode.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/jszip@3.10.1/dist/jszip.min.js"></script>
 </head>
 <body>
   <div id="root"></div>
@@ -92,37 +93,158 @@
       });
 
     // ─── 附件文字抽取 ─────────────────────────────────────────────────────────────
-    const extractFileText = async (fileUrl, fileName) => {
+    // ─── ATTACHMENT EXTRACTION (text + vision) ───────────────────────────────
+    // 提案附件可能是 PDF/圖片/DOCX/TXT/PPT。支援範圍：
+    //   PDF → 每頁 render 成 JPEG，送 Claude vision（保留圖片/版面）
+    //   PNG/JPG/WEBP/GIF → 直接 base64 送 Claude vision
+    //   DOCX/TXT/MD/RTF → 抽純文字
+    //   PPT/PPTX/KEY → 提示使用者匯出 PDF（瀏覽器無法可靠解析）
+    // 回傳: { kind, fileName, blocks?, text? }
+    //   blocks 是 Claude API 相容的圖片 content blocks（也可轉成 OpenAI vision 格式）
+
+    const PDF_VISION_MAX_PAGES = 30; // 超過只取前 N 頁，避免 token 爆炸
+    const PDF_VISION_SCALE = 1.5;    // 約 1280×960，Claude 閱讀足夠
+
+    // Blob → base64 純字串（去掉 data:...;base64, 前綴）
+    const blobToBase64 = (blob) => new Promise((resolve, reject) => {
+      const r = new FileReader();
+      r.onloadend = () => resolve(r.result.split(',')[1]);
+      r.onerror = reject;
+      r.readAsDataURL(blob);
+    });
+
+    // canvas → JPEG base64（JPEG 比 PNG 小 5-10 倍,視覺無損）
+    const canvasToJpegBase64 = (canvas, quality = 0.8) => {
+      const dataUrl = canvas.toDataURL('image/jpeg', quality);
+      return dataUrl.split(',')[1];
+    };
+
+    const pdfToImageBlocks = async (fileUrl) => {
+      if (typeof pdfjsLib === 'undefined') return [];
+      const res = await fetch(fileUrl);
+      if (!res.ok) return [];
+      const buf = await res.arrayBuffer();
+      const pdf = await pdfjsLib.getDocument({ data: buf }).promise;
+      const pages = Math.min(pdf.numPages, PDF_VISION_MAX_PAGES);
+      const blocks = [];
+      for (let i = 1; i <= pages; i++) {
+        const page = await pdf.getPage(i);
+        const viewport = page.getViewport({ scale: PDF_VISION_SCALE });
+        const canvas = document.createElement('canvas');
+        canvas.width = viewport.width;
+        canvas.height = viewport.height;
+        await page.render({ canvasContext: canvas.getContext('2d'), viewport }).promise;
+        blocks.push({
+          type: 'image',
+          source: { type: 'base64', media_type: 'image/jpeg', data: canvasToJpegBase64(canvas) },
+        });
+      }
+      return { blocks, totalPages: pdf.numPages, includedPages: pages };
+    };
+
+    // PPTX 半解：JSZip 拆 zip → 抽每張 slide 的 XML 文字 + ppt/media/ 裡的圖片
+    // 版面配置會遺失，但文字+原圖都保留，比純文字好很多
+    const PPTX_MAX_IMAGES = 40;
+    const pptxToParts = async (fileUrl) => {
+      if (typeof JSZip === 'undefined') return null;
+      const res = await fetch(fileUrl);
+      if (!res.ok) return null;
+      const buf = await res.arrayBuffer();
+      const zip = await JSZip.loadAsync(buf);
+
+      // 1) 每張 slide 的文字（按 slide1.xml, slide2.xml... 排序）
+      const slideEntries = Object.keys(zip.files)
+        .filter(k => /^ppt\/slides\/slide\d+\.xml$/.test(k))
+        .sort((a, b) => {
+          const na = parseInt(a.match(/slide(\d+)/)[1], 10);
+          const nb = parseInt(b.match(/slide(\d+)/)[1], 10);
+          return na - nb;
+        });
+      const slideTexts = [];
+      for (const key of slideEntries) {
+        const xml = await zip.files[key].async('string');
+        // <a:t>...</a:t> 是實際文字內容
+        const matches = [...xml.matchAll(/<a:t[^>]*>([^<]*)<\/a:t>/g)];
+        const text = matches.map(m => m[1]).join(' ').replace(/\s+/g, ' ').trim();
+        const n = parseInt(key.match(/slide(\d+)/)[1], 10);
+        if (text) slideTexts.push(`【Slide ${n}】${text}`);
+      }
+
+      // 2) 內嵌圖片（PNG/JPG/JPEG/GIF/WEBP）→ base64 image blocks
+      const mediaEntries = Object.keys(zip.files)
+        .filter(k => /^ppt\/media\/.*\.(png|jpg|jpeg|gif|webp)$/i.test(k))
+        .sort()
+        .slice(0, PPTX_MAX_IMAGES);
+      const blocks = [];
+      for (const key of mediaEntries) {
+        const ext = key.split('.').pop().toLowerCase();
+        const mime = ext === 'jpg' ? 'image/jpeg' : `image/${ext}`;
+        const blob = await zip.files[key].async('blob');
+        const data = await blobToBase64(blob);
+        blocks.push({ type: 'image', source: { type: 'base64', media_type: mime, data } });
+      }
+
+      return {
+        text: slideTexts.join('\n'),
+        blocks,
+        totalImages: mediaEntries.length,
+      };
+    };
+
+    const extractAttachmentParts = async (fileUrl, fileName) => {
       try {
         const ext = (fileName || fileUrl).split('.').pop().toLowerCase().split('?')[0];
-        const res = await fetch(fileUrl);
-        if (!res.ok) return '';
+
+        // Apple 專有 / 2003 舊格式 → 提示匯出
+        if (['key', 'pages', 'numbers'].includes(ext)) {
+          return { kind: 'needs-export', fileName, hint: '請在 Keynote/Pages/Numbers 裡按 Cmd+E 匯出為 PDF，再重新上傳' };
+        }
+        if (['ppt', 'doc', 'xls'].includes(ext)) {
+          return { kind: 'needs-export', fileName, hint: `${ext.toUpperCase()} 為 2003 舊格式，請另存新檔為 .${ext}x 或匯出 PDF` };
+        }
+
+        if (ext === 'pptx') {
+          const r = await pptxToParts(fileUrl);
+          if (!r) return { kind: 'empty', fileName };
+          // 混合回傳：文字 + 圖片 blocks（上層會同時塞進 messages）
+          return { kind: 'pptx', fileName, text: r.text, blocks: r.blocks, note: `（PPTX 半解：文字 + ${r.totalImages} 張內嵌圖，版面配置已遺失）` };
+        }
 
         if (ext === 'pdf') {
-          if (typeof pdfjsLib === 'undefined') return '';
-          const buf = await res.arrayBuffer();
-          const pdf = await pdfjsLib.getDocument({ data: buf }).promise;
-          const pages = await Promise.all(
-            Array.from({ length: pdf.numPages }, (_, i) =>
-              pdf.getPage(i + 1).then(p => p.getTextContent()).then(tc => tc.items.map(it => it.str).join(' '))
-            )
-          );
-          return pages.join('\n');
+          const r = await pdfToImageBlocks(fileUrl);
+          if (!r || !r.blocks.length) return { kind: 'empty', fileName };
+          return { kind: 'vision', fileName, blocks: r.blocks, note: r.totalPages > r.includedPages ? `（共 ${r.totalPages} 頁，只分析前 ${r.includedPages} 頁）` : '' };
+        }
+
+        if (['png', 'jpg', 'jpeg', 'webp', 'gif'].includes(ext)) {
+          const res = await fetch(fileUrl);
+          if (!res.ok) return { kind: 'empty', fileName };
+          const blob = await res.blob();
+          const data = await blobToBase64(blob);
+          const mime = ext === 'jpg' ? 'image/jpeg' : `image/${ext}`;
+          return { kind: 'vision', fileName, blocks: [{ type: 'image', source: { type: 'base64', media_type: mime, data } }] };
         }
 
         if (ext === 'docx') {
-          if (typeof mammoth === 'undefined') return '';
+          if (typeof mammoth === 'undefined') return { kind: 'empty', fileName };
+          const res = await fetch(fileUrl);
+          if (!res.ok) return { kind: 'empty', fileName };
           const buf = await res.arrayBuffer();
           const result = await mammoth.extractRawText({ arrayBuffer: buf });
-          return result.value || '';
+          return { kind: 'text', fileName, text: result.value || '' };
         }
 
         if (['txt', 'md', 'rtf'].includes(ext)) {
-          return await res.text();
+          const res = await fetch(fileUrl);
+          if (!res.ok) return { kind: 'empty', fileName };
+          return { kind: 'text', fileName, text: await res.text() };
         }
 
-        return '';
-      } catch { return ''; }
+        return { kind: 'empty', fileName };
+      } catch (e) {
+        console.warn('附件抽取失敗：', fileName, e.message);
+        return { kind: 'empty', fileName };
+      }
     };
 
     const genId = () => Math.random().toString(36).slice(2, 8).toUpperCase();
@@ -2053,29 +2175,30 @@
           setWhisperInfo({ mins, cost: (mins * 0.006).toFixed(3) });
         } catch (e) { setErrMsg('處理失敗：' + e.message); setStatus('error'); return; }
 
-        // ── 階段 5：AI 摘要 ───────────────────────────────────────────────
+        // ── 階段 5：AI 摘要（附件抽取 + vision 整合） ────────────────────
         setStatus('summarizing');
-        // 抽取每個提案的附件文字
-        const proposalsWithText = await Promise.all(proposals.map(async (p) => {
-          let attachText = '';
+
+        // 5a) 抽取每個提案的附件為 Claude content parts（文字/圖片/格式警告）
+        const proposalsWithParts = await Promise.all(proposals.map(async (p) => {
+          let parts = [];
           try {
             const urls = JSON.parse(p.file_url || '[]');
             const names = JSON.parse(p.file_name || '[]');
-            const texts = await Promise.all(urls.map((url, i) => extractFileText(url, names[i] || url)));
-            attachText = texts.filter(Boolean).join('\n');
+            for (let i = 0; i < urls.length; i++) {
+              parts.push(await extractAttachmentParts(urls[i], names[i] || urls[i]));
+            }
           } catch {}
-          return { ...p, attachText };
+          return { ...p, parts };
         }));
-        const agendaDetail = proposalsWithText.length
-          ? proposalsWithText.map((p, i) => {
-              const base = `${i + 1}. 【${p.title}】提案人：${p.author}\n   ${p.content || '（無提案說明）'}`;
-              return p.attachText ? `${base}\n\n   【附件內容摘錄】\n${p.attachText.slice(0, 3000)}` : base;
-            }).join('\n\n')
-          : '（無提案議程）';
-        const prompt = `你是一位專業的會議記錄與策略分析師。以下是一場會議的完整逐字稿與議程提案，請用繁體中文產出一份結構完整的會後文件。
 
-━━━ 本次議程提案 ━━━
-${agendaDetail}
+        // 5b) 組 Claude content blocks（text + image 混合）
+        const intro = `你是一位專業的會議記錄與策略分析師。以下是一場會議的完整逐字稿、議程提案與提案附件。請用繁體中文產出一份結構完整的會後文件。
+
+注意：附件中的圖片（PDF 每頁、PPTX 內嵌圖、PNG/JPG）都是提案的一部分，請結合圖片中的視覺資訊（配色、排版、圖表、示意）與文字內容共同分析，不要只看文字。如附件有格式警告（例如 .key/.pages 無法讀取），請在摘要中明確提醒使用者。
+
+━━━ 本次議程提案 ━━━`;
+
+        const outroFormat = `
 
 ━━━ 會議逐字稿 ━━━
 ${txText}
@@ -2089,7 +2212,7 @@ ${txText}
 ## 提案 N：{提案標題}（{提案人}）
 
 ### 核心想法
-（一段話說明提案人的核心主張）
+（一段話說明提案人的核心主張；如有附件圖片，結合圖片中的視覺資訊）
 
 ### 會議 Findings
 - **支持點：** （與會者認同的觀點、正面回饋）
@@ -2131,6 +2254,43 @@ ${txText}
 # 💡 AI 綜合建議
 
 （根據整體會議內容，提出 3-5 點具體可行的策略建議，包含優先順序推薦與注意事項）`;
+
+        const claudeBlocks = [{ type: 'text', text: intro }];
+        if (proposalsWithParts.length === 0) {
+          claudeBlocks.push({ type: 'text', text: '\n\n（無提案議程）' });
+        } else {
+          proposalsWithParts.forEach((p, i) => {
+            claudeBlocks.push({ type: 'text', text: `\n\n【提案 ${i + 1}】${p.title}（提案人：${p.author}）\n${p.content || '（無提案說明）'}` });
+            for (const part of (p.parts || [])) {
+              if (part.kind === 'needs-export') {
+                claudeBlocks.push({ type: 'text', text: `\n⚠️ 附件「${part.fileName}」：${part.hint}（本次無法納入分析）` });
+              } else if (part.kind === 'vision') {
+                claudeBlocks.push({ type: 'text', text: `\n附件「${part.fileName}」${part.note || ''}：` });
+                claudeBlocks.push(...part.blocks);
+              } else if (part.kind === 'pptx') {
+                claudeBlocks.push({ type: 'text', text: `\n附件「${part.fileName}」${part.note || ''}\n${(part.text || '').slice(0, 8000)}` });
+                if (part.blocks && part.blocks.length) {
+                  claudeBlocks.push({ type: 'text', text: '（簡報內嵌圖）' });
+                  claudeBlocks.push(...part.blocks);
+                }
+              } else if (part.kind === 'text') {
+                claudeBlocks.push({ type: 'text', text: `\n附件「${part.fileName}」：\n${(part.text || '').slice(0, 10000)}` });
+              }
+              // kind === 'empty' 就不輸出任何東西
+            }
+          });
+        }
+        claudeBlocks.push({ type: 'text', text: outroFormat });
+
+        // 5c) 轉成 OpenAI vision 格式（fallback 用）
+        const openAIBlocks = claudeBlocks.map(b => {
+          if (b.type === 'text') return { type: 'text', text: b.text };
+          if (b.type === 'image') {
+            return { type: 'image_url', image_url: { url: `data:${b.source.media_type};base64,${b.source.data}` } };
+          }
+          return b;
+        });
+
         try {
           let summaryText = '';
           // 優先用 Anthropic Claude，失敗才 fallback 到 GPT-4o
@@ -2144,7 +2304,7 @@ ${txText}
                 payload: {
                   model: 'claude-opus-4-5',
                   max_tokens: 4096,
-                  messages: [{ role: 'user', content: prompt }],
+                  messages: [{ role: 'user', content: claudeBlocks }],
                 },
               }),
             });
@@ -2155,7 +2315,7 @@ ${txText}
             console.warn('Anthropic 摘要失敗，改用 GPT-4o：', anthropicErr.message);
           }
           if (!summaryText) {
-            const res = await fetch(`${EDGE_BASE}/ai-proxy`, { method: 'POST', headers: EDGE_HEADERS, body: JSON.stringify({ provider: 'openai', payload: { model: 'gpt-4o', messages: [{ role: 'user', content: prompt }] } }) });
+            const res = await fetch(`${EDGE_BASE}/ai-proxy`, { method: 'POST', headers: EDGE_HEADERS, body: JSON.stringify({ provider: 'openai', payload: { model: 'gpt-4o', messages: [{ role: 'user', content: openAIBlocks }] } }) });
             if (!res.ok) { const e = await res.json(); throw new Error(e.error?.message || `HTTP ${res.status}`); }
             summaryText = (await res.json()).choices[0].message.content;
           }
