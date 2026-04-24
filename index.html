@@ -59,6 +59,8 @@
   </style>
   <script src="https://cdn.jsdelivr.net/npm/qrcodejs@1.0.0/qrcode.min.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/jszip@3.10.1/dist/jszip.min.js"></script>
+  <!-- Supabase JS SDK v2(Route C:magic link auth + RLS) -->
+  <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/dist/umd/supabase.min.js"></script>
 </head>
 <body>
   <div id="root"></div>
@@ -69,6 +71,20 @@
     const SB_URL = "https://yrugcgzkomydmorgzwhb.supabase.co";
     const SB_KEY = "sb_publishable_m3Qi3HdfMT2pbcQHVuGxNw_696C0jYa";
 
+    // Supabase JS SDK client(給 auth.signInWithOtp / getSession 用)
+    // 注意:resthook 不用它,db() 還是直接 fetch REST API,只是 Authorization 改帶 user access_token
+    const sb = (window.supabase && typeof window.supabase.createClient === 'function')
+      ? window.supabase.createClient(SB_URL, SB_KEY, {
+          auth: { persistSession: true, autoRefreshToken: true, detectSessionInUrl: true },
+        })
+      : null;
+
+    // 目前的使用者 session(access_token / email),由 App 頂層 onAuthStateChange 維護
+    // 未登入時 = null,db() 會退回用 anon key(但 RLS 會擋掉,只看得到公開資料)
+    let currentSession = null;
+    const setCurrentSession = (s) => { currentSession = s; };
+    const getBearer = () => (currentSession?.access_token) || SB_KEY;
+
     // ─── EDGE FUNCTION 代理（Phase C：API key 不再暴露於前端） ────────────────
     // 所有 OpenAI / Anthropic 呼叫都改走這裡，key 存在 Supabase Edge Function secrets
     const EDGE_BASE = `${SB_URL}/functions/v1`;
@@ -78,16 +94,20 @@
       'Content-Type': 'application/json',
     };
 
+    // db(): REST API 呼叫 helper
+    // Authorization 帶使用者 access_token(RLS 才能拿到 auth.jwt()->>'email')
+    // apikey 永遠帶 SB_KEY(publishable),這是 Supabase REST 的必要欄位
+    // 注意 spread 順序:opts 先展開,headers 最後才合併,避免呼叫者傳 headers 時把預設的 apikey/Authorization 整個覆蓋掉(先前 2026-04-25 project_members 401 的根因)
     const db = (path, opts = {}) =>
       fetch(`${SB_URL}/rest/v1/${path}`, {
+        ...opts,
         headers: {
           apikey: SB_KEY,
-          Authorization: `Bearer ${SB_KEY}`,
+          Authorization: `Bearer ${getBearer()}`,
           "Content-Type": "application/json",
           Prefer: "return=representation",
           ...opts.headers,
         },
-        ...opts,
       });
 
     // ─── 附件文字抽取 ─────────────────────────────────────────────────────────────
@@ -226,6 +246,239 @@
       };
     };
 
+    // DOCX 半解：mammoth 只抽文字,但 .docx 是 zip,裡面 word/media/ 存著所有內嵌圖
+    // 用 JSZip 補抽圖片,跟 PPTX 走一樣的 path,這樣含圖 DOCX 也能完整還原
+    const DOCX_MAX_IMAGES = 40;
+    const docxToParts = async (fileUrl) => {
+      if (typeof JSZip === 'undefined' || typeof mammoth === 'undefined') return null;
+      const res = await fetch(fileUrl);
+      if (!res.ok) return null;
+      const buf = await res.arrayBuffer();
+
+      // 1) 用 mammoth 抽純文字(保留原本流程)
+      let text = '';
+      try {
+        const r = await mammoth.extractRawText({ arrayBuffer: buf });
+        text = r.value || '';
+      } catch (e) {
+        console.warn('mammoth 抽文字失敗:', e.message);
+      }
+
+      // 2) 用 JSZip 抽 word/media/ 裡的圖片
+      let blocks = [];
+      let totalImages = 0;
+      try {
+        const zip = await JSZip.loadAsync(buf);
+        const mediaEntries = Object.keys(zip.files)
+          .filter(k => /^word\/media\/.*\.(png|jpg|jpeg|gif|webp)$/i.test(k))
+          .sort()
+          .slice(0, DOCX_MAX_IMAGES);
+        totalImages = mediaEntries.length;
+        for (const key of mediaEntries) {
+          const ext = key.split('.').pop().toLowerCase();
+          const mime = ext === 'jpg' ? 'image/jpeg' : `image/${ext}`;
+          const blob = await zip.files[key].async('blob');
+          const data = await blobToBase64(blob);
+          blocks.push({ type: 'image', source: { type: 'base64', media_type: mime, data } });
+        }
+      } catch (e) {
+        console.warn('JSZip 解 DOCX 失敗(純文字 fallback):', e.message);
+      }
+
+      return { text, blocks, totalImages };
+    };
+
+    // ─── GEMINI UNIVERSAL ATTACHMENT DESCRIBER ─────────────────────────────────
+    // 統一用 Gemini 2.5 Flash 處理所有格式附件,產出結構化 Markdown 描述,
+    // 後續 Claude 摘要時只讀這段描述,不必再重吃 raw vision tokens,省錢又一致。
+    //
+    // 策略：
+    //   PDF   → 直接 base64 丟 Gemini（原生支援 1000 頁內）
+    //   PPTX  → JSZip 已抽出的 slide 文字 + 每張內嵌圖(base64) 丟 Gemini
+    //   DOCX  → mammoth 抽出的文字 丟 Gemini
+    //   圖片  → base64 直接丟 Gemini
+    //
+    // 若 Gemini 失敗,前端照舊用 JSZip/mammoth/pdf.js 的輸出餵給 Claude,保留 fallback。
+
+    const GEMINI_DESCRIBE_PROMPT = `你是一位專業的提案內容分析助理。你的任務是仔細閱讀這份附件,產出一份結構化的 Markdown 描述,讓其他 AI(例如 Claude)讀到後能完整理解這份附件的內容,不必再看原檔。
+
+請務必使用下列格式,不要省略任何章節(若該章節沒內容就寫「無」):
+
+## 整體概述
+(2-3 句精簡說明:這份附件在講什麼?目的是什麼?給誰看?)
+
+## 關鍵資訊
+- 重要人名/公司/產品/概念(含英文原名若有)
+- 重要數字(價格、時間、尺寸、數量)
+- 重要日期與里程碑
+- 明確的決策點、方案對比、選項清單
+
+## 視覺元素描述
+(若附件含圖片/簡報頁面,每張圖或每頁各一段,說明:配色風格、排版結構、主要視覺元素、圖表資訊、設計意圖。若無視覺元素就寫「本附件為純文字」)
+
+## 重點原文引用
+(從原檔挑 3-5 句或段落,最能代表這份提案核心觀點的原文,用 > 引用格式)
+
+## 未能解析
+(任何模糊、缺字、圖太小看不清的部分。如無,寫「無」)
+
+請用繁體中文輸出,不要加任何開場白或結尾語,直接從 ## 整體概述 開始。`;
+
+    const GEMINI_MAX_PDF_BYTES = 20 * 1024 * 1024;   // 20MB 保守上限(Gemini inline 上限更大,但 base64 膨脹 33%)
+    const GEMINI_MAX_IMAGES_PER_CALL = 20;            // 一次最多吃 20 張圖,超過分批
+
+    // 核心:把已抽好的 parts 組成 Gemini contents.parts 陣列 → 呼叫 proxy → 回傳 Markdown 描述
+    // 回傳字串(Markdown)或 null(失敗)
+    const callGeminiDescribe = async (geminiParts, fileName) => {
+      try {
+        const headerText = `檔名:${fileName || '(未知)'}`;
+        const parts = [{ text: headerText }, ...geminiParts];
+        const res = await fetch(`${EDGE_BASE}/gemini-proxy`, {
+          method: 'POST',
+          headers: EDGE_HEADERS,
+          body: JSON.stringify({
+            model: 'gemini-2.5-flash',
+            systemInstruction: GEMINI_DESCRIBE_PROMPT,
+            parts,
+            generationConfig: {
+              temperature: 0.3,
+              maxOutputTokens: 4096,
+              thinkingConfig: { thinkingBudget: 0 }, // 關掉思考模式,附件描述不需要 reasoning
+            },
+          }),
+        });
+        if (!res.ok) {
+          const e = await res.json().catch(() => ({}));
+          console.warn('Gemini describe 失敗:', e.error || `HTTP ${res.status}`);
+          return null;
+        }
+        const data = await res.json();
+        return (data.text || '').trim() || null;
+      } catch (e) {
+        console.warn('Gemini describe 例外:', e.message);
+        return null;
+      }
+    };
+
+    // PDF → 直接送整份 PDF(Gemini 原生支援)
+    const geminiDescribePdf = async (fileUrl, fileName) => {
+      try {
+        const res = await fetch(fileUrl);
+        if (!res.ok) return null;
+        const blob = await res.blob();
+        if (blob.size > GEMINI_MAX_PDF_BYTES) {
+          console.warn(`PDF ${fileName} 超過 ${GEMINI_MAX_PDF_BYTES/1024/1024}MB,跳過 Gemini`);
+          return null;
+        }
+        const data = await blobToBase64(blob);
+        return await callGeminiDescribe([
+          { inline_data: { mime_type: 'application/pdf', data } },
+        ], fileName);
+      } catch (e) {
+        console.warn('geminiDescribePdf 失敗:', e.message);
+        return null;
+      }
+    };
+
+    // PPTX → 已抽好的 slide 文字 + 內嵌圖 base64
+    const geminiDescribePptx = async (pptxResult, fileName) => {
+      const parts = [];
+      if (pptxResult.text) {
+        parts.push({ text: `【簡報文字】\n${pptxResult.text.slice(0, 20000)}` });
+      }
+      const imgBlocks = (pptxResult.blocks || []).slice(0, GEMINI_MAX_IMAGES_PER_CALL);
+      for (const b of imgBlocks) {
+        if (b.type === 'image' && b.source?.data) {
+          parts.push({ inline_data: { mime_type: b.source.media_type, data: b.source.data } });
+        }
+      }
+      if (parts.length === 0) return null;
+      return await callGeminiDescribe(parts, fileName);
+    };
+
+    // DOCX → 抽好的純文字 + 內嵌圖(選填)。txt/md/rtf 只有 text 沒 blocks,走一樣的 path
+    const geminiDescribeDocx = async (text, fileName, blocks = []) => {
+      const parts = [];
+      if (text?.trim()) {
+        parts.push({ text: `【文件內容】\n${text.slice(0, 30000)}` });
+      }
+      const imgBlocks = (blocks || []).slice(0, GEMINI_MAX_IMAGES_PER_CALL);
+      for (const b of imgBlocks) {
+        if (b.type === 'image' && b.source?.data) {
+          parts.push({ inline_data: { mime_type: b.source.media_type, data: b.source.data } });
+        }
+      }
+      if (parts.length === 0) return null;
+      return await callGeminiDescribe(parts, fileName);
+    };
+
+    // 單張圖片 → base64 直接送
+    const geminiDescribeImage = async (fileUrl, mime, fileName) => {
+      try {
+        const res = await fetch(fileUrl);
+        if (!res.ok) return null;
+        const blob = await res.blob();
+        const data = await blobToBase64(blob);
+        return await callGeminiDescribe([
+          { inline_data: { mime_type: mime, data } },
+        ], fileName);
+      } catch (e) {
+        console.warn('geminiDescribeImage 失敗:', e.message);
+        return null;
+      }
+    };
+
+    // ─── NOTION 連結解析 ──────────────────────────────────────────────
+    // 提案 content 裡可能塞 Notion 頁連結(例如品牌調研、先前會議紀錄),
+    // 呼叫 notion-fetch Edge Function 把整頁攤平成 markdown,交給 Claude 當額外上下文
+    //
+    // 支援格式:
+    //   https://www.notion.so/Title-abc123def456...
+    //   https://notion.so/workspace/abc123def456...
+    //   https://qmore.notion.site/Page-abc123...
+    const NOTION_URL_RE = /https?:\/\/(?:www\.)?(?:notion\.so|[a-z0-9-]+\.notion\.site)\/[^\s)\]]*/gi;
+
+    const extractNotionPageId = (url) => {
+      if (!url) return '';
+      const m = url.match(/([0-9a-f]{32}|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/i);
+      return m ? m[1].replace(/-/g, '').toLowerCase() : '';
+    };
+
+    // 掃 proposal content,把所有 Notion URL 抓出來打 notion-fetch,回傳 [{ url, pageId, title, markdown }]
+    // 失敗的頁(integration 沒分享等)會回 { url, pageId, error: '...' }
+    const fetchProposalNotionRefs = async (content) => {
+      if (!content || typeof content !== 'string') return [];
+      const urls = [...new Set(content.match(NOTION_URL_RE) || [])];
+      if (urls.length === 0) return [];
+      const results = [];
+      for (const url of urls) {
+        const pageId = extractNotionPageId(url);
+        if (!pageId) continue;
+        try {
+          const res = await fetch(`${EDGE_BASE}/notion-fetch`, {
+            method: 'POST',
+            headers: EDGE_HEADERS,
+            body: JSON.stringify({ pageId, test: false }),
+          });
+          const data = await res.json();
+          if (data.ok) {
+            results.push({
+              url,
+              pageId,
+              title: data.title || '(無標題)',
+              markdown: data.markdown || '',
+              blockCount: data.blockCount || 0,
+            });
+          } else {
+            results.push({ url, pageId, error: data.hint || data.error || '無法讀取' });
+          }
+        } catch (e) {
+          results.push({ url, pageId, error: e.message || '連線失敗' });
+        }
+      }
+      return results;
+    };
+
     const extractAttachmentParts = async (fileUrl, fileName) => {
       const base = { fileName, originalUrl: fileUrl };
       try {
@@ -242,14 +495,17 @@
         if (ext === 'pptx') {
           const r = await pptxToParts(fileUrl);
           if (!r) return { ...base, kind: 'empty' };
-          // 混合回傳：文字 + 圖片 blocks（上層會同時塞進 messages）
-          return { ...base, kind: 'pptx', text: r.text, blocks: r.blocks, note: `（PPTX 半解：文字 + ${r.totalImages} 張內嵌圖，版面配置已遺失）` };
+          // Gemini 統一描述(失敗時 description 為 null,Claude 會 fallback 回 text+blocks)
+          const description = await geminiDescribePptx(r, fileName);
+          return { ...base, kind: 'pptx', text: r.text, blocks: r.blocks, description, note: `(PPTX 半解:文字 + ${r.totalImages} 張內嵌圖,版面配置已遺失)` };
         }
 
         if (ext === 'pdf') {
           const r = await pdfToImageBlocks(fileUrl);
           if (!r || !r.blocks.length) return { ...base, kind: 'empty' };
-          return { ...base, kind: 'vision', blocks: r.blocks, totalPages: r.totalPages, includedPages: r.includedPages, note: r.totalPages > r.includedPages ? `（共 ${r.totalPages} 頁，只分析前 ${r.includedPages} 頁）` : '' };
+          // PDF 送整份原檔給 Gemini(原生支援)
+          const description = await geminiDescribePdf(fileUrl, fileName);
+          return { ...base, kind: 'vision', blocks: r.blocks, description, totalPages: r.totalPages, includedPages: r.includedPages, note: r.totalPages > r.includedPages ? `(共 ${r.totalPages} 頁,只分析前 ${r.includedPages} 頁)` : '' };
         }
 
         if (['png', 'jpg', 'jpeg', 'webp', 'gif'].includes(ext)) {
@@ -258,28 +514,31 @@
           const blob = await res.blob();
           const data = await blobToBase64(blob);
           const mime = ext === 'jpg' ? 'image/jpeg' : `image/${ext}`;
-          // 圖片原檔已在 Storage（file_url 就是 public URL）,Notion 可直接用 originalUrl,不需重傳
-          return { ...base, kind: 'vision', blocks: [{ type: 'image', source: { type: 'base64', media_type: mime, data } }], isDirectImage: true };
+          // 圖片原檔已在 Storage(file_url 就是 public URL),Notion 可直接用 originalUrl,不需重傳
+          const description = await geminiDescribeImage(fileUrl, mime, fileName);
+          return { ...base, kind: 'vision', blocks: [{ type: 'image', source: { type: 'base64', media_type: mime, data } }], description, isDirectImage: true };
         }
 
         if (ext === 'docx') {
-          if (typeof mammoth === 'undefined') return { ...base, kind: 'empty' };
-          const res = await fetch(fileUrl);
-          if (!res.ok) return { ...base, kind: 'empty' };
-          const buf = await res.arrayBuffer();
-          const result = await mammoth.extractRawText({ arrayBuffer: buf });
-          return { ...base, kind: 'text', text: result.value || '' };
+          const r = await docxToParts(fileUrl);
+          if (!r || (!r.text && (!r.blocks || !r.blocks.length))) return { ...base, kind: 'empty' };
+          // Gemini 吃文字 + 內嵌圖,描述會連圖一起分析
+          const description = await geminiDescribeDocx(r.text, fileName, r.blocks);
+          const note = r.totalImages > 0 ? `(DOCX:文字 + ${r.totalImages} 張內嵌圖)` : '';
+          return { ...base, kind: 'docx', text: r.text, blocks: r.blocks, description, note };
         }
 
         if (['txt', 'md', 'rtf'].includes(ext)) {
           const res = await fetch(fileUrl);
           if (!res.ok) return { ...base, kind: 'empty' };
-          return { ...base, kind: 'text', text: await res.text() };
+          const text = await res.text();
+          const description = await geminiDescribeDocx(text, fileName);
+          return { ...base, kind: 'text', text, description };
         }
 
         return { ...base, kind: 'empty' };
       } catch (e) {
-        console.warn('附件抽取失敗：', fileName, e.message);
+        console.warn('附件抽取失敗:', fileName, e.message);
         return { ...base, kind: 'empty' };
       }
     };
@@ -299,6 +558,7 @@
             note: part.note || '',
             hint: part.hint || '',
             text: part.text || '',
+            description: part.description || '', // Gemini 產出的統一描述
             images: [],
           };
 
@@ -316,7 +576,7 @@
               const url = await uploadRenderedToStorage(projectId, `${stem}-p${i + 1}.jpg`, blob, b.source.media_type);
               if (url) att.images.push({ url, caption: `${part.fileName} – 第 ${i + 1} 頁` });
             }
-          } else if (part.kind === 'pptx' && part.blocks?.length) {
+          } else if ((part.kind === 'pptx' || part.kind === 'docx') && part.blocks?.length) {
             const stem = safeStem(part.fileName);
             for (let i = 0; i < part.blocks.length; i++) {
               const b = part.blocks[i];
@@ -566,135 +826,254 @@
     }
 
     // ─── HOME ────────────────────────────────────────────────────────────────────
+    // 邀請制白名單模型(2026-04-25 起):
+    //   - 進入 MeetKit 必須先 magic-link 登入(LoginGate 擋在外)
+    //   - 首頁顯示兩份清單:
+    //       🧑‍💼 我建立的會議(owner_email = 我)
+    //       📨 我被邀請的會議(project_members.member_email = 我,經 RLS 自動 filter)
+    //   - 不再有「6 碼代碼輸入加入」的 UI,因為 RLS 會擋沒被邀請的 email
+    //   - 建立新專案時直接填與會者 email 清單,Edge Function 會自動寄 MeetKit 邀請信
     function Home({ onEnter }) {
-      const [joinCode,  setJoinCode]  = useState('');
-      const [password,  setPassword]  = useState('');
-      const [creating,  setCreating]  = useState(false);
-      const [showPwField, setShowPwField] = useState(false);
-      const [recent, setRecent] = useState(() => {
-        try { return JSON.parse(localStorage.getItem('mk_recent_projects') || '[]'); } catch { return []; }
-      });
-      const [recentTitles, setRecentTitles] = useState({});
+      const [myProjects, setMyProjects] = useState([]);
+      const [invitedProjects, setInvitedProjects] = useState([]);
+      const [showCreateForm, setShowCreateForm] = useState(false);
+      const [newTitle, setNewTitle] = useState('');
+      const [inviteEmailsInput, setInviteEmailsInput] = useState('');
+      const [creating, setCreating] = useState(false);
+      const [sendMsg, setSendMsg] = useState('');
+
+      const myEmail = (currentSession?.user?.email || '').toLowerCase();
 
       useEffect(() => {
-        if (recent.length === 0) return;
-        const codes = recent.map(p => p.id).join(',');
-        db(`projects?code=in.(${codes})&select=code,title`)
-          .then(r => r.json()).then(data => {
-            const map = {};
-            data.forEach(p => { map[p.code] = p.title; });
-            setRecentTitles(map);
-          }).catch(() => {});
-      }, []);
+        if (!myEmail) return;
+        // 單一 query:RLS 會回傳所有「我 owner OR 我是成員」的專案,前端再切成兩堆
+        // 注意:projects 沒有 code 欄位,id 本身就是 6 碼專案代碼(例如 A3X9KP)
+        db(`projects?select=id,title,meeting_date,owner_email&order=meeting_date.desc,id.asc`)
+          .then(async r => {
+            if (!r.ok) {
+              const errBody = await r.text().catch(() => '');
+              console.error('[Home] 載入專案失敗', r.status, errBody);
+              return null;
+            }
+            return r.json();
+          }).then(data => {
+            if (!Array.isArray(data)) {
+              console.warn('[Home] projects 回傳不是陣列:', data);
+              return;
+            }
+            console.log('[Home] 載到', data.length, '個專案');
+            const mine = [];
+            const invited = [];
+            for (const p of data) {
+              if ((p.owner_email || '').toLowerCase() === myEmail) mine.push(p);
+              else invited.push(p);
+            }
+            setMyProjects(mine);
+            setInvitedProjects(invited);
+          }).catch(err => {
+            console.error('[Home] 網路/JSON 錯誤', err);
+          });
+      }, [myEmail]);
 
-      const removeRecent = (id, e) => {
-        e.stopPropagation();
-        const updated = recent.filter(p => p.id !== id);
-        setRecent(updated);
-        localStorage.setItem('mk_recent_projects', JSON.stringify(updated));
+      // 把使用者輸入的 email 清單切乾淨(逗號/分號/空白/換行都當分隔)
+      const parseInviteEmails = (s) => {
+        const list = s.split(/[\s,;\n]+/).map(x => x.trim().toLowerCase()).filter(Boolean);
+        const valid = list.filter(x => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(x));
+        return [...new Set(valid)]; // 去重
       };
+
+      const parsedInvitees = parseInviteEmails(inviteEmailsInput).filter(e => e !== myEmail);
 
       const createProject = async () => {
         setCreating(true);
+        setSendMsg('');
         const id = genId();
+        const ownerEmail = currentSession?.user?.email || null;
+        const title = newTitle.trim() || '未命名專案';
+
         try {
-          await db('projects', {
+          // 1) 建專案(RLS 會檢查 owner_email 必須 = 我的 email)
+          const pRes = await db('projects', {
             method: 'POST',
-            body: JSON.stringify({ id, title: '未命名專案', password: password.trim() }),
+            body: JSON.stringify({ id, title, owner_email: ownerEmail }),
           });
-        } catch {}
+          if (!pRes.ok) {
+            const err = await pRes.text().catch(() => '');
+            throw new Error(`建立專案失敗 (${pRes.status}) ${err.slice(0, 200)}`);
+          }
+
+          // 2) 加入成員(如果有填)
+          if (parsedInvitees.length > 0) {
+            const rows = parsedInvitees.map(email => ({
+              project_id: id,
+              member_email: email,
+              added_by: ownerEmail,
+            }));
+            const mRes = await db('project_members', {
+              method: 'POST',
+              headers: { Prefer: 'return=minimal' },
+              body: JSON.stringify(rows),
+            });
+            if (!mRes.ok) {
+              // 不擋建立,只印警告(專案建成了,可以之後再加人)
+              console.warn('加入成員失敗:', mRes.status, await mRes.text().catch(() => ''));
+              setSendMsg('⚠️ 專案建成了,但加入成員失敗,請進專案後手動再加');
+            } else {
+              // 3) 寄邀請信(fire-and-forget,不等回應)
+              fetch(`${EDGE_BASE}/send-invite`, {
+                method: 'POST',
+                headers: {
+                  'Authorization': `Bearer ${getBearer()}`,
+                  'apikey': SB_KEY,
+                  'Content-Type': 'application/json',
+                },
+                body: JSON.stringify({
+                  projectCode: id,
+                  projectTitle: title,
+                  senderEmail: ownerEmail,
+                  senderName: ownerEmail ? ownerEmail.split('@')[0] : '',
+                  recipientEmails: parsedInvitees,
+                }),
+              }).then(r => r.json()).then(r => {
+                console.log('[send-invite]', r);
+              }).catch(e => console.warn('寄邀請信失敗:', e));
+            }
+          }
+        } catch (e) {
+          alert(`建立失敗:${e.message || e}`);
+          setCreating(false);
+          return;
+        }
         sessionStorage.setItem(`mk_auth_${id}`, '1');
         onEnter(id);
         setCreating(false);
       };
 
-      const joinProject = () => {
-        const code = joinCode.trim().toUpperCase();
-        if (code.length >= 4) onEnter(code);
-      };
+      const renderProjectItem = (p) => (
+        <div key={p.id} style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '9px 12px', background: C.bgInput, borderRadius: 8, border: `1px solid ${C.border}`, cursor: 'pointer', transition: 'border-color 0.15s' }}
+          onClick={() => onEnter(p.code || p.id)}
+          onMouseEnter={e => e.currentTarget.style.borderColor = C.accent + '66'}
+          onMouseLeave={e => e.currentTarget.style.borderColor = C.border}>
+          <div style={{ flex: 1, minWidth: 0 }}>
+            <div style={{ fontSize: 14, fontWeight: 500, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+              {p.title || '(未命名)'}
+            </div>
+            <div style={{ fontSize: 11, color: C.textMut, fontFamily: 'monospace', letterSpacing: '0.08em', marginTop: 2 }}>
+              {p.code || p.id}{p.meeting_date ? `　·　${p.meeting_date}` : ''}
+            </div>
+          </div>
+        </div>
+      );
 
       return (
-        <div style={{ minHeight: '100vh', display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', padding: 24 }}>
-          <div style={{ marginBottom: 48, textAlign: 'center' }}>
+        <div style={{ minHeight: '100vh', display: 'flex', flexDirection: 'column', alignItems: 'center', padding: '40px 24px' }}>
+          <div style={{ marginBottom: 32, textAlign: 'center' }}>
             <div style={{ fontSize: 48, marginBottom: 12 }}>◈</div>
             <div style={{ fontSize: 28, fontWeight: 700, letterSpacing: '-0.03em', color: C.text }}>MeetKit</div>
             <div style={{ fontSize: 14, color: C.textSec, marginTop: 8 }}>小團隊會議管理系統</div>
           </div>
 
-          <div style={{ width: '100%', maxWidth: 420, display: 'flex', flexDirection: 'column', gap: 16 }}>
+          <div style={{ width: '100%', maxWidth: 460, display: 'flex', flexDirection: 'column', gap: 16 }}>
 
-            {/* 最近使用的專案 */}
-            {recent.length > 0 && (
+            {/* 我建立的會議 */}
+            {myProjects.length > 0 && (
               <div style={S.panel}>
-                <div style={{ fontSize: 15, fontWeight: 600, marginBottom: 12 }}>🕐 最近使用</div>
-                <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
-                  {recent.map(p => (
-                    <div key={p.id} style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '9px 12px', background: C.bgInput, borderRadius: 8, border: `1px solid ${C.border}`, cursor: 'pointer', transition: 'border-color 0.15s' }}
-                      onClick={() => onEnter(p.id)}
-                      onMouseEnter={e => e.currentTarget.style.borderColor = C.accent + '66'}
-                      onMouseLeave={e => e.currentTarget.style.borderColor = C.border}>
-                      <div style={{ flex: 1, minWidth: 0 }}>
-                        <div style={{ fontSize: 14, fontWeight: 500, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                          {recentTitles[p.id] || '載入中…'}
-                        </div>
-                        <div style={{ fontSize: 11, color: C.textMut, fontFamily: 'monospace', letterSpacing: '0.08em', marginTop: 2 }}>{p.id}</div>
-                      </div>
-                      <button style={{ ...btn('ghost'), padding: '2px 7px', fontSize: 12, color: C.textMut, borderColor: 'transparent', flexShrink: 0 }}
-                        onClick={e => removeRecent(p.id, e)}>✕</button>
-                    </div>
-                  ))}
+                <div style={{ fontSize: 15, fontWeight: 600, marginBottom: 12, display: 'flex', alignItems: 'center', gap: 6 }}>
+                  🧑‍💼 我建立的會議
+                  <span style={{ fontSize: 11, color: C.textMut, fontWeight: 400 }}>({myProjects.length})</span>
+                </div>
+                <div style={{ display: 'flex', flexDirection: 'column', gap: 6, maxHeight: 280, overflowY: 'auto' }}>
+                  {myProjects.map(renderProjectItem)}
                 </div>
               </div>
             )}
 
-            {/* 建立新專案 */}
-            <div style={S.panel}>
-              <div style={{ fontSize: 15, fontWeight: 600, marginBottom: 6 }}>建立新專案</div>
-              <div style={{ fontSize: 13, color: C.textSec, marginBottom: 16, lineHeight: 1.6 }}>
-                系統會產生一組專屬代碼，分享給與會者即可加入。
-              </div>
-              {showPwField ? (
-                <div style={{ marginBottom: 12 }}>
-                  <label style={S.label}>專案密碼（選填）</label>
-                  <input
-                    style={S.input} type="password" placeholder="留空則無密碼保護"
-                    value={password} onChange={e => setPassword(e.target.value)}
-                    autoFocus
-                  />
+            {/* 我被邀請的會議 */}
+            {invitedProjects.length > 0 && (
+              <div style={S.panel}>
+                <div style={{ fontSize: 15, fontWeight: 600, marginBottom: 12, display: 'flex', alignItems: 'center', gap: 6 }}>
+                  📨 我被邀請的會議
+                  <span style={{ fontSize: 11, color: C.textMut, fontWeight: 400 }}>({invitedProjects.length})</span>
                 </div>
-              ) : (
-                <button style={{ ...btn('ghost'), fontSize: 12, marginBottom: 12, padding: '6px 12px' }} onClick={() => setShowPwField(true)}>
-                  🔒 設定密碼保護（選填）
-                </button>
-              )}
-              <button
-                style={{ ...btn('primary'), width: '100%', padding: 13, fontSize: 15, opacity: creating ? 0.7 : 1 }}
-                onClick={createProject} disabled={creating}
-              >
-                {creating ? <><Spinner /> 建立中…</> : '＋ 建立新專案'}
-              </button>
-            </div>
+                <div style={{ display: 'flex', flexDirection: 'column', gap: 6, maxHeight: 280, overflowY: 'auto' }}>
+                  {invitedProjects.map(renderProjectItem)}
+                </div>
+              </div>
+            )}
 
-            <div style={{ textAlign: 'center', fontSize: 13, color: C.textMut }}>或</div>
-
-            {/* 加入專案 */}
+            {/* 建立新會議 */}
             <div style={S.panel}>
-              <div style={{ fontSize: 15, fontWeight: 600, marginBottom: 16 }}>加入現有專案</div>
-              <input
-                style={S.input}
-                placeholder="輸入 6 碼專案代碼（例：A3X9KP）"
-                value={joinCode}
-                onChange={e => setJoinCode(e.target.value.toUpperCase())}
-                onKeyDown={e => e.key === 'Enter' && joinProject()}
-                maxLength={8}
-              />
-              <button
-                style={{ ...btn('default'), width: '100%', marginTop: 12, padding: 11 }}
-                onClick={joinProject} disabled={joinCode.trim().length < 4}
-              >
-                加入專案 →
-              </button>
+              {!showCreateForm ? (
+                <button
+                  style={{ ...btn('primary'), width: '100%', padding: 14, fontSize: 15 }}
+                  onClick={() => setShowCreateForm(true)}
+                >
+                  ＋ 建立新會議
+                </button>
+              ) : (
+                <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+                  <div style={{ fontSize: 15, fontWeight: 600 }}>建立新會議專案</div>
+
+                  <div>
+                    <label style={S.label}>專案名稱</label>
+                    <input
+                      style={S.input}
+                      placeholder="例:SIPAI 第三次討論會"
+                      value={newTitle}
+                      onChange={e => setNewTitle(e.target.value)}
+                      autoFocus
+                    />
+                  </div>
+
+                  <div>
+                    <label style={S.label}>
+                      與會者 Email
+                      <span style={{ fontSize: 11, color: C.textMut, fontWeight: 400 }}>
+                        每行一個,或用逗號/空白分隔;留空可之後再加
+                      </span>
+                    </label>
+                    <textarea
+                      style={{ ...S.input, minHeight: 90, fontFamily: 'inherit', resize: 'vertical' }}
+                      placeholder={`a@example.com\nb@example.com`}
+                      value={inviteEmailsInput}
+                      onChange={e => setInviteEmailsInput(e.target.value)}
+                    />
+                    {parsedInvitees.length > 0 && (
+                      <div style={{ fontSize: 12, color: C.textSec, marginTop: 6 }}>
+                        ✓ 將寄邀請給 <b>{parsedInvitees.length}</b> 位與會者:
+                        <span style={{ fontFamily: 'monospace', color: C.textMut }}>　{parsedInvitees.slice(0, 3).join(', ')}{parsedInvitees.length > 3 ? '…' : ''}</span>
+                      </div>
+                    )}
+                  </div>
+
+                  {sendMsg && <div style={{ fontSize: 12, color: C.textSec }}>{sendMsg}</div>}
+
+                  <div style={{ display: 'flex', gap: 8 }}>
+                    <button
+                      style={{ ...btn('primary'), flex: 1, padding: 12, fontSize: 14, opacity: creating ? 0.7 : 1 }}
+                      onClick={createProject}
+                      disabled={creating}
+                    >
+                      {creating ? <><Spinner /> 建立中…</> : (parsedInvitees.length > 0 ? '建立並寄邀請信' : '建立會議')}
+                    </button>
+                    <button
+                      style={{ ...btn('ghost'), padding: '12px 16px', fontSize: 14 }}
+                      onClick={() => { setShowCreateForm(false); setNewTitle(''); setInviteEmailsInput(''); setSendMsg(''); }}
+                      disabled={creating}
+                    >
+                      取消
+                    </button>
+                  </div>
+                </div>
+              )}
             </div>
+
+            {myProjects.length === 0 && invitedProjects.length === 0 && !showCreateForm && (
+              <div style={{ fontSize: 13, color: C.textMut, textAlign: 'center', padding: '8px 12px', lineHeight: 1.6 }}>
+                你還沒有任何會議。<br/>
+                建立一個新會議,把與會者 email 填進去,他們就能用各自的 email 登入加入會議。
+              </div>
+            )}
           </div>
         </div>
       );
@@ -833,8 +1212,30 @@
       const [expanded, setExpanded] = useState({});
       const [cardUploading, setCardUploading] = useState({});
       const [toast, setToast] = useState('');
-      const [publicUrl, setPublicUrl] = useState(() => localStorage.getItem('mk_public_url') || '');
-      const [slackWebhook, setSlackWebhook] = useState(() => localStorage.getItem('mk_slack_webhook') || '');
+      // (2026-04-25 Route C 清理)原有「公開網址」「Slack Webhook」兩個 state 已拿掉:
+      //   - 分享連結改用 window.location 自動組,不需要使用者填
+      //   - Slack 通知已被邀請信 (Resend) 取代,日後要整合 Slack 再另外做
+      // Route C:此專案要同步到哪個 Notion 頁(pageId 或完整 URL)
+      // 空值 = 沿用舊行為(notion-sync 用 NOTION_DB_ID env 寫到預設資料庫)
+      const [notionTarget, setNotionTarget] = useState('');
+      const [notionTargetTitle, setNotionTargetTitle] = useState('');
+      const [notionTesting, setNotionTesting] = useState(false);
+      const [notionMsg, setNotionMsg] = useState('');
+      // 邀請白名單:此專案的 owner + members
+      const [projectOwnerEmail, setProjectOwnerEmail] = useState('');
+      const [members, setMembers] = useState([]);
+      const [addEmailsInput, setAddEmailsInput] = useState('');
+      const [addingMembers, setAddingMembers] = useState(false);
+      const [membersMsg, setMembersMsg] = useState('');
+      // 重寄邀請中的 email(避免同一列 double-click;一次只寄一封,UI 顯示「…」)
+      const [resendingEmail, setResendingEmail] = useState('');
+      // 寄送時機:'now' 立即送 / 'schedule' 排程到指定時間
+      // scheduledAt 存 <input type="datetime-local"> 的本地時間字串(YYYY-MM-DDTHH:mm)
+      // 送給 Edge Function 前會用 toUtcIso 轉成 UTC ISO,Resend 的 scheduled_at 接 UTC
+      const [scheduleMode, setScheduleMode] = useState('now');
+      const [scheduledAt, setScheduledAt] = useState('');
+      const myEmail = (currentSession?.user?.email || '').toLowerCase();
+      const isOwner = !!projectOwnerEmail && projectOwnerEmail.toLowerCase() === myEmail;
       const [showUrlInput, setShowUrlInput] = useState(false);
       const [showDatePicker, setShowDatePicker] = useState(false);
       const [showJournalRef, setShowJournalRef] = useState(false);
@@ -847,6 +1248,249 @@
       useEffect(() => {
         if (!projectId) return;
       }, [projectId]);
+
+      // ─── Notion 目標頁 + 專案 owner_email ──────────────────────────────
+      // 載入該專案儲存過的 Notion parent page id 和 owner_email(後者決定使用者是否能改成員)
+      useEffect(() => {
+        if (!projectId) return;
+        db(`projects?id=eq.${projectId}&select=notion_parent_page_id,owner_email`)
+          .then(r => r.json()).then(d => {
+            const v = d?.[0]?.notion_parent_page_id || '';
+            if (v) setNotionTarget(v);
+            setProjectOwnerEmail(d?.[0]?.owner_email || '');
+          }).catch(() => {});
+      }, [projectId]);
+
+      // ─── Members 管理 ─────────────────────────────────────────────────
+      // 載入成員清單;RLS 會讓 owner 看到全部,member 只看到自己那一行
+      const loadMembers = useCallback(() => {
+        if (!projectId) return;
+        db(`project_members?project_id=eq.${projectId}&select=member_email,added_by,added_at&order=added_at.asc`)
+          .then(r => r.json()).then(d => {
+            if (Array.isArray(d)) setMembers(d);
+          }).catch(() => {});
+      }, [projectId]);
+
+      useEffect(() => { loadMembers(); }, [loadMembers]);
+
+      // ─── 排程寄送 helpers ──────────────────────────────────────
+      // datetime-local 字串(無時區,瀏覽器當本地時間解讀)→ UTC ISO
+      // Resend 的 scheduled_at 接 UTC ISO 或 natural language,這裡統一用 UTC ISO 最穩
+      const toUtcIso = (localStr) => {
+        if (!localStr) return '';
+        const d = new Date(localStr);
+        if (isNaN(d.getTime())) return '';
+        return d.toISOString();
+      };
+      // Date → datetime-local input 接受的格式 YYYY-MM-DDTHH:mm
+      const toLocalInput = (d) => {
+        const pad = n => String(n).padStart(2, '0');
+        return `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
+      };
+      // 預設:明天早上 09:00
+      const presetTomorrow9am = () => {
+        const d = new Date();
+        d.setDate(d.getDate() + 1);
+        d.setHours(9, 0, 0, 0);
+        setScheduledAt(toLocalInput(d));
+      };
+      // 預設:下個週一早上 09:00(今天本身是週一則跳到下週一)
+      const presetNextMonday9am = () => {
+        const d = new Date();
+        const dow = d.getDay();                          // 0=Sun 1=Mon … 6=Sat
+        const add = dow === 1 ? 7 : (dow === 0 ? 1 : 8 - dow);
+        d.setDate(d.getDate() + add);
+        d.setHours(9, 0, 0, 0);
+        setScheduledAt(toLocalInput(d));
+      };
+      // 預設:會議日期前 2 天早上 09:00(沒設會議日期就不做)
+      const presetTwoDaysBeforeMeeting = () => {
+        if (!meetingDate) return;
+        const d = new Date(meetingDate + 'T00:00:00');
+        d.setDate(d.getDate() - 2);
+        d.setHours(9, 0, 0, 0);
+        setScheduledAt(toLocalInput(d));
+      };
+
+      // 新增成員:驗證 email → INSERT → 寄邀請信(立即或排程) → 重新載入
+      const addMembers = async () => {
+        const list = addEmailsInput.split(/[\s,;\n]+/).map(x => x.trim().toLowerCase()).filter(Boolean);
+        const valid = [...new Set(list.filter(x => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(x)))];
+        // 排除已經是 owner / 已在名單的
+        const existing = new Set(members.map(m => (m.member_email || '').toLowerCase()));
+        const newOnes = valid.filter(e => e !== projectOwnerEmail.toLowerCase() && !existing.has(e));
+        if (newOnes.length === 0) {
+          setMembersMsg('⚠ 沒有新的有效 email(可能都已在名單中)');
+          return;
+        }
+        setAddingMembers(true);
+        setMembersMsg('');
+        try {
+          const rows = newOnes.map(email => ({
+            project_id: projectId,
+            member_email: email,
+            added_by: myEmail || null,
+          }));
+          const res = await db('project_members', {
+            method: 'POST',
+            headers: { Prefer: 'return=minimal' },
+            body: JSON.stringify(rows),
+          });
+          if (!res.ok) {
+            const err = await res.text().catch(() => '');
+            throw new Error(`${res.status} ${err.slice(0, 200)}`);
+          }
+          // 寄邀請信(fire and forget)
+          // scheduledIso 有值 → Edge Function 會傳 Resend 的 scheduled_at,排程到指定時間;空值 = 立即
+          const scheduledIso = scheduleMode === 'schedule' ? toUtcIso(scheduledAt) : '';
+          fetch(`${EDGE_BASE}/send-invite`, {
+            method: 'POST',
+            headers: {
+              'Authorization': `Bearer ${getBearer()}`,
+              'apikey': SB_KEY,
+              'Content-Type': 'application/json',
+            },
+            body: JSON.stringify({
+              projectCode: projectId,
+              projectTitle: projectTitle || '未命名專案',
+              meetingDate: meetingDate || '',
+              meetingTime: meetingTime || '',
+              senderEmail: myEmail,
+              senderName: myEmail ? myEmail.split('@')[0] : '',
+              recipientEmails: newOnes,
+              scheduledAt: scheduledIso,
+            }),
+          }).then(r => r.json()).then(r => console.log('[send-invite]', r)).catch(e => console.warn('寄邀請信失敗:', e));
+
+          const whenMsg = scheduledIso
+            ? `,將於 ${scheduledAt.replace('T', ' ')} 寄出`
+            : ',邀請信寄送中';
+          setMembersMsg(`✓ 已新增 ${newOnes.length} 位成員${whenMsg}`);
+          setAddEmailsInput('');
+          loadMembers();
+        } catch (e) {
+          setMembersMsg(`❌ ${e.message || '新增失敗'}`);
+        } finally {
+          setAddingMembers(false);
+        }
+      };
+
+      const removeMember = async (email) => {
+        if (!isOwner) return;
+        if (!confirm(`確定要把 ${email} 從這個專案移除嗎?`)) return;
+        try {
+          const res = await db(`project_members?project_id=eq.${projectId}&member_email=eq.${encodeURIComponent(email)}`, {
+            method: 'DELETE',
+          });
+          if (!res.ok) throw new Error(`${res.status}`);
+          setMembersMsg(`✓ 已移除 ${email}`);
+          loadMembers();
+        } catch (e) {
+          setMembersMsg(`❌ 移除失敗:${e.message || e}`);
+        }
+      };
+
+      // 重寄邀請信:只觸發 send-invite,不動 DB
+      // 使用情境:成員說「我沒收到信」「誤刪了」「垃圾信撈不到」
+      // 注意和 addMembers 的差異 — 這裡跳過 INSERT,因為 email 早就在 project_members 了
+      const resendInvite = async (email) => {
+        if (!isOwner || !email) return;
+        setResendingEmail(email);
+        setMembersMsg('');
+        try {
+          const res = await fetch(`${EDGE_BASE}/send-invite`, {
+            method: 'POST',
+            headers: {
+              'Authorization': `Bearer ${getBearer()}`,
+              'apikey': SB_KEY,
+              'Content-Type': 'application/json',
+            },
+            body: JSON.stringify({
+              projectCode: projectId,
+              projectTitle: projectTitle || '未命名專案',
+              meetingDate: meetingDate || '',
+              meetingTime: meetingTime || '',
+              senderEmail: myEmail,
+              senderName: myEmail ? myEmail.split('@')[0] : '',
+              recipientEmails: [email],
+            }),
+          });
+          const r = await res.json().catch(() => ({}));
+          if (r?.ok && Array.isArray(r.sent) && r.sent.length > 0) {
+            setMembersMsg(`✓ 已重寄邀請到 ${email}`);
+          } else {
+            const reason = r?.failed?.[0]?.error || r?.error || `HTTP ${res.status}`;
+            setMembersMsg(`❌ 重寄失敗:${reason}`);
+          }
+        } catch (e) {
+          setMembersMsg(`❌ 重寄失敗:${e.message || e}`);
+        } finally {
+          setResendingEmail('');
+        }
+      };
+
+      // 從 Notion URL 或 raw id 抓出 32 字元 page id
+      // 支援:
+      //   - https://www.notion.so/Page-Title-abc123def456...
+      //   - https://www.notion.so/workspace/abc123def456...
+      //   - abc123def456...(直接貼 32 hex)
+      //   - abc123de-f456-...(連字號格式)
+      const parseNotionPageId = (raw) => {
+        if (!raw) return '';
+        const s = raw.trim();
+        // 先抓 32 hex 或 UUID 風格
+        const m = s.match(/([0-9a-f]{32}|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/i);
+        if (!m) return '';
+        return m[1].replace(/-/g, '').toLowerCase();
+      };
+
+      // 測試 + 儲存 Notion 目標頁
+      // 流程:1) parse page id 2) 呼叫 notion-fetch test 確認可讀 3) 存進 projects.notion_parent_page_id
+      const saveNotionTarget = async () => {
+        const pageId = parseNotionPageId(notionTarget);
+        if (!pageId) {
+          setNotionMsg('⚠ 找不到有效的 Notion page id(貼 Notion 頁面完整 URL 最穩)');
+          return;
+        }
+        setNotionTesting(true);
+        setNotionMsg('');
+        try {
+          // 先 test 能不能讀
+          const testRes = await fetch(`${EDGE_BASE}/notion-fetch`, {
+            method: 'POST',
+            headers: EDGE_HEADERS,
+            body: JSON.stringify({ pageId, test: true }),
+          });
+          const testData = await testRes.json();
+          if (!testData.ok) {
+            setNotionMsg(`❌ ${testData.hint || testData.error || '無法讀取該頁'}`);
+            setNotionTesting(false);
+            return;
+          }
+          // 存回 DB
+          await db(`projects?id=eq.${projectId}`, {
+            method: 'PATCH',
+            body: JSON.stringify({ notion_parent_page_id: pageId }),
+          });
+          setNotionTargetTitle(testData.title || '');
+          setNotionMsg(`✓ 已連到「${testData.title || pageId}」,之後歸檔會同步到這頁底下`);
+        } catch (e) {
+          setNotionMsg(`❌ ${e.message || '連線失敗'}`);
+        } finally {
+          setNotionTesting(false);
+        }
+      };
+
+      const clearNotionTarget = async () => {
+        setNotionTarget('');
+        setNotionTargetTitle('');
+        setNotionMsg('');
+        await db(`projects?id=eq.${projectId}`, {
+          method: 'PATCH',
+          body: JSON.stringify({ notion_parent_page_id: null }),
+        });
+        showToast('✓ 已取消 Notion 目標頁,歸檔會改寫到預設資料庫');
+      };
 
       const loadProposals = useCallback(async () => {
         try {
@@ -972,21 +1616,6 @@
         await db(`projects?id=eq.${projectId}`, { method: 'PATCH', body: JSON.stringify({ meeting_date: date, meeting_time: time }) });
       };
 
-      const savePublicUrl = (val) => {
-        const clean = val.trim().replace(/\?.*$/, '').replace(/\/$/, '');
-        setPublicUrl(clean);
-        localStorage.setItem('mk_public_url', clean);
-        setShowUrlInput(false);
-        showToast('✓ 網址已儲存');
-      };
-
-      const saveSlackWebhook = (val) => {
-        const clean = val.trim();
-        setSlackWebhook(clean);
-        localStorage.setItem('mk_slack_webhook', clean);
-        showToast(clean ? '✓ Slack Webhook 已儲存' : '✓ Slack 通知已關閉');
-      };
-
       const openNewRound = async () => {
         if (proposals.length > 0) {
           await Promise.all(proposals.map(p => db(`proposals?id=eq.${p.id}`, { method: 'DELETE' }).catch(() => {})));
@@ -995,36 +1624,9 @@
         showToast('✓ 準備室已開啟！');
       };
 
-      const sendNotice = () => {
-        const isLocal = window.location.protocol === 'file:' || window.location.hostname === 'localhost';
-        const base = publicUrl || (isLocal ? null : `${window.location.origin}${window.location.pathname}`);
-        if (!base) { showToast('⚠ 請先設定公開網址（點 ⚙）'); return; }
-        const url = `${base}?p=${projectId}`;
-        const weekdays = ['日','一','二','三','四','五','六'];
-        const dateObj = meetingDate ? new Date(meetingDate + 'T00:00') : null;
-        const shortDate = dateObj ? `${dateObj.getMonth()+1}/${dateObj.getDate()}(${weekdays[dateObj.getDay()]})` : '';
-        const timeStr = meetingTime || '';
-        const roomTitle = [shortDate, timeStr].filter(Boolean).join(' ') + '會議準備室';
-
-        // 複製到剪貼簿
-        navigator.clipboard.writeText(`${roomTitle}\n${url}`).catch(() => {});
-
-        // 發送到 Slack（若有設定 Webhook）
-        if (slackWebhook) {
-          const payload = JSON.stringify({
-            text: `📅 *${roomTitle}*\n請至以下連結提交議程提案：\n${url}`
-          });
-          fetch(slackWebhook, {
-            method: 'POST',
-            mode: 'no-cors',
-            headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-            body: `payload=${encodeURIComponent(payload)}`
-          }).catch(() => {});
-          showToast('✓ 開會通知已發送到 Slack！');
-        } else {
-          showToast('✓ 開會通知已複製！');
-        }
-      };
+      // (2026-04-25 Route C 清理)原 savePublicUrl / saveSlackWebhook / sendNotice 已拿掉:
+      //   - 分享不再靠「複製連結貼給人」— 同事登入後會在「我被邀請的會議」看到這個專案直接點進
+      //   - Slack 通知已被邀請信取代;要整合 Slack 以後再說
 
       return (
         <div style={{ maxWidth: 1100, margin: '0 auto', padding: '28px 20px' }}>
@@ -1053,7 +1655,6 @@
                 <input type="date" style={{ ...S.input, width: 'auto', fontSize: 13, colorScheme: 'dark' }} value={meetingDate} onChange={e => { setMeetingDate(e.target.value); saveMeetingInfo(e.target.value, meetingTime); }} />
                 <input type="time" style={{ ...S.input, width: 'auto', fontSize: 13, colorScheme: 'dark' }} value={meetingTime} onChange={e => { setMeetingTime(e.target.value); saveMeetingInfo(meetingDate, e.target.value); }} />
                 <button style={{ ...btn('primary'), padding: '7px 16px', fontSize: 13 }} onClick={() => { openNewRound(); setShowDatePicker(false); }}>✓ 確認開新準備室</button>
-                <button style={{ ...btn('ghost'), padding: '7px 14px', fontSize: 13 }} onClick={sendNotice}>📋 複製開會通知</button>
                 {(meetingDate || meetingTime) && (
                   <button style={{ ...btn('ghost'), padding: '6px 10px', fontSize: 12, color: C.textMut }} onClick={() => { setMeetingDate(''); setMeetingTime(''); saveMeetingInfo('', ''); }}>✕ 清除</button>
                 )}
@@ -1062,17 +1663,152 @@
 
             {showUrlInput && (
               <div style={{ marginTop: 16, paddingTop: 16, borderTop: `1px solid ${C.border}`, display: 'flex', flexDirection: 'column', gap: 10 }} className="fade-in">
+                {/* Route C:Notion 目標頁 picker — 每個專案獨立綁一個 Notion 頁 */}
                 <div style={{ display: 'flex', gap: 10, alignItems: 'center' }}>
-                  <span style={{ fontSize: 12, color: C.textMut, width: 72, flexShrink: 0 }}>🔗 公開網址</span>
-                  <input defaultValue={publicUrl} placeholder="https://qmorechi.github.io/meetkit" style={{ ...S.input, flex: 1, fontSize: 12, padding: '6px 10px' }} onKeyDown={e => e.key === 'Enter' && savePublicUrl(e.target.value)} id="public-url-input" />
-                  <button style={{ ...btn('primary'), padding: '6px 12px', fontSize: 12, flexShrink: 0 }} onClick={() => savePublicUrl(document.getElementById('public-url-input').value)}>儲存</button>
+                  <span style={{ fontSize: 12, color: C.textMut, width: 72, flexShrink: 0 }}>📓 Notion</span>
+                  <input
+                    value={notionTarget}
+                    onChange={e => setNotionTarget(e.target.value)}
+                    placeholder="貼 Notion 頁面 URL(歸檔時寫到這頁底下)"
+                    style={{ ...S.input, flex: 1, fontSize: 12, padding: '6px 10px' }}
+                    onKeyDown={e => e.key === 'Enter' && saveNotionTarget()}
+                  />
+                  <button
+                    style={{ ...btn('primary'), padding: '6px 12px', fontSize: 12, flexShrink: 0, opacity: notionTesting ? 0.6 : 1 }}
+                    disabled={notionTesting}
+                    onClick={saveNotionTarget}
+                  >
+                    {notionTesting ? '測試中…' : '測試並儲存'}
+                  </button>
+                  {notionTarget && (
+                    <button
+                      style={{ ...btn('ghost'), padding: '6px 10px', fontSize: 12, flexShrink: 0, color: C.textMut }}
+                      onClick={clearNotionTarget}
+                      title="清除設定(改用預設資料庫)"
+                    >
+                      ✕
+                    </button>
+                  )}
                 </div>
-                <div style={{ display: 'flex', gap: 10, alignItems: 'center' }}>
-                  <span style={{ fontSize: 12, color: C.textMut, width: 72, flexShrink: 0 }}>🔔 Slack</span>
-                  <input defaultValue={slackWebhook} placeholder="https://hooks.slack.com/services/…" style={{ ...S.input, flex: 1, fontSize: 12, padding: '6px 10px' }} onKeyDown={e => e.key === 'Enter' && saveSlackWebhook(e.target.value)} id="slack-webhook-input" />
-                  <button style={{ ...btn('primary'), padding: '6px 12px', fontSize: 12, flexShrink: 0 }} onClick={() => saveSlackWebhook(document.getElementById('slack-webhook-input').value)}>儲存</button>
+                {notionMsg && (
+                  <div style={{ fontSize: 11, color: notionMsg.startsWith('✓') ? C.success : (notionMsg.startsWith('⚠') ? '#fa0' : '#f88'), paddingLeft: 82, lineHeight: 1.6 }}>
+                    {notionMsg}
+                  </div>
+                )}
+                <div style={{ fontSize: 10, color: C.textMut, paddingLeft: 82, lineHeight: 1.5 }}>
+                  留空 = 寫到預設 MeetKit 資料庫。
+                  先到 Notion 把該頁「⋯ → Add connections → MeetKit」分享給 integration,才能寫入。
                 </div>
-                {slackWebhook && <div style={{ fontSize: 11, color: C.success, paddingLeft: 82 }}>✓ Slack 通知已啟用</div>}
+
+                {/* 📬 與會者白名單 — 只有 owner 能加 / 移除;member 只看得到自己 */}
+                <div style={{ marginTop: 8, paddingTop: 14, borderTop: `1px dashed ${C.border}` }}>
+                  <div style={{ display: 'flex', gap: 10, alignItems: 'flex-start', marginBottom: 8 }}>
+                    <span style={{ fontSize: 12, color: C.textMut, width: 72, flexShrink: 0, paddingTop: 4 }}>📬 與會者</span>
+                    <div style={{ flex: 1, minWidth: 0 }}>
+                      {/* 現有成員清單 */}
+                      <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, marginBottom: 10 }}>
+                        {projectOwnerEmail && (
+                          <div style={{ display: 'inline-flex', alignItems: 'center', gap: 5, padding: '3px 8px', background: C.accent + '22', color: C.accent, borderRadius: 6, fontSize: 11 }}>
+                            👑 {projectOwnerEmail}
+                          </div>
+                        )}
+                        {members.map(m => (
+                          <div key={m.member_email} style={{ display: 'inline-flex', alignItems: 'center', gap: 4, padding: '3px 8px', background: C.bgInput, border: `1px solid ${C.border}`, borderRadius: 6, fontSize: 11 }}>
+                            {m.member_email}
+                            {isOwner && m.member_email !== myEmail && (
+                              <>
+                                <button
+                                  onClick={() => resendInvite(m.member_email)}
+                                  disabled={resendingEmail === m.member_email}
+                                  style={{ background: 'none', border: 'none', color: C.textMut, cursor: 'pointer', fontSize: 11, padding: 0, lineHeight: 1, opacity: resendingEmail === m.member_email ? 0.4 : 1 }}
+                                  title="重寄邀請信"
+                                >
+                                  {resendingEmail === m.member_email ? '…' : '✉'}
+                                </button>
+                                <button
+                                  onClick={() => removeMember(m.member_email)}
+                                  style={{ background: 'none', border: 'none', color: C.textMut, cursor: 'pointer', fontSize: 11, padding: 0, lineHeight: 1 }}
+                                  title="移除此成員"
+                                >
+                                  ✕
+                                </button>
+                              </>
+                            )}
+                          </div>
+                        ))}
+                        {members.length === 0 && !projectOwnerEmail && (
+                          <span style={{ fontSize: 11, color: C.textMut }}>載入中…</span>
+                        )}
+                      </div>
+
+                      {/* 新增成員(只有 owner 能操作) */}
+                      {isOwner ? (
+                        <>
+                          {/* textarea 高度固定 60-120px,內容多就內部捲動(避免整個面板被撐開) */}
+                          <textarea
+                            value={addEmailsInput}
+                            onChange={e => setAddEmailsInput(e.target.value)}
+                            placeholder={`新增成員 email(一行一個,或逗號分隔)\n例:\nalice@example.com\nbob@example.com`}
+                            style={{ ...S.input, minHeight: 60, maxHeight: 120, overflowY: 'auto', fontSize: 12, padding: '6px 10px', fontFamily: 'inherit', resize: 'none', width: '100%', boxSizing: 'border-box' }}
+                          />
+
+                          {/* 寄送時機:立即 vs 排程到指定時間(Resend scheduled_at) */}
+                          <div style={{ marginTop: 8, fontSize: 11, color: C.textSec, display: 'flex', gap: 14, alignItems: 'center', flexWrap: 'wrap' }}>
+                            <label style={{ display: 'inline-flex', alignItems: 'center', gap: 4, cursor: 'pointer' }}>
+                              <input type="radio" name={`sm-${projectId}`} checked={scheduleMode === 'now'} onChange={() => setScheduleMode('now')} />
+                              立即寄送
+                            </label>
+                            <label style={{ display: 'inline-flex', alignItems: 'center', gap: 4, cursor: 'pointer' }}>
+                              <input type="radio" name={`sm-${projectId}`} checked={scheduleMode === 'schedule'} onChange={() => setScheduleMode('schedule')} />
+                              排程到
+                            </label>
+                            {scheduleMode === 'schedule' && (
+                              <input
+                                type="datetime-local"
+                                value={scheduledAt}
+                                onChange={e => setScheduledAt(e.target.value)}
+                                style={{ ...S.input, fontSize: 11, padding: '4px 8px', width: 'auto' }}
+                              />
+                            )}
+                          </div>
+                          {/* 快捷預設時間:明天 / 下週一 / 會議前 2 天,全 09:00 */}
+                          {scheduleMode === 'schedule' && (
+                            <div style={{ display: 'flex', gap: 6, marginTop: 6, flexWrap: 'wrap' }}>
+                              <button type="button" onClick={presetTomorrow9am} style={{ ...btn('ghost'), padding: '3px 10px', fontSize: 11 }}>📅 明天 09:00</button>
+                              <button type="button" onClick={presetNextMonday9am} style={{ ...btn('ghost'), padding: '3px 10px', fontSize: 11 }}>🌅 下週一 09:00</button>
+                              {meetingDate && (
+                                <button type="button" onClick={presetTwoDaysBeforeMeeting} style={{ ...btn('ghost'), padding: '3px 10px', fontSize: 11 }}>🕘 會議前 2 天 09:00</button>
+                              )}
+                            </div>
+                          )}
+
+                          <div style={{ display: 'flex', gap: 8, marginTop: 8, alignItems: 'center', flexWrap: 'wrap' }}>
+                            <button
+                              style={{ ...btn('primary'), padding: '6px 14px', fontSize: 12, opacity: addingMembers ? 0.6 : 1 }}
+                              disabled={addingMembers || !addEmailsInput.trim() || (scheduleMode === 'schedule' && !scheduledAt)}
+                              onClick={addMembers}
+                            >
+                              {addingMembers
+                                ? '加入中…'
+                                : scheduleMode === 'schedule'
+                                  ? '＋ 加入並排程邀請信'
+                                  : '＋ 加入並寄邀請信'}
+                            </button>
+                            {membersMsg && (
+                              <span style={{ fontSize: 11, color: membersMsg.startsWith('✓') ? C.success : (membersMsg.startsWith('⚠') ? '#fa0' : '#f88') }}>
+                                {membersMsg}
+                              </span>
+                            )}
+                          </div>
+                        </>
+                      ) : (
+                        <div style={{ fontSize: 11, color: C.textMut, lineHeight: 1.5 }}>
+                          只有專案建立者(owner)可以新增或移除成員。
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                </div>
               </div>
             )}
           </div>
@@ -1844,8 +2580,10 @@
       useEffect(() => {
         if (typeof QRCode === 'undefined' || !qrRef.current) return;
         qrRef.current.innerHTML = '';
+        // QR code 指向「當前部署網址底下的 open-voicememos.html」,不再硬編碼個人帳號路徑
+        // meetkit.mx.design 開 → 產出 meetkit.mx.design/open-voicememos.html
         new QRCode(qrRef.current, {
-          text: 'https://qmorechi.github.io/meetkit/open-voicememos.html',
+          text: `${window.location.origin}${window.location.pathname.replace(/[^/]*$/, '')}open-voicememos.html`,
           width: 120, height: 120,
           colorDark: '#000000', colorLight: '#ffffff',
         });
@@ -2136,6 +2874,7 @@
         setStatus('summarizing');
 
         // 5a) 抽取每個提案的附件為 Claude content parts（文字/圖片/格式警告）
+        //     + 解析提案 content 裡的 Notion 連結,抓整頁 markdown 當額外上下文
         const proposalsWithParts = await Promise.all(proposals.map(async (p) => {
           let parts = [];
           try {
@@ -2145,14 +2884,18 @@
               parts.push(await extractAttachmentParts(urls[i], names[i] || urls[i]));
             }
           } catch {}
-          return { ...p, parts };
+          // Notion 連結:放在 content 裡面的才抓(附件 URL 不處理,避免誤抓 Supabase Storage 假 UUID)
+          const notionRefs = await fetchProposalNotionRefs(p.content || '');
+          return { ...p, parts, notionRefs };
         }));
         setProposalsParts(proposalsWithParts);
 
-        // 5b) 組 Claude content blocks（text + image 混合）
+        // 5b) 組 Claude content blocks（優先用 Gemini 描述,fallback 才塞 vision）
         const intro = `你是一位專業的會議記錄與策略分析師。以下是一場會議的完整逐字稿、議程提案與提案附件。請用繁體中文產出一份結構完整的會後文件。
 
-注意：附件中的圖片（PDF 每頁、PPTX 內嵌圖、PNG/JPG）都是提案的一部分，請結合圖片中的視覺資訊（配色、排版、圖表、示意）與文字內容共同分析，不要只看文字。如附件有格式警告（例如 .key/.pages 無法讀取），請在摘要中明確提醒使用者。
+重要:
+1. 每份提案附件都附有一段「Gemini 附件描述」,那是由視覺理解 AI 預先消化過的結構化摘要(包含整體概述、關鍵資訊、視覺元素描述、重點原文)。你可以把這段描述當作你「看過原檔」來分析。若附件有格式警告(例如 .key/.pages 無法讀取),請在摘要中明確提醒使用者。
+2. 若提案內文引用了 Notion 頁面,該頁的完整 markdown 會附在提案正文之後(以「━━━ 提案引用的 Notion 頁」開頭)。請把它當成提案的延伸資料閱讀,並在分析時引用其中的重點。
 
 ━━━ 本次議程提案 ━━━`;
 
@@ -2219,20 +2962,39 @@ ${txText}
         } else {
           proposalsWithParts.forEach((p, i) => {
             claudeBlocks.push({ type: 'text', text: `\n\n【提案 ${i + 1}】${p.title}（提案人：${p.author}）\n${p.content || '（無提案說明）'}` });
+            // 提案 content 裡的 Notion 連結 → 把整頁 markdown 當成延伸閱讀餵進 Claude
+            // 單頁內容上限 6000 字(避免吃爆 token,Notion 長頁可能 2-3 萬字)
+            for (const ref of (p.notionRefs || [])) {
+              if (ref.error) {
+                claudeBlocks.push({ type: 'text', text: `\n⚠️ 提案引用的 Notion 頁「${ref.url}」讀取失敗:${ref.error}(本次無法納入分析)` });
+                continue;
+              }
+              const snippet = (ref.markdown || '').slice(0, 6000);
+              const truncated = ref.markdown && ref.markdown.length > 6000 ? '\n\n…(內容過長,已截斷,完整頁面請見原連結)' : '';
+              claudeBlocks.push({ type: 'text', text: `\n\n━━━ 提案引用的 Notion 頁「${ref.title}」(${ref.url}) ━━━\n${snippet}${truncated}` });
+            }
             for (const part of (p.parts || [])) {
               if (part.kind === 'needs-export') {
                 claudeBlocks.push({ type: 'text', text: `\n⚠️ 附件「${part.fileName}」：${part.hint}（本次無法納入分析）` });
-              } else if (part.kind === 'vision') {
-                claudeBlocks.push({ type: 'text', text: `\n附件「${part.fileName}」${part.note || ''}：` });
+                continue;
+              }
+              // 優先用 Gemini 描述(統一文字格式,省 token)
+              if (part.description) {
+                claudeBlocks.push({ type: 'text', text: `\n\n━━━ 附件「${part.fileName}」Gemini 描述 ━━━\n${part.description}` });
+                continue;
+              }
+              // Fallback:Gemini 失敗時,用原本的 vision/text 混合餵給 Claude
+              if (part.kind === 'vision') {
+                claudeBlocks.push({ type: 'text', text: `\n附件「${part.fileName}」${part.note || ''}:` });
                 claudeBlocks.push(...part.blocks);
-              } else if (part.kind === 'pptx') {
+              } else if (part.kind === 'pptx' || part.kind === 'docx') {
                 claudeBlocks.push({ type: 'text', text: `\n附件「${part.fileName}」${part.note || ''}\n${(part.text || '').slice(0, 8000)}` });
                 if (part.blocks && part.blocks.length) {
-                  claudeBlocks.push({ type: 'text', text: '（簡報內嵌圖）' });
+                  claudeBlocks.push({ type: 'text', text: part.kind === 'pptx' ? '(簡報內嵌圖)' : '(文件內嵌圖)' });
                   claudeBlocks.push(...part.blocks);
                 }
               } else if (part.kind === 'text') {
-                claudeBlocks.push({ type: 'text', text: `\n附件「${part.fileName}」：\n${(part.text || '').slice(0, 10000)}` });
+                claudeBlocks.push({ type: 'text', text: `\n附件「${part.fileName}」:\n${(part.text || '').slice(0, 10000)}` });
               }
               // kind === 'empty' 就不輸出任何東西
             }
@@ -2756,6 +3518,8 @@ ${txText}
       const [syncOk,    setSyncOk]    = useState(true);
       const [journal,   setJournal]   = useState([]);
       const [briefing,  setBriefing]  = useState('');
+      // Route C:此專案綁定的 Notion parent page id(歸檔時傳給 notion-sync)
+      const [notionParentPageId, setNotionParentPageId] = useState('');
       const [isRecording, setIsRecording] = useState(false);
       const [recordingSeconds, setRecordingSeconds] = useState(0);
       const [headerHidden, setHeaderHidden] = useState(false);
@@ -2854,12 +3618,13 @@ ${txText}
         if (sessionStorage.getItem(`mk_auth_${projectId}`)) setAuthed(true);
         // Load journal from Supabase
         db(`journals?project_id=eq.${projectId}&order=created_at.asc`).then(r => r.json()).then(d => { if (Array.isArray(d)) setJournal(d); }).catch(() => {});
-        // Load project info
-        db(`projects?id=eq.${projectId}&select=title,meeting_date,meeting_time,briefing`).then(r => r.json()).then(d => {
+        // Load project info(含 notion_parent_page_id,給 syncEntryToNotion 用)
+        db(`projects?id=eq.${projectId}&select=title,meeting_date,meeting_time,briefing,notion_parent_page_id`).then(r => r.json()).then(d => {
           if (d[0]?.title) setProjectTitle(d[0].title);
           if (d[0]?.meeting_date) setMeetingDate(d[0].meeting_date);
           if (d[0]?.meeting_time) setMeetingTime(d[0].meeting_time);
           if (d[0]?.briefing) setBriefing(d[0].briefing);
+          if (d[0]?.notion_parent_page_id) setNotionParentPageId(d[0].notion_parent_page_id);
         }).catch(() => {});
       }, [projectId]);
 
@@ -2886,7 +3651,7 @@ ${txText}
               'Content-Type': 'application/json',
               'Authorization': `Bearer ${SB_KEY}`,
             },
-            body: JSON.stringify({ journal: entry, projectTitle, isoDate }),
+            body: JSON.stringify({ journal: entry, projectTitle, isoDate, notionParentPageId: notionParentPageId || null }),
           });
           const data = await res.json();
           if (!res.ok) throw new Error(data.error || 'Notion 同步失敗');
@@ -2976,7 +3741,137 @@ ${txText}
       );
     }
 
-    ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+    // ─── LOGIN GATE(Route C)─────────────────────────────────────────────────
+    // 包在 App 外面,確保所有 db() 呼叫都發生在「有 session」的狀態下
+    // 流程:
+    //   1) 掛載時讀 localStorage 裡的既有 session(sb.auth.getSession)
+    //   2) 沒 session → 顯示 email 輸入 + 「寄登入連結」按鈕
+    //   3) 按下按鈕 → sb.auth.signInWithOtp({ email }) → Supabase 寄 magic link
+    //   4) 使用者點信裡的連結 → 回到這個 URL,detectSessionInUrl 自動取 token
+    //   5) 有 session 後,currentSession 被設好,db() helper 就會帶 user access_token
+    function LoginGate({ children }) {
+      const [session, setSession] = useState(null);
+      const [loading, setLoading] = useState(true);
+      const [email, setEmail] = useState(() => localStorage.getItem('mk_last_email') || '');
+      const [sending, setSending] = useState(false);
+      const [sent, setSent] = useState(false);
+      const [err, setErr] = useState('');
+
+      useEffect(() => {
+        if (!sb) { setLoading(false); return; }
+        // 初次載入:讀既有 session + 聽 auth 變化
+        sb.auth.getSession().then(({ data }) => {
+          setCurrentSession(data.session || null);
+          setSession(data.session || null);
+          setLoading(false);
+        }).catch(() => setLoading(false));
+        const { data: sub } = sb.auth.onAuthStateChange((_event, s) => {
+          setCurrentSession(s || null);
+          setSession(s || null);
+        });
+        return () => { sub?.subscription?.unsubscribe?.(); };
+      }, []);
+
+      const sendLink = async () => {
+        const em = email.trim().toLowerCase();
+        if (!em || !em.includes('@')) { setErr('請輸入有效 email'); return; }
+        setSending(true); setErr('');
+        try {
+          const { error } = await sb.auth.signInWithOtp({
+            email: em,
+            options: { emailRedirectTo: window.location.href.split('?')[0] },
+          });
+          if (error) throw error;
+          localStorage.setItem('mk_last_email', em);
+          setSent(true);
+        } catch (e) {
+          setErr(e.message || '寄信失敗');
+        } finally {
+          setSending(false);
+        }
+      };
+
+      const signOut = async () => {
+        await sb.auth.signOut();
+        setCurrentSession(null);
+        setSession(null);
+        // 重新整理把 URL 上的 ?p= 清掉,回到 home
+        window.location.href = window.location.pathname;
+      };
+
+      if (loading) {
+        return (
+          <div style={{ minHeight: '100vh', display: 'flex', alignItems: 'center', justifyContent: 'center', color: '#888' }}>
+            載入中…
+          </div>
+        );
+      }
+
+      if (!session) {
+        return (
+          <div style={{ minHeight: '100vh', display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 24 }}>
+            <div style={{ width: '100%', maxWidth: 400 }}>
+              <div style={{ textAlign: 'center', marginBottom: 32 }}>
+                <div style={{ fontSize: 48, marginBottom: 12 }}>◈</div>
+                <div style={{ fontSize: 28, fontWeight: 700, letterSpacing: '-0.03em' }}>MeetKit</div>
+                <div style={{ fontSize: 13, color: '#888', marginTop: 8 }}>輸入 email,我們會寄一個登入連結給你</div>
+              </div>
+              {sent ? (
+                <div style={{ background: '#1a2b1f', border: '1px solid #2d5a3d', borderRadius: 10, padding: 20, textAlign: 'center' }}>
+                  <div style={{ fontSize: 28, marginBottom: 10 }}>✉️</div>
+                  <div style={{ fontSize: 15, fontWeight: 600, marginBottom: 6 }}>登入連結已寄出</div>
+                  <div style={{ fontSize: 13, color: '#9cc0a8', lineHeight: 1.6 }}>
+                    請到 <b>{email}</b> 收信,<br/>點裡面的「Log In」連結即可進入 MeetKit。
+                  </div>
+                  <button onClick={() => setSent(false)}
+                    style={{ marginTop: 16, background: 'transparent', border: '1px solid #2a4a30', color: '#9cc0a8', padding: '8px 16px', borderRadius: 8, cursor: 'pointer', fontSize: 12 }}>
+                    寄到別的信箱
+                  </button>
+                </div>
+              ) : (
+                <div style={{ background: '#151821', border: '1px solid #2a2d35', borderRadius: 10, padding: 20 }}>
+                  <label style={{ display: 'block', fontSize: 12, color: '#888', marginBottom: 8 }}>Email</label>
+                  <input type="email" value={email} onChange={e => setEmail(e.target.value)}
+                    placeholder="you@example.com" autoFocus
+                    onKeyDown={e => { if (e.key === 'Enter') sendLink(); }}
+                    style={{ width: '100%', background: '#0f1117', border: '1px solid #2a2d35', borderRadius: 8, padding: '10px 12px', color: '#e8e8e8', fontSize: 14, boxSizing: 'border-box', marginBottom: 12 }} />
+                  {err && <div style={{ color: '#f88', fontSize: 12, marginBottom: 10 }}>{err}</div>}
+                  <button onClick={sendLink} disabled={sending}
+                    style={{ width: '100%', background: sending ? '#2a3340' : '#3b82f6', border: 'none', color: '#fff', padding: '11px', borderRadius: 8, cursor: sending ? 'wait' : 'pointer', fontSize: 14, fontWeight: 600 }}>
+                    {sending ? '寄送中…' : '寄登入連結到我的信箱'}
+                  </button>
+                  <div style={{ fontSize: 11, color: '#666', marginTop: 12, lineHeight: 1.5 }}>
+                    寄件人是 <code style={{ background: '#0f1117', padding: '1px 5px', borderRadius: 3 }}>meetkit@mx.design</code>。<br/>
+                    沒收到的話,檢查垃圾信夾。
+                  </div>
+                </div>
+              )}
+            </div>
+          </div>
+        );
+      }
+
+      // 已登入 → 渲染 App,並提供一個右上角的「登出」浮鈕
+      return (
+        <>
+          {children}
+          <button onClick={signOut}
+            title={`登入為 ${session.user?.email}`}
+            style={{
+              position: 'fixed', bottom: 16, left: 16, zIndex: 9998,
+              background: 'rgba(21,24,33,0.85)', border: '1px solid #2a2d35',
+              borderRadius: 8, padding: '6px 10px', color: '#888', fontSize: 11,
+              cursor: 'pointer', backdropFilter: 'blur(8px)',
+            }}>
+            {session.user?.email}　⎋ 登出
+          </button>
+        </>
+      );
+    }
+
+    ReactDOM.createRoot(document.getElementById('root')).render(
+      sb ? <LoginGate><App /></LoginGate> : <App />
+    );
   </script>
 </body>
 </html>
