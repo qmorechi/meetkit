@@ -50,6 +50,10 @@ Deno.serve(async (req) => {
       senderEmail,
       senderName,
       recipientEmails,
+      // 排程寄送:UTC ISO 字串(例 "2026-04-28T01:00:00.000Z"),
+      // 或 Resend 支援的自然語言(例 "in 1 hour")。空值/未提供 = 立即寄送。
+      // 交給 Resend 的 scheduled_at 欄位,Resend 內部排程,我們不自建 queue。
+      scheduledAt,
     } = body;
 
     if (!projectCode) throw new Error('缺少 projectCode');
@@ -99,6 +103,8 @@ Deno.serve(async (req) => {
             html,
             // 讓收信匣顯示 "MeetKit" 而非 noreply,同時讓 reply 回到發起人
             reply_to: senderEmail || undefined,
+            // 有排程時間就讓 Resend 延後寄(UTC ISO 或 "in 1 hour" 這類自然語言)
+            ...(scheduledAt && String(scheduledAt).trim() ? { scheduled_at: String(scheduledAt).trim() } : {}),
           }),
         });
         const data = await res.json();

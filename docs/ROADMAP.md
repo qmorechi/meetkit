@@ -234,6 +234,39 @@ Phase 1 已經遠超預期 — `index.html` 實戰版已經在多次真實會議
 
 ---
 
+### 2026-04-25|Route C 邀請白名單 + 成員管理 UI 上線(原 Phase 4 的一部分提前到 Phase 2.5)
+
+**觸發點:**
+MeetKit 開始處理 SIPAI 等客戶敏感資料,「知道 6 碼代碼就能進」的共享模型風險過高。
+配合 2026/04/22 API key 外洩事件的後續,順勢把 Phase 4 規劃的「使用者系統 + 權限」提前落地。
+
+**決策:** 改成「邀請白名單 + Supabase magic-link + RLS」三層防護。
+6 碼代碼從「通行密碼」變成「專案識別碼 + URL slug」,實際進出由 `project_members` 白名單控制。
+
+**這一輪已完成(Phase 2.5 的範圍):**
+- ✅ Supabase Auth magic link(`signInWithOtp`)
+- ✅ `projects.owner_email` 欄位 + `project_members` 白名單表
+- ✅ 四張表 RLS policies(owner OR member;`SECURITY DEFINER` helper 避免 policy 遞迴)
+- ✅ Edge Function `send-invite`(Resend + `meetkit@mx.design`,domain 已驗證)
+- ✅ Home 分「🧑‍💼 我建立的」+「📨 我被邀請的」兩份清單
+- ✅ 專案設定 ⚙ 的「📬 與會者」面板:加人 + 移除 + **重寄邀請信**(2026-04-25 補)
+- ✅ SIPAI_開發日誌(`MTRF1H`)backfill + `notion_parent_page_id` 綁定
+
+**Phase 4 仍未處理的部分(真的擴到全公司再做):**
+- ⏭ SSO(mx.design domain 白名單)
+- ⏭ 角色區分(viewer / editor / owner)
+- ⏭ 邀請有效期 + 撤銷
+- ⏭ 專案歸屬變更(owner transfer)
+
+**理由:**
+現階段「owner + member 兩層」就夠 SIPAI / MX 內部會議用,不必一步到位做完整 RBAC。
+「重寄邀請信」原本規劃到 Phase 4,但因同事下週開始加入名單,提前一週做完這顆按鈕。
+
+詳見 CLAUDE.md §3、`supabase/migrations/20260425_project_members.sql`、
+`supabase/functions/send-invite/index.ts`。
+
+---
+
 ## 待解決的根本性問題(Phase 3 必須面對)
 
 ### 議題:MeetKit 的「專案 / 會議」語義模糊
@@ -577,6 +610,7 @@ Cosmoship 上 production 時這整套經驗全部適用:
 - 重要流程要端到端實戰驗證,不能只做單元測試
 
 ### 待辦
-- [ ] Phase D:Supabase RLS 設定(config / projects / proposals / journals)
+- [x] ~~Phase D:Supabase RLS 設定(config / projects / proposals / journals)~~ → **2026-04-25 隨 Route C 一起完成**(4 張表 RLS 都開,policies 為 owner-or-member)
 - [ ] ffmpeg 切段 15 秒 timeout 調整(不影響使用,有 fallback)
 - [ ] 清 localStorage 殘留 mk_openai_key / mk_anthropic_key(無害)
+- [ ] Phase 2 音訊改造主體(Meeting 元件重設計 + ffmpeg.wasm 整合,目前尚未動工)

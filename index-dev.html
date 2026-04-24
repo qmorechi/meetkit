@@ -1226,6 +1226,13 @@
       const [addEmailsInput, setAddEmailsInput] = useState('');
       const [addingMembers, setAddingMembers] = useState(false);
       const [membersMsg, setMembersMsg] = useState('');
+      // 重寄邀請中的 email(避免同一列 double-click;一次只寄一封,UI 顯示「…」)
+      const [resendingEmail, setResendingEmail] = useState('');
+      // 寄送時機:'now' 立即送 / 'schedule' 排程到指定時間
+      // scheduledAt 存 <input type="datetime-local"> 的本地時間字串(YYYY-MM-DDTHH:mm)
+      // 送給 Edge Function 前會用 toUtcIso 轉成 UTC ISO,Resend 的 scheduled_at 接 UTC
+      const [scheduleMode, setScheduleMode] = useState('now');
+      const [scheduledAt, setScheduledAt] = useState('');
       const myEmail = (currentSession?.user?.email || '').toLowerCase();
       const isOwner = !!projectOwnerEmail && projectOwnerEmail.toLowerCase() === myEmail;
       const [showUrlInput, setShowUrlInput] = useState(false);
@@ -1265,7 +1272,46 @@
 
       useEffect(() => { loadMembers(); }, [loadMembers]);
 
-      // 新增成員:驗證 email → INSERT → 寄邀請信 → 重新載入
+      // ─── 排程寄送 helpers ──────────────────────────────────────
+      // datetime-local 字串(無時區,瀏覽器當本地時間解讀)→ UTC ISO
+      // Resend 的 scheduled_at 接 UTC ISO 或 natural language,這裡統一用 UTC ISO 最穩
+      const toUtcIso = (localStr) => {
+        if (!localStr) return '';
+        const d = new Date(localStr);
+        if (isNaN(d.getTime())) return '';
+        return d.toISOString();
+      };
+      // Date → datetime-local input 接受的格式 YYYY-MM-DDTHH:mm
+      const toLocalInput = (d) => {
+        const pad = n => String(n).padStart(2, '0');
+        return `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
+      };
+      // 預設:明天早上 09:00
+      const presetTomorrow9am = () => {
+        const d = new Date();
+        d.setDate(d.getDate() + 1);
+        d.setHours(9, 0, 0, 0);
+        setScheduledAt(toLocalInput(d));
+      };
+      // 預設:下個週一早上 09:00(今天本身是週一則跳到下週一)
+      const presetNextMonday9am = () => {
+        const d = new Date();
+        const dow = d.getDay();                          // 0=Sun 1=Mon … 6=Sat
+        const add = dow === 1 ? 7 : (dow === 0 ? 1 : 8 - dow);
+        d.setDate(d.getDate() + add);
+        d.setHours(9, 0, 0, 0);
+        setScheduledAt(toLocalInput(d));
+      };
+      // 預設:會議日期前 2 天早上 09:00(沒設會議日期就不做)
+      const presetTwoDaysBeforeMeeting = () => {
+        if (!meetingDate) return;
+        const d = new Date(meetingDate + 'T00:00:00');
+        d.setDate(d.getDate() - 2);
+        d.setHours(9, 0, 0, 0);
+        setScheduledAt(toLocalInput(d));
+      };
+
+      // 新增成員:驗證 email → INSERT → 寄邀請信(立即或排程) → 重新載入
       const addMembers = async () => {
         const list = addEmailsInput.split(/[\s,;\n]+/).map(x => x.trim().toLowerCase()).filter(Boolean);
         const valid = [...new Set(list.filter(x => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(x)))];
@@ -1294,6 +1340,8 @@
             throw new Error(`${res.status} ${err.slice(0, 200)}`);
           }
           // 寄邀請信(fire and forget)
+          // scheduledIso 有值 → Edge Function 會傳 Resend 的 scheduled_at,排程到指定時間;空值 = 立即
+          const scheduledIso = scheduleMode === 'schedule' ? toUtcIso(scheduledAt) : '';
           fetch(`${EDGE_BASE}/send-invite`, {
             method: 'POST',
             headers: {
@@ -1309,10 +1357,14 @@
               senderEmail: myEmail,
               senderName: myEmail ? myEmail.split('@')[0] : '',
               recipientEmails: newOnes,
+              scheduledAt: scheduledIso,
             }),
           }).then(r => r.json()).then(r => console.log('[send-invite]', r)).catch(e => console.warn('寄邀請信失敗:', e));
 
-          setMembersMsg(`✓ 已新增 ${newOnes.length} 位成員,邀請信寄送中`);
+          const whenMsg = scheduledIso
+            ? `,將於 ${scheduledAt.replace('T', ' ')} 寄出`
+            : ',邀請信寄送中';
+          setMembersMsg(`✓ 已新增 ${newOnes.length} 位成員${whenMsg}`);
           setAddEmailsInput('');
           loadMembers();
         } catch (e) {
@@ -1334,6 +1386,45 @@
           loadMembers();
         } catch (e) {
           setMembersMsg(`❌ 移除失敗:${e.message || e}`);
+        }
+      };
+
+      // 重寄邀請信:只觸發 send-invite,不動 DB
+      // 使用情境:成員說「我沒收到信」「誤刪了」「垃圾信撈不到」
+      // 注意和 addMembers 的差異 — 這裡跳過 INSERT,因為 email 早就在 project_members 了
+      const resendInvite = async (email) => {
+        if (!isOwner || !email) return;
+        setResendingEmail(email);
+        setMembersMsg('');
+        try {
+          const res = await fetch(`${EDGE_BASE}/send-invite`, {
+            method: 'POST',
+            headers: {
+              'Authorization': `Bearer ${getBearer()}`,
+              'apikey': SB_KEY,
+              'Content-Type': 'application/json',
+            },
+            body: JSON.stringify({
+              projectCode: projectId,
+              projectTitle: projectTitle || '未命名專案',
+              meetingDate: meetingDate || '',
+              meetingTime: meetingTime || '',
+              senderEmail: myEmail,
+              senderName: myEmail ? myEmail.split('@')[0] : '',
+              recipientEmails: [email],
+            }),
+          });
+          const r = await res.json().catch(() => ({}));
+          if (r?.ok && Array.isArray(r.sent) && r.sent.length > 0) {
+            setMembersMsg(`✓ 已重寄邀請到 ${email}`);
+          } else {
+            const reason = r?.failed?.[0]?.error || r?.error || `HTTP ${res.status}`;
+            setMembersMsg(`❌ 重寄失敗:${reason}`);
+          }
+        } catch (e) {
+          setMembersMsg(`❌ 重寄失敗:${e.message || e}`);
+        } finally {
+          setResendingEmail('');
         }
       };
 
@@ -1679,13 +1770,23 @@
                           <div key={m.member_email} style={{ display: 'inline-flex', alignItems: 'center', gap: 4, padding: '3px 8px', background: C.bgInput, border: `1px solid ${C.border}`, borderRadius: 6, fontSize: 11 }}>
                             {m.member_email}
                             {isOwner && m.member_email !== myEmail && (
-                              <button
-                                onClick={() => removeMember(m.member_email)}
-                                style={{ background: 'none', border: 'none', color: C.textMut, cursor: 'pointer', fontSize: 11, padding: 0, lineHeight: 1 }}
-                                title="移除此成員"
-                              >
-                                ✕
-                              </button>
+                              <>
+                                <button
+                                  onClick={() => resendInvite(m.member_email)}
+                                  disabled={resendingEmail === m.member_email}
+                                  style={{ background: 'none', border: 'none', color: C.textMut, cursor: 'pointer', fontSize: 11, padding: 0, lineHeight: 1, opacity: resendingEmail === m.member_email ? 0.4 : 1 }}
+                                  title="重寄邀請信"
+                                >
+                                  {resendingEmail === m.member_email ? '…' : '✉'}
+                                </button>
+                                <button
+                                  onClick={() => removeMember(m.member_email)}
+                                  style={{ background: 'none', border: 'none', color: C.textMut, cursor: 'pointer', fontSize: 11, padding: 0, lineHeight: 1 }}
+                                  title="移除此成員"
+                                >
+                                  ✕
+                                </button>
+                              </>
                             )}
                           </div>
                         ))}
@@ -1697,19 +1798,55 @@
                       {/* 新增成員(只有 owner 能操作) */}
                       {isOwner ? (
                         <>
+                          {/* textarea 高度固定 60-120px,內容多就內部捲動(避免整個面板被撐開) */}
                           <textarea
                             value={addEmailsInput}
                             onChange={e => setAddEmailsInput(e.target.value)}
                             placeholder={`新增成員 email(一行一個,或逗號分隔)\n例:\nalice@example.com\nbob@example.com`}
-                            style={{ ...S.input, minHeight: 60, fontSize: 12, padding: '6px 10px', fontFamily: 'inherit', resize: 'vertical', width: '100%', boxSizing: 'border-box' }}
+                            style={{ ...S.input, minHeight: 60, maxHeight: 120, overflowY: 'auto', fontSize: 12, padding: '6px 10px', fontFamily: 'inherit', resize: 'none', width: '100%', boxSizing: 'border-box' }}
                           />
-                          <div style={{ display: 'flex', gap: 8, marginTop: 6, alignItems: 'center' }}>
+
+                          {/* 寄送時機:立即 vs 排程到指定時間(Resend scheduled_at) */}
+                          <div style={{ marginTop: 8, fontSize: 11, color: C.textSec, display: 'flex', gap: 14, alignItems: 'center', flexWrap: 'wrap' }}>
+                            <label style={{ display: 'inline-flex', alignItems: 'center', gap: 4, cursor: 'pointer' }}>
+                              <input type="radio" name={`sm-${projectId}`} checked={scheduleMode === 'now'} onChange={() => setScheduleMode('now')} />
+                              立即寄送
+                            </label>
+                            <label style={{ display: 'inline-flex', alignItems: 'center', gap: 4, cursor: 'pointer' }}>
+                              <input type="radio" name={`sm-${projectId}`} checked={scheduleMode === 'schedule'} onChange={() => setScheduleMode('schedule')} />
+                              排程到
+                            </label>
+                            {scheduleMode === 'schedule' && (
+                              <input
+                                type="datetime-local"
+                                value={scheduledAt}
+                                onChange={e => setScheduledAt(e.target.value)}
+                                style={{ ...S.input, fontSize: 11, padding: '4px 8px', width: 'auto' }}
+                              />
+                            )}
+                          </div>
+                          {/* 快捷預設時間:明天 / 下週一 / 會議前 2 天,全 09:00 */}
+                          {scheduleMode === 'schedule' && (
+                            <div style={{ display: 'flex', gap: 6, marginTop: 6, flexWrap: 'wrap' }}>
+                              <button type="button" onClick={presetTomorrow9am} style={{ ...btn('ghost'), padding: '3px 10px', fontSize: 11 }}>📅 明天 09:00</button>
+                              <button type="button" onClick={presetNextMonday9am} style={{ ...btn('ghost'), padding: '3px 10px', fontSize: 11 }}>🌅 下週一 09:00</button>
+                              {meetingDate && (
+                                <button type="button" onClick={presetTwoDaysBeforeMeeting} style={{ ...btn('ghost'), padding: '3px 10px', fontSize: 11 }}>🕘 會議前 2 天 09:00</button>
+                              )}
+                            </div>
+                          )}
+
+                          <div style={{ display: 'flex', gap: 8, marginTop: 8, alignItems: 'center', flexWrap: 'wrap' }}>
                             <button
                               style={{ ...btn('primary'), padding: '6px 14px', fontSize: 12, opacity: addingMembers ? 0.6 : 1 }}
-                              disabled={addingMembers || !addEmailsInput.trim()}
+                              disabled={addingMembers || !addEmailsInput.trim() || (scheduleMode === 'schedule' && !scheduledAt)}
                               onClick={addMembers}
                             >
-                              {addingMembers ? '加入中…' : '＋ 加入並寄邀請信'}
+                              {addingMembers
+                                ? '加入中…'
+                                : scheduleMode === 'schedule'
+                                  ? '＋ 加入並排程邀請信'
+                                  : '＋ 加入並寄邀請信'}
                             </button>
                             {membersMsg && (
                               <span style={{ fontSize: 11, color: membersMsg.startsWith('✓') ? C.success : (membersMsg.startsWith('⚠') ? '#fa0' : '#f88') }}>

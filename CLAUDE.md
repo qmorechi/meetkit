@@ -243,7 +243,7 @@ Helper functions `public.is_project_owner(pid)` 和 `public.is_project_member(pi
 - ❌ **TypeScript** — 純 JavaScript + JSX,降低設計師理解門檻
 - ❌ **Zustand / Redux** — React 的 `useState` + props drilling 已經夠用
 - ❌ **Tailwind / styled-components** — 用原生 CSS-in-JS 物件(`S.panel`、`btn()` 等 helper)
-- ❌ **NextAuth** — 用 6 碼專案代碼 + 可選密碼保護,不需要完整帳號系統
+- ❌ **NextAuth / Clerk / Auth0** — 登入改用 Supabase Auth magic link(詳見 §3),零外部依賴、已驗證可用
 - ❌ **npm / package.json / node_modules** — 所有函式庫從 CDN 載入
 - ❌ **build 流程** — 改完檔案直接重新整理
 
@@ -268,10 +268,13 @@ Helper functions `public.is_project_owner(pid)` 和 `public.is_project_member(pi
 
 ### 資料表結構(Supabase)
 
-- `projects` — id, code(6 碼), title, password_hash, meeting_date, meeting_time
-- `proposals` — id, project_id, title, author, content, file_url (JSON), file_name (JSON)
-- `journal` — 會議歸檔(逐字稿、摘要)
+- `projects` — id(6 碼 TEXT), title, meeting_date, meeting_time, owner_email, notion_parent_page_id, password_hash(保留欄位,Route C 後已不使用)
+- `proposals` — id(UUID), project_id, title, author, content, file_url (JSON), file_name (JSON)
+- `journals` — 會議歸檔(逐字稿、摘要)
+- `project_members` — project_id, member_email, added_by, added_at(Route C 2026-04-25 新增)
 - Storage bucket `presentations` — 提案附件,路徑 `{projectId}/{timestamp}_{random}.{ext}`
+
+所有 4 張表都啟用 RLS;helper function `public.is_project_owner()` / `public.is_project_member()` 是 `SECURITY DEFINER`,避免 policy 跨表遞迴。完整 policy 清單見 §3 和 `supabase/migrations/20260425_project_members.sql`。
 
 ---
 
@@ -416,17 +419,23 @@ const startRec = async () => {
 
 ## 7. Rollout 路線圖(詳見 `docs/ROADMAP.md`)
 
-目前位置:**Phase 2 準備開工**(index.html 實戰版已有,錄音改造待做)
+目前位置:**Phase 2.5 完成、Phase 2 音訊主體尚未動工**
 
 - ✅ Phase 0:需求與架構確立
 - ✅ Phase 1:index.html 實戰版上線,多次真實會議驗證
-- 🔄 Phase 2:錄音改造(放棄瀏覽器錄音 + 整合 ffmpeg.wasm + 切段上傳)← 當前
-- ⏭ Phase 3:多專案管理介面優化 + 跨專案搜尋
-- ⏭ Phase 4:全公司 rollout(可能的 Next.js 重寫時機)
+- 🔄 Phase 2:錄音改造(放棄瀏覽器錄音 + 整合 ffmpeg.wasm + 切段上傳)← 音訊 pipeline 還沒動
+- ✅ Phase 2.5:資安補強 + 邀請白名單(2026-04-22 至 2026-04-25)
+  - Phase A–C(2026-04-22):Edge Function 代理、API key 回收、前端改走 proxy
+  - Route C(2026-04-25):4 張表 RLS、Supabase magic-link 登入、`project_members` 白名單、Resend 邀請信
+  - 📬 與會者面板(2026-04-25):加人 / 移除 / 重寄邀請信
+- ⏭ Phase 3:多專案管理優化 + 跨專案搜尋 + 「專案 vs 會議」語義釐清(見 ROADMAP.md 根本議題)
+- ⏭ Phase 4:全公司 rollout — SSO(mx.design 白名單)、角色區分(viewer/editor/owner)、邀請有效期、owner transfer(可能的 Next.js 重寫時機)
 
 每一次 session 結束時,如果有里程碑變動,請更新 `docs/ROADMAP.md` 的狀態標記。
 
 **重要認知:** MeetKit 的 Phase 劃分**不是**「從零到 Next.js 正式版」的工程路線,而是「從單檔實戰版逐步擴充功能」的漸進路線。保留 index.html 作為主體,直到它不敷使用才考慮重寫。
+
+**Phase 2.5 插在 2 和 3 中間的理由:** 原本「使用者系統 + 權限」規劃在 Phase 4,但 2026/04/22 API key 外洩事件 + SIPAI 客戶資料敏感度,讓這塊的優先級拉到音訊改造前面。現在是先有登入和權限再談 Meeting 元件重設計,順序合理。
 
 ---
 
@@ -507,4 +516,4 @@ qmore 是設計師不是工程師。以下情境**一定要停下來問**:
 
 ---
 
-_最後更新:2026-04-11 — Phase 2 音訊 pipeline 決策完成,準備開工_
+_最後更新:2026-04-25 — Phase 2.5 完成(Route C 邀請白名單 + 📬 與會者面板 + 重寄邀請按鈕);Phase 2 音訊 pipeline 仍待開工_
