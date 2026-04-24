@@ -59,7 +59,45 @@ function calloutBlock(emoji: string, text: string, color = 'yellow_background') 
   };
 }
 
-// 依附件 kind 組 Notion blocks（圖 + 文字 + 原檔下載連結 + 格式警告）
+// Toggle block(可摺疊) — 把 Gemini 描述收起來,讀者展開才看細節,維持頁面簡潔
+function toggleBlock(title: string, childrenBlocks: object[]) {
+  return {
+    object: 'block',
+    type: 'toggle',
+    toggle: {
+      rich_text: [{ type: 'text', text: { content: title.slice(0, 1900) } }],
+      children: childrenBlocks.slice(0, 100), // Notion toggle 內最多 100 個 child
+    },
+  };
+}
+
+// 把 Gemini 產出的 Markdown 轉成 Notion blocks(## / ### 變 heading,其餘當 paragraph)
+function markdownToBlocks(md: string): object[] {
+  if (!md?.trim()) return [];
+  const blocks: object[] = [];
+  const lines = md.split(/\r?\n/);
+  let buffer = '';
+  const flush = () => {
+    if (buffer.trim()) {
+      blocks.push(...paragraphBlocks(buffer.trim()));
+      buffer = '';
+    }
+  };
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (/^##\s+/.test(trimmed) || /^###\s+/.test(trimmed)) {
+      flush();
+      blocks.push(heading3(trimmed.replace(/^#+\s+/, '')));
+      continue;
+    }
+    if (!trimmed) { flush(); continue; }
+    buffer += (buffer ? '\n' : '') + line;
+  }
+  flush();
+  return blocks;
+}
+
+// 依附件 kind 組 Notion blocks（Gemini 描述 + 圖 + 文字 + 原檔下載連結 + 格式警告）
 function attachmentBlocks(att: any) {
   const out: object[] = [];
   const header = att.note ? `📎 附件：${att.fileName}　${att.note}` : `📎 附件：${att.fileName}`;
@@ -76,6 +114,14 @@ function attachmentBlocks(att: any) {
     return out;
   }
 
+  // 🤖 Gemini AI 描述(摺疊區塊,預設收合保持頁面乾淨)
+  if (att.description && att.description.trim()) {
+    const descBlocks = markdownToBlocks(att.description);
+    if (descBlocks.length > 0) {
+      out.push(toggleBlock('🤖 Gemini AI 描述（展開看結構化分析）', descBlocks));
+    }
+  }
+
   // 圖片（PDF 每頁 render、PPTX 內嵌圖、直接上傳的圖片）
   if (Array.isArray(att.images) && att.images.length > 0) {
     for (const img of att.images) {
@@ -84,7 +130,8 @@ function attachmentBlocks(att: any) {
   }
 
   // 抽取的文字（DOCX/TXT/MD/PPTX 文字）→ 給 AI 讀懂用
-  if (att.text && att.text.trim()) {
+  // 有 Gemini 描述時就不重複塞文字(避免 Notion 頁面太冗長)
+  if (!att.description && att.text && att.text.trim()) {
     out.push(...paragraphBlocks(att.text));
   }
 

@@ -226,6 +226,138 @@
       };
     };
 
+    // ─── GEMINI UNIVERSAL ATTACHMENT DESCRIBER ─────────────────────────────────
+    // 統一用 Gemini 2.5 Flash 處理所有格式附件,產出結構化 Markdown 描述,
+    // 後續 Claude 摘要時只讀這段描述,不必再重吃 raw vision tokens,省錢又一致。
+    //
+    // 策略：
+    //   PDF   → 直接 base64 丟 Gemini（原生支援 1000 頁內）
+    //   PPTX  → JSZip 已抽出的 slide 文字 + 每張內嵌圖(base64) 丟 Gemini
+    //   DOCX  → mammoth 抽出的文字 丟 Gemini
+    //   圖片  → base64 直接丟 Gemini
+    //
+    // 若 Gemini 失敗,前端照舊用 JSZip/mammoth/pdf.js 的輸出餵給 Claude,保留 fallback。
+
+    const GEMINI_DESCRIBE_PROMPT = `你是一位專業的提案內容分析助理。你的任務是仔細閱讀這份附件,產出一份結構化的 Markdown 描述,讓其他 AI(例如 Claude)讀到後能完整理解這份附件的內容,不必再看原檔。
+
+請務必使用下列格式,不要省略任何章節(若該章節沒內容就寫「無」):
+
+## 整體概述
+(2-3 句精簡說明:這份附件在講什麼?目的是什麼?給誰看?)
+
+## 關鍵資訊
+- 重要人名/公司/產品/概念(含英文原名若有)
+- 重要數字(價格、時間、尺寸、數量)
+- 重要日期與里程碑
+- 明確的決策點、方案對比、選項清單
+
+## 視覺元素描述
+(若附件含圖片/簡報頁面,每張圖或每頁各一段,說明:配色風格、排版結構、主要視覺元素、圖表資訊、設計意圖。若無視覺元素就寫「本附件為純文字」)
+
+## 重點原文引用
+(從原檔挑 3-5 句或段落,最能代表這份提案核心觀點的原文,用 > 引用格式)
+
+## 未能解析
+(任何模糊、缺字、圖太小看不清的部分。如無,寫「無」)
+
+請用繁體中文輸出,不要加任何開場白或結尾語,直接從 ## 整體概述 開始。`;
+
+    const GEMINI_MAX_PDF_BYTES = 20 * 1024 * 1024;   // 20MB 保守上限(Gemini inline 上限更大,但 base64 膨脹 33%)
+    const GEMINI_MAX_IMAGES_PER_CALL = 20;            // 一次最多吃 20 張圖,超過分批
+
+    // 核心:把已抽好的 parts 組成 Gemini contents.parts 陣列 → 呼叫 proxy → 回傳 Markdown 描述
+    // 回傳字串(Markdown)或 null(失敗)
+    const callGeminiDescribe = async (geminiParts, fileName) => {
+      try {
+        const headerText = `檔名:${fileName || '(未知)'}`;
+        const parts = [{ text: headerText }, ...geminiParts];
+        const res = await fetch(`${EDGE_BASE}/gemini-proxy`, {
+          method: 'POST',
+          headers: EDGE_HEADERS,
+          body: JSON.stringify({
+            model: 'gemini-2.5-flash',
+            systemInstruction: GEMINI_DESCRIBE_PROMPT,
+            parts,
+            generationConfig: {
+              temperature: 0.3,
+              maxOutputTokens: 4096,
+              thinkingConfig: { thinkingBudget: 0 }, // 關掉思考模式,附件描述不需要 reasoning
+            },
+          }),
+        });
+        if (!res.ok) {
+          const e = await res.json().catch(() => ({}));
+          console.warn('Gemini describe 失敗:', e.error || `HTTP ${res.status}`);
+          return null;
+        }
+        const data = await res.json();
+        return (data.text || '').trim() || null;
+      } catch (e) {
+        console.warn('Gemini describe 例外:', e.message);
+        return null;
+      }
+    };
+
+    // PDF → 直接送整份 PDF(Gemini 原生支援)
+    const geminiDescribePdf = async (fileUrl, fileName) => {
+      try {
+        const res = await fetch(fileUrl);
+        if (!res.ok) return null;
+        const blob = await res.blob();
+        if (blob.size > GEMINI_MAX_PDF_BYTES) {
+          console.warn(`PDF ${fileName} 超過 ${GEMINI_MAX_PDF_BYTES/1024/1024}MB,跳過 Gemini`);
+          return null;
+        }
+        const data = await blobToBase64(blob);
+        return await callGeminiDescribe([
+          { inline_data: { mime_type: 'application/pdf', data } },
+        ], fileName);
+      } catch (e) {
+        console.warn('geminiDescribePdf 失敗:', e.message);
+        return null;
+      }
+    };
+
+    // PPTX → 已抽好的 slide 文字 + 內嵌圖 base64
+    const geminiDescribePptx = async (pptxResult, fileName) => {
+      const parts = [];
+      if (pptxResult.text) {
+        parts.push({ text: `【簡報文字】\n${pptxResult.text.slice(0, 20000)}` });
+      }
+      const imgBlocks = (pptxResult.blocks || []).slice(0, GEMINI_MAX_IMAGES_PER_CALL);
+      for (const b of imgBlocks) {
+        if (b.type === 'image' && b.source?.data) {
+          parts.push({ inline_data: { mime_type: b.source.media_type, data: b.source.data } });
+        }
+      }
+      if (parts.length === 0) return null;
+      return await callGeminiDescribe(parts, fileName);
+    };
+
+    // DOCX → 抽好的純文字
+    const geminiDescribeDocx = async (text, fileName) => {
+      if (!text?.trim()) return null;
+      return await callGeminiDescribe([
+        { text: `【文件內容】\n${text.slice(0, 30000)}` },
+      ], fileName);
+    };
+
+    // 單張圖片 → base64 直接送
+    const geminiDescribeImage = async (fileUrl, mime, fileName) => {
+      try {
+        const res = await fetch(fileUrl);
+        if (!res.ok) return null;
+        const blob = await res.blob();
+        const data = await blobToBase64(blob);
+        return await callGeminiDescribe([
+          { inline_data: { mime_type: mime, data } },
+        ], fileName);
+      } catch (e) {
+        console.warn('geminiDescribeImage 失敗:', e.message);
+        return null;
+      }
+    };
+
     const extractAttachmentParts = async (fileUrl, fileName) => {
       const base = { fileName, originalUrl: fileUrl };
       try {
@@ -242,14 +374,17 @@
         if (ext === 'pptx') {
           const r = await pptxToParts(fileUrl);
           if (!r) return { ...base, kind: 'empty' };
-          // 混合回傳：文字 + 圖片 blocks（上層會同時塞進 messages）
-          return { ...base, kind: 'pptx', text: r.text, blocks: r.blocks, note: `（PPTX 半解：文字 + ${r.totalImages} 張內嵌圖，版面配置已遺失）` };
+          // Gemini 統一描述(失敗時 description 為 null,Claude 會 fallback 回 text+blocks)
+          const description = await geminiDescribePptx(r, fileName);
+          return { ...base, kind: 'pptx', text: r.text, blocks: r.blocks, description, note: `(PPTX 半解:文字 + ${r.totalImages} 張內嵌圖,版面配置已遺失)` };
         }
 
         if (ext === 'pdf') {
           const r = await pdfToImageBlocks(fileUrl);
           if (!r || !r.blocks.length) return { ...base, kind: 'empty' };
-          return { ...base, kind: 'vision', blocks: r.blocks, totalPages: r.totalPages, includedPages: r.includedPages, note: r.totalPages > r.includedPages ? `（共 ${r.totalPages} 頁，只分析前 ${r.includedPages} 頁）` : '' };
+          // PDF 送整份原檔給 Gemini(原生支援)
+          const description = await geminiDescribePdf(fileUrl, fileName);
+          return { ...base, kind: 'vision', blocks: r.blocks, description, totalPages: r.totalPages, includedPages: r.includedPages, note: r.totalPages > r.includedPages ? `(共 ${r.totalPages} 頁,只分析前 ${r.includedPages} 頁)` : '' };
         }
 
         if (['png', 'jpg', 'jpeg', 'webp', 'gif'].includes(ext)) {
@@ -258,8 +393,9 @@
           const blob = await res.blob();
           const data = await blobToBase64(blob);
           const mime = ext === 'jpg' ? 'image/jpeg' : `image/${ext}`;
-          // 圖片原檔已在 Storage（file_url 就是 public URL）,Notion 可直接用 originalUrl,不需重傳
-          return { ...base, kind: 'vision', blocks: [{ type: 'image', source: { type: 'base64', media_type: mime, data } }], isDirectImage: true };
+          // 圖片原檔已在 Storage(file_url 就是 public URL),Notion 可直接用 originalUrl,不需重傳
+          const description = await geminiDescribeImage(fileUrl, mime, fileName);
+          return { ...base, kind: 'vision', blocks: [{ type: 'image', source: { type: 'base64', media_type: mime, data } }], description, isDirectImage: true };
         }
 
         if (ext === 'docx') {
@@ -268,18 +404,22 @@
           if (!res.ok) return { ...base, kind: 'empty' };
           const buf = await res.arrayBuffer();
           const result = await mammoth.extractRawText({ arrayBuffer: buf });
-          return { ...base, kind: 'text', text: result.value || '' };
+          const text = result.value || '';
+          const description = await geminiDescribeDocx(text, fileName);
+          return { ...base, kind: 'text', text, description };
         }
 
         if (['txt', 'md', 'rtf'].includes(ext)) {
           const res = await fetch(fileUrl);
           if (!res.ok) return { ...base, kind: 'empty' };
-          return { ...base, kind: 'text', text: await res.text() };
+          const text = await res.text();
+          const description = await geminiDescribeDocx(text, fileName);
+          return { ...base, kind: 'text', text, description };
         }
 
         return { ...base, kind: 'empty' };
       } catch (e) {
-        console.warn('附件抽取失敗：', fileName, e.message);
+        console.warn('附件抽取失敗:', fileName, e.message);
         return { ...base, kind: 'empty' };
       }
     };
@@ -299,6 +439,7 @@
             note: part.note || '',
             hint: part.hint || '',
             text: part.text || '',
+            description: part.description || '', // Gemini 產出的統一描述
             images: [],
           };
 
@@ -2149,10 +2290,10 @@
         }));
         setProposalsParts(proposalsWithParts);
 
-        // 5b) 組 Claude content blocks（text + image 混合）
+        // 5b) 組 Claude content blocks（優先用 Gemini 描述,fallback 才塞 vision）
         const intro = `你是一位專業的會議記錄與策略分析師。以下是一場會議的完整逐字稿、議程提案與提案附件。請用繁體中文產出一份結構完整的會後文件。
 
-注意：附件中的圖片（PDF 每頁、PPTX 內嵌圖、PNG/JPG）都是提案的一部分，請結合圖片中的視覺資訊（配色、排版、圖表、示意）與文字內容共同分析，不要只看文字。如附件有格式警告（例如 .key/.pages 無法讀取），請在摘要中明確提醒使用者。
+重要:每份提案附件都附有一段「Gemini 附件描述」,那是由視覺理解 AI 預先消化過的結構化摘要(包含整體概述、關鍵資訊、視覺元素描述、重點原文)。你可以把這段描述當作你「看過原檔」來分析。若附件有格式警告(例如 .key/.pages 無法讀取),請在摘要中明確提醒使用者。
 
 ━━━ 本次議程提案 ━━━`;
 
@@ -2222,17 +2363,25 @@ ${txText}
             for (const part of (p.parts || [])) {
               if (part.kind === 'needs-export') {
                 claudeBlocks.push({ type: 'text', text: `\n⚠️ 附件「${part.fileName}」：${part.hint}（本次無法納入分析）` });
-              } else if (part.kind === 'vision') {
-                claudeBlocks.push({ type: 'text', text: `\n附件「${part.fileName}」${part.note || ''}：` });
+                continue;
+              }
+              // 優先用 Gemini 描述(統一文字格式,省 token)
+              if (part.description) {
+                claudeBlocks.push({ type: 'text', text: `\n\n━━━ 附件「${part.fileName}」Gemini 描述 ━━━\n${part.description}` });
+                continue;
+              }
+              // Fallback:Gemini 失敗時,用原本的 vision/text 混合餵給 Claude
+              if (part.kind === 'vision') {
+                claudeBlocks.push({ type: 'text', text: `\n附件「${part.fileName}」${part.note || ''}:` });
                 claudeBlocks.push(...part.blocks);
               } else if (part.kind === 'pptx') {
                 claudeBlocks.push({ type: 'text', text: `\n附件「${part.fileName}」${part.note || ''}\n${(part.text || '').slice(0, 8000)}` });
                 if (part.blocks && part.blocks.length) {
-                  claudeBlocks.push({ type: 'text', text: '（簡報內嵌圖）' });
+                  claudeBlocks.push({ type: 'text', text: '(簡報內嵌圖)' });
                   claudeBlocks.push(...part.blocks);
                 }
               } else if (part.kind === 'text') {
-                claudeBlocks.push({ type: 'text', text: `\n附件「${part.fileName}」：\n${(part.text || '').slice(0, 10000)}` });
+                claudeBlocks.push({ type: 'text', text: `\n附件「${part.fileName}」:\n${(part.text || '').slice(0, 10000)}` });
               }
               // kind === 'empty' 就不輸出任何東西
             }
