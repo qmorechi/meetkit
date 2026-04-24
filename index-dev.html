@@ -226,6 +226,48 @@
       };
     };
 
+    // DOCX 半解：mammoth 只抽文字,但 .docx 是 zip,裡面 word/media/ 存著所有內嵌圖
+    // 用 JSZip 補抽圖片,跟 PPTX 走一樣的 path,這樣含圖 DOCX 也能完整還原
+    const DOCX_MAX_IMAGES = 40;
+    const docxToParts = async (fileUrl) => {
+      if (typeof JSZip === 'undefined' || typeof mammoth === 'undefined') return null;
+      const res = await fetch(fileUrl);
+      if (!res.ok) return null;
+      const buf = await res.arrayBuffer();
+
+      // 1) 用 mammoth 抽純文字(保留原本流程)
+      let text = '';
+      try {
+        const r = await mammoth.extractRawText({ arrayBuffer: buf });
+        text = r.value || '';
+      } catch (e) {
+        console.warn('mammoth 抽文字失敗:', e.message);
+      }
+
+      // 2) 用 JSZip 抽 word/media/ 裡的圖片
+      let blocks = [];
+      let totalImages = 0;
+      try {
+        const zip = await JSZip.loadAsync(buf);
+        const mediaEntries = Object.keys(zip.files)
+          .filter(k => /^word\/media\/.*\.(png|jpg|jpeg|gif|webp)$/i.test(k))
+          .sort()
+          .slice(0, DOCX_MAX_IMAGES);
+        totalImages = mediaEntries.length;
+        for (const key of mediaEntries) {
+          const ext = key.split('.').pop().toLowerCase();
+          const mime = ext === 'jpg' ? 'image/jpeg' : `image/${ext}`;
+          const blob = await zip.files[key].async('blob');
+          const data = await blobToBase64(blob);
+          blocks.push({ type: 'image', source: { type: 'base64', media_type: mime, data } });
+        }
+      } catch (e) {
+        console.warn('JSZip 解 DOCX 失敗(純文字 fallback):', e.message);
+      }
+
+      return { text, blocks, totalImages };
+    };
+
     // ─── GEMINI UNIVERSAL ATTACHMENT DESCRIBER ─────────────────────────────────
     // 統一用 Gemini 2.5 Flash 處理所有格式附件,產出結構化 Markdown 描述,
     // 後續 Claude 摘要時只讀這段描述,不必再重吃 raw vision tokens,省錢又一致。
@@ -334,12 +376,20 @@
       return await callGeminiDescribe(parts, fileName);
     };
 
-    // DOCX → 抽好的純文字
-    const geminiDescribeDocx = async (text, fileName) => {
-      if (!text?.trim()) return null;
-      return await callGeminiDescribe([
-        { text: `【文件內容】\n${text.slice(0, 30000)}` },
-      ], fileName);
+    // DOCX → 抽好的純文字 + 內嵌圖(選填)。txt/md/rtf 只有 text 沒 blocks,走一樣的 path
+    const geminiDescribeDocx = async (text, fileName, blocks = []) => {
+      const parts = [];
+      if (text?.trim()) {
+        parts.push({ text: `【文件內容】\n${text.slice(0, 30000)}` });
+      }
+      const imgBlocks = (blocks || []).slice(0, GEMINI_MAX_IMAGES_PER_CALL);
+      for (const b of imgBlocks) {
+        if (b.type === 'image' && b.source?.data) {
+          parts.push({ inline_data: { mime_type: b.source.media_type, data: b.source.data } });
+        }
+      }
+      if (parts.length === 0) return null;
+      return await callGeminiDescribe(parts, fileName);
     };
 
     // 單張圖片 → base64 直接送
@@ -399,14 +449,12 @@
         }
 
         if (ext === 'docx') {
-          if (typeof mammoth === 'undefined') return { ...base, kind: 'empty' };
-          const res = await fetch(fileUrl);
-          if (!res.ok) return { ...base, kind: 'empty' };
-          const buf = await res.arrayBuffer();
-          const result = await mammoth.extractRawText({ arrayBuffer: buf });
-          const text = result.value || '';
-          const description = await geminiDescribeDocx(text, fileName);
-          return { ...base, kind: 'text', text, description };
+          const r = await docxToParts(fileUrl);
+          if (!r || (!r.text && (!r.blocks || !r.blocks.length))) return { ...base, kind: 'empty' };
+          // Gemini 吃文字 + 內嵌圖,描述會連圖一起分析
+          const description = await geminiDescribeDocx(r.text, fileName, r.blocks);
+          const note = r.totalImages > 0 ? `(DOCX:文字 + ${r.totalImages} 張內嵌圖)` : '';
+          return { ...base, kind: 'docx', text: r.text, blocks: r.blocks, description, note };
         }
 
         if (['txt', 'md', 'rtf'].includes(ext)) {
@@ -457,7 +505,7 @@
               const url = await uploadRenderedToStorage(projectId, `${stem}-p${i + 1}.jpg`, blob, b.source.media_type);
               if (url) att.images.push({ url, caption: `${part.fileName} – 第 ${i + 1} 頁` });
             }
-          } else if (part.kind === 'pptx' && part.blocks?.length) {
+          } else if ((part.kind === 'pptx' || part.kind === 'docx') && part.blocks?.length) {
             const stem = safeStem(part.fileName);
             for (let i = 0; i < part.blocks.length; i++) {
               const b = part.blocks[i];
@@ -2374,10 +2422,10 @@ ${txText}
               if (part.kind === 'vision') {
                 claudeBlocks.push({ type: 'text', text: `\n附件「${part.fileName}」${part.note || ''}:` });
                 claudeBlocks.push(...part.blocks);
-              } else if (part.kind === 'pptx') {
+              } else if (part.kind === 'pptx' || part.kind === 'docx') {
                 claudeBlocks.push({ type: 'text', text: `\n附件「${part.fileName}」${part.note || ''}\n${(part.text || '').slice(0, 8000)}` });
                 if (part.blocks && part.blocks.length) {
-                  claudeBlocks.push({ type: 'text', text: '(簡報內嵌圖)' });
+                  claudeBlocks.push({ type: 'text', text: part.kind === 'pptx' ? '(簡報內嵌圖)' : '(文件內嵌圖)' });
                   claudeBlocks.push(...part.blocks);
                 }
               } else if (part.kind === 'text') {
