@@ -97,12 +97,13 @@ cp index-dev.html index.html
 ### 實際欄位(從 index.html 推斷)
 
 **`projects` 表:**
-- `id` (UUID)
-- `code` (6 碼專案代碼,例如 `A3X9KP`)
+- `id` (TEXT,6 碼專案代碼,例如 `A3X9KP` — 這就是專案代碼,**不是 UUID**,也**沒有**另外一個 `code` 欄位)
 - `title` (專案名稱)
-- `password_hash` (可選的密碼保護)
+- `password_hash` (可選的密碼保護,Route C 邀請制啟用後已不使用,欄位保留但 UI 拿掉)
 - `meeting_date`
 - `meeting_time`
+- `owner_email` (TEXT,2026-04-25 migration 加入,記錄建立者 email,用於 RLS)
+- `notion_parent_page_id` (TEXT,可選。該專案歸檔要寫到哪個 Notion 頁底下;為 null 則寫 NOTION_DB_ID 預設資料庫)
 
 **`proposals` 表:**
 - `id` (UUID)

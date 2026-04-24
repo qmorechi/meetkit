@@ -846,9 +846,21 @@
       useEffect(() => {
         if (!myEmail) return;
         // 單一 query:RLS 會回傳所有「我 owner OR 我是成員」的專案,前端再切成兩堆
-        db(`projects?select=id,code,title,meeting_date,owner_email&order=meeting_date.desc.nullslast`)
-          .then(r => r.json()).then(data => {
-            if (!Array.isArray(data)) return;
+        // 注意:projects 沒有 code 欄位,id 本身就是 6 碼專案代碼(例如 A3X9KP)
+        db(`projects?select=id,title,meeting_date,owner_email&order=meeting_date.desc,id.asc`)
+          .then(async r => {
+            if (!r.ok) {
+              const errBody = await r.text().catch(() => '');
+              console.error('[Home] 載入專案失敗', r.status, errBody);
+              return null;
+            }
+            return r.json();
+          }).then(data => {
+            if (!Array.isArray(data)) {
+              console.warn('[Home] projects 回傳不是陣列:', data);
+              return;
+            }
+            console.log('[Home] 載到', data.length, '個專案');
             const mine = [];
             const invited = [];
             for (const p of data) {
@@ -857,7 +869,9 @@
             }
             setMyProjects(mine);
             setInvitedProjects(invited);
-          }).catch(() => {});
+          }).catch(err => {
+            console.error('[Home] 網路/JSON 錯誤', err);
+          });
       }, [myEmail]);
 
       // 把使用者輸入的 email 清單切乾淨(逗號/分號/空白/換行都當分隔)
