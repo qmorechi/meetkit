@@ -57,8 +57,6 @@
       .hide-mobile { display: none !important; }
     }
   </style>
-  <script src="https://unpkg.com/@ffmpeg/ffmpeg@0.12.10/dist/umd/ffmpeg.js"></script>
-  <script src="https://unpkg.com/@ffmpeg/util@0.12.1/dist/umd/index.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/qrcodejs@1.0.0/qrcode.min.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/jszip@3.10.1/dist/jszip.min.js"></script>
 </head>
@@ -345,141 +343,20 @@
     const genId = () => Math.random().toString(36).slice(2, 8).toUpperCase();
 
     // ─── AUDIO PIPELINE ──────────────────────────────────────────────────────────
-    // 壓縮 → 靜音切段 → 並行 Whisper 上傳 → 合併逐字稿
-    // 依賴：ffmpeg.wasm（<head> CDN 載入）
+    // Web Audio API 原生切段 → 並行 Whisper 上傳 → 合併逐字稿
+    // 完全不用 ffmpeg.wasm（實測在 Safari + 慢網路 + 長檔下載失敗率高，改走純瀏覽器 API）
     // 決策文件：docs/audio-pipeline.md
     // ─────────────────────────────────────────────────────────────────────────────
 
     const AUDIO_CONFIG = {
       sampleRate: 16000,
       channels: 1,
-      bitrate: '24k',
-      codec: 'libopus',
-      targetSegmentMinutes: 15,
-      maxSegmentMinutes: 20,
-      searchWindowMinutes: 2,
-      silenceThresholdDb: -40,
-      minSilenceSec: 0.8,
       parallelChannels: 2,
       retryAttempts: 5,
       retryDelayMs: 3000,
       maxFileSizeMB: 500,
       whisperLanguage: 'zh',
       whisperPrompt: 'Cosmoship, 宇宙小艇, SIPAI, 偷瞄的X, MX Design, Figma, Supabase, Anthropic, Claude, ComfyUI, Flux, MeetKit',
-    };
-
-    // ffmpeg 懶載入（第一次呼叫時初始化，之後重用）
-    // 載入失敗時會拋錯，讓上層走 Web Audio API 備援路線
-    let ffmpegInstance = null;
-    let ffmpegLoadPromise = null;
-    const getFFmpeg = async () => {
-      if (ffmpegInstance) return ffmpegInstance;
-      if (ffmpegLoadPromise) return ffmpegLoadPromise;
-      const { FFmpeg } = FFmpegWASM;
-      const inst = new FFmpeg();
-      // 90 秒 timeout：core 首次要下載 ~30MB，Safari + 慢網路很容易超過 10 秒
-      ffmpegLoadPromise = Promise.race([
-        inst.load({ coreURL: 'https://unpkg.com/@ffmpeg/core@0.12.6/dist/umd/ffmpeg-core.js' }),
-        new Promise((_, reject) => setTimeout(() => reject(new Error('ffmpeg timeout')), 90000)),
-      ]).then(() => { ffmpegInstance = inst; return inst; })
-        .catch((e) => { ffmpegLoadPromise = null; throw e; });
-      return ffmpegLoadPromise;
-    };
-
-    // 階段 1：壓縮 → 16kHz mono opus 24kbps
-    // 嚴格版：失敗直接拋錯，讓上層決定要不要走 Web Audio fallback
-    // （不能靜默吞錯回傳原檔，否則後續切段也會掛，最後整個 80 分鐘原檔送上 Whisper 變成 413）
-    const compressAudioStrict = async (inputBlob, onProgress) => {
-      const ffmpeg = await getFFmpeg();
-      await ffmpeg.writeFile('input.m4a', new Uint8Array(await inputBlob.arrayBuffer()));
-      ffmpeg.on('progress', ({ progress }) => { if (onProgress) onProgress(Math.min(progress, 1)); });
-      // 用 .ogg 容器包 opus codec（Whisper 支援 .ogg，不支援純 .opus）
-      await ffmpeg.exec([
-        '-i', 'input.m4a',
-        '-ar', String(AUDIO_CONFIG.sampleRate),
-        '-ac', String(AUDIO_CONFIG.channels),
-        '-c:a', AUDIO_CONFIG.codec,
-        '-b:a', AUDIO_CONFIG.bitrate,
-        'output.ogg',
-      ]);
-      const out = await ffmpeg.readFile('output.ogg');
-      await ffmpeg.deleteFile('input.m4a');
-      await ffmpeg.deleteFile('output.ogg');
-      if (onProgress) onProgress(1);
-      return new Blob([out.buffer], { type: 'audio/ogg' });
-    };
-
-    // 階段 2a：靜音偵測
-    const detectSilence = async (audioBlob, silenceDurationSec) => {
-      const ffmpeg = await getFFmpeg();
-      await ffmpeg.writeFile('detect.ogg', new Uint8Array(await audioBlob.arrayBuffer()));
-      const marks = [];
-      ffmpeg.on('log', ({ message }) => {
-        const s = message.match(/silence_start: ([\d.]+)/);
-        const e = message.match(/silence_end: ([\d.]+) \| silence_duration: ([\d.]+)/);
-        if (s) marks.push({ type: 'start', time: parseFloat(s[1]) });
-        if (e) marks.push({ type: 'end', time: parseFloat(e[1]) });
-      });
-      await ffmpeg.exec(['-i', 'detect.ogg', '-af',
-        `silencedetect=noise=${AUDIO_CONFIG.silenceThresholdDb}dB:d=${silenceDurationSec}`,
-        '-f', 'null', '-']);
-      await ffmpeg.deleteFile('detect.ogg');
-      const silences = [];
-      for (let i = 0; i < marks.length - 1; i++) {
-        if (marks[i].type === 'start' && marks[i + 1].type === 'end') {
-          silences.push({ midpoint: (marks[i].time + marks[i + 1].time) / 2 });
-        }
-      }
-      return silences;
-    };
-
-    // 階段 2b：計算切段邊界
-    const calculateSegmentBoundaries = async (audioBlob, totalDurationSec) => {
-      const targetSec = AUDIO_CONFIG.targetSegmentMinutes * 60;
-      const windowSec = AUDIO_CONFIG.searchWindowMinutes * 60;
-      const maxSec    = AUDIO_CONFIG.maxSegmentMinutes * 60;
-      let silences = await detectSilence(audioBlob, AUDIO_CONFIG.minSilenceSec);
-      if (silences.length === 0) silences = await detectSilence(audioBlob, 0.5); // 寬鬆 fallback
-      const boundaries = [0];
-      let pos = 0;
-      while (pos < totalDurationSec) {
-        const ideal = pos + targetSec;
-        if (ideal >= totalDurationSec) break;
-        const candidates = silences.filter(s => s.midpoint >= ideal - windowSec && s.midpoint <= ideal + windowSec);
-        let cut;
-        if (candidates.length > 0) {
-          cut = candidates.reduce((best, s) =>
-            Math.abs(s.midpoint - ideal) < Math.abs(best.midpoint - ideal) ? s : best
-          ).midpoint;
-        } else if (pos + maxSec < totalDurationSec) {
-          cut = pos + maxSec; // 找不到靜音，強制切
-        } else {
-          break;
-        }
-        boundaries.push(cut);
-        pos = cut;
-      }
-      boundaries.push(totalDurationSec);
-      return boundaries;
-    };
-
-    // 階段 2c：依邊界切出各段 Blob
-    const segmentAudio = async (compressedBlob, boundaries, onProgress) => {
-      const ffmpeg = await getFFmpeg();
-      await ffmpeg.writeFile('full.ogg', new Uint8Array(await compressedBlob.arrayBuffer()));
-      const segments = [];
-      for (let i = 0; i < boundaries.length - 1; i++) {
-        const start = boundaries[i];
-        const dur   = boundaries[i + 1] - boundaries[i];
-        const name  = `seg_${i}.ogg`;
-        await ffmpeg.exec(['-i', 'full.ogg', '-ss', String(start), '-t', String(dur), '-c', 'copy', name]);
-        const data  = await ffmpeg.readFile(name);
-        segments.push({ index: i, blob: new Blob([data.buffer], { type: 'audio/ogg' }), startSec: start, durationSec: dur });
-        await ffmpeg.deleteFile(name);
-        if (onProgress) onProgress((i + 1) / (boundaries.length - 1));
-      }
-      await ffmpeg.deleteFile('full.ogg');
-      return segments;
     };
 
     // 階段 3a：單段 Whisper（含重試）
@@ -559,9 +436,8 @@
       };
     };
 
-    // ─── WEB AUDIO FALLBACK ──────────────────────────────────────────────────
-    // ffmpeg.wasm 無法載入時的備援路線（Safari 無 COOP/COEP、核心下載失敗等）
-    // 全程使用瀏覽器原生 AudioContext，保證任何環境都能切段上傳
+    // ─── WEB AUDIO SEGMENTATION ──────────────────────────────────────────────
+    // 全程使用瀏覽器原生 AudioContext，無 WASM 依賴，任何環境都能切段上傳
 
     // 每段 5 分鐘：16kHz mono 16-bit WAV ≈ 9.6MB
     // 小段落換來:(1) 單次上傳失敗風險低(2) 平行連線總頻寬壓力小(3) Edge Function 處理時間短
@@ -2203,7 +2079,6 @@
       const [archiving,        setArchiving]        = useState(false);
       const [archiveSteps,     setArchiveSteps]     = useState([]);
       const [proposalsParts,   setProposalsParts]   = useState([]);
-      const [compressProgress, setCompressProgress] = useState(0);
       const [segmentProgress,  setSegmentProgress]  = useState(0);
       const [uploadProgress,   setUploadProgress]   = useState(0);
       const [segmentCount,     setSegmentCount]     = useState(0);
@@ -2223,30 +2098,16 @@
           setErrMsg(`檔案過大，請上傳 ${AUDIO_CONFIG.maxFileSizeMB} MB 以內的音檔`); return;
         }
         setErrMsg('');
-        setCompressProgress(0); setSegmentProgress(0); setUploadProgress(0); setFailedSegments([]);
+        setSegmentProgress(0); setUploadProgress(0); setFailedSegments([]);
         let txText = '';
 
         let segs, duration;
         try {
-          // ── 階段 1-2：ffmpeg 主路線（壓縮 + 靜音切段） ─────────────────────
-          // ffmpeg 載入失敗或切段失敗，一律退到 Web Audio API 備援路線
-          try {
-            setStatus('compressing');
-            const compressed = await compressAudioStrict(audioSrc, p => setCompressProgress(p));
-
-            setStatus('segmenting');
-            duration = await getAudioDuration(audioSrc);
-            const boundaries = await calculateSegmentBoundaries(compressed, duration);
-            segs = await segmentAudio(compressed, boundaries, p => setSegmentProgress(p));
-          } catch (ffmpegErr) {
-            // Web Audio fallback：原生瀏覽器 API，無 WASM 依賴，一定能切
-            console.warn('ffmpeg 路線失敗，改走 Web Audio API 備援：', ffmpegErr.message);
-            setStatus('segmenting');
-            setCompressProgress(1);
-            const webResult = await segmentAudioWebAudio(audioSrc, p => setSegmentProgress(p));
-            segs = webResult.segments;
-            duration = webResult.duration;
-          }
+          // ── 階段 1：Web Audio API 切段（原生瀏覽器 API，無 WASM 依賴） ───
+          setStatus('segmenting');
+          const webResult = await segmentAudioWebAudio(audioSrc, p => setSegmentProgress(p));
+          segs = webResult.segments;
+          duration = webResult.duration;
           setSegmentProgress(1);
           setSegmentCount(segs.length);
 
@@ -2437,7 +2298,7 @@ ${txText}
         a.download = `meetkit-${new Date().toISOString().slice(0,10)}.md`; a.click();
       };
 
-      const running = ['compressing', 'segmenting', 'transcribing', 'summarizing'].includes(status);
+      const running = ['segmenting', 'transcribing', 'summarizing'].includes(status);
 
       const handleArchive = async () => {
         setArchiving(true);
@@ -2525,15 +2386,8 @@ ${txText}
             <>
               {running && status !== 'summarizing' && (
                 <div style={{ ...S.card, padding: '14px 16px', display: 'flex', flexDirection: 'column', gap: 8 }}>
-                  {status === 'compressing' && <>
-                    <div style={{ fontSize: 13, color: C.textSec }}>⚙️ 壓縮音訊中…</div>
-                    <div style={{ height: 6, background: C.border, borderRadius: 3, overflow: 'hidden' }}>
-                      <div style={{ height: '100%', width: `${Math.round(compressProgress * 100)}%`, background: C.accent, borderRadius: 3, transition: 'width 0.3s' }} />
-                    </div>
-                    <div style={{ fontSize: 11, color: C.textMut }}>{Math.round(compressProgress * 100)}%</div>
-                  </>}
                   {status === 'segmenting' && <>
-                    <div style={{ fontSize: 13, color: C.textSec }}>✂️ 靜音偵測切段中…</div>
+                    <div style={{ fontSize: 13, color: C.textSec }}>✂️ 切段中…（5 分鐘/段）</div>
                     <div style={{ height: 6, background: C.border, borderRadius: 3, overflow: 'hidden' }}>
                       <div style={{ height: '100%', width: `${Math.round(segmentProgress * 100)}%`, background: C.accent, borderRadius: 3, transition: 'width 0.3s' }} />
                     </div>
@@ -2554,8 +2408,7 @@ ${txText}
                 </div>
               )}
               <button style={{ ...btn('primary'), padding: 14, fontSize: 15, opacity: running ? 0.7 : 1 }} onClick={run} disabled={running}>
-                {status === 'compressing'  ? <><Spinner /> 壓縮音訊中…</> :
-                 status === 'segmenting'   ? <><Spinner /> 切段中…</> :
+                {status === 'segmenting'   ? <><Spinner /> 切段中…</> :
                  status === 'transcribing' ? <><Spinner /> 語音轉文字中…</> :
                  status === 'summarizing'  ? <><Spinner /> AI 摘要生成中…</> :
                  '▶ 開始轉文字 & 摘要'}
@@ -2624,12 +2477,17 @@ ${txText}
       const [syncingId, setSyncingId] = useState(null);
       const [batchSyncing, setBatchSyncing] = useState(false);
       const [syncedIds, setSyncedIds] = useState(() => new Set(
-        journal.filter(j => j.notionSynced).map(j => j.id)
+        journal.filter(j => j.notion_page_id).map(j => j.id)
       ));
+
+      // journal 從 DB reload 後,同步 syncedIds 狀態（避免卡在舊 state）
+      useEffect(() => {
+        setSyncedIds(new Set(journal.filter(j => j.notion_page_id).map(j => j.id)));
+      }, [journal]);
 
       const handleBatchSync = async () => {
         if (!onSyncToNotion) return;
-        const unsynced = journal.filter(j => !syncedIds.has(j.id) && !j.notionSynced);
+        const unsynced = journal.filter(j => !syncedIds.has(j.id) && !j.notion_page_id);
         if (unsynced.length === 0) { alert('所有日誌都已同步到 Notion'); return; }
         if (!confirm(`準備同步 ${unsynced.length} 筆日誌到 Notion，確定繼續？`)) return;
         setBatchSyncing(true);
@@ -2724,7 +2582,7 @@ ${txText}
                     </div>
                     <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
                       {onSyncToNotion && (
-                        syncedIds.has(m.id) || m.notionSynced
+                        syncedIds.has(m.id) || m.notion_page_id
                           ? <span style={{ ...badge('#2ecc71', '#e8faf0'), fontSize: 10, padding: '2px 7px' }}>✓ Notion</span>
                           : <button
                               style={{ ...btn('ghost'), padding: '3px 8px', fontSize: 11, color: '#666', borderColor: 'transparent', opacity: syncingId === m.id ? 0.5 : 1 }}
@@ -3010,6 +2868,7 @@ ${txText}
       };
 
       // ─── 同步單筆日誌到 Notion ───────────────────────────────────
+      // 成功後把 notion_page_id 寫回 journals 表,避免重整/重開後重複同步
       const syncEntryToNotion = async (entry) => {
         const isoDate = new Date().toISOString().split('T')[0];
         try {
@@ -3023,7 +2882,18 @@ ${txText}
           });
           const data = await res.json();
           if (!res.ok) throw new Error(data.error || 'Notion 同步失敗');
-          return { ok: true, url: data.notionUrl };
+          // 持久化：把 notion_page_id 寫回 DB（schema 需要有此欄位,見 docs/README）
+          if (data.notionPageId && entry.id) {
+            try {
+              await db(`journals?id=eq.${entry.id}`, {
+                method: 'PATCH',
+                body: JSON.stringify({ notion_page_id: data.notionPageId }),
+              });
+            } catch (patchErr) {
+              console.warn('notion_page_id 寫回失敗（欄位可能未建立）:', patchErr);
+            }
+          }
+          return { ok: true, url: data.notionUrl, pageId: data.notionPageId };
         } catch (e) {
           console.error('Notion sync failed:', e);
           return { ok: false };
@@ -3047,10 +2917,10 @@ ${txText}
         // 同步到 Notion（背景執行，不阻擋流程）
         syncEntryToNotion(notionEntry).then(result => {
           if (result.ok) {
-            setJournal(prev => prev.map(j => j.id === dbEntry.id ? { ...j, notionSynced: true, notionUrl: result.url } : j));
+            setJournal(prev => prev.map(j => j.id === dbEntry.id ? { ...j, notion_page_id: result.pageId, notionUrl: result.url } : j));
           }
         });
-        setJournal(prev => [...prev, { ...dbEntry, notionSynced: false }]);
+        setJournal(prev => [...prev, { ...dbEntry }]);
         setPhase(3);
       };
 
