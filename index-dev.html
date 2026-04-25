@@ -1771,8 +1771,25 @@
                     placeholder="時"
                     min={0}
                     max={23}
+                    lang="en"
+                    autoComplete="off"
+                    autoCorrect="off"
+                    autoCapitalize="off"
+                    spellCheck={false}
                     className="mk-time-part"
                     value={hourInput}
+                    onBeforeInput={e => {
+                      // 攔住注音/中文輸入法 — 只要即將插入的字串不是純數字就拒絕
+                      // 注意:macOS Safari 可能不完全尊重 IME 合成的 preventDefault,
+                      // 但同時搭配 onChange 的 replace(/\D/g, '') 雙保險
+                      if (e.data != null && !/^\d+$/.test(e.data)) e.preventDefault();
+                    }}
+                    onCompositionEnd={e => {
+                      // IME 合成結束(例如使用者打了注音再選字)→ 強制清掉非數字
+                      // 不要在 compositionstart 做 blur+focus,那會讓使用者在中文 IME 狀態下根本打不進字
+                      const v = (e.target.value || '').replace(/\D/g, '').slice(0, 2);
+                      setHourInput(v);
+                    }}
                     onChange={e => {
                       // 24 小時制:0-23 才合法
                       // 第 1 碼是 3-9 → 單碼即可(3,4,...,9 = 03,04,...,09),自動跳到分
@@ -1817,8 +1834,20 @@
                     placeholder="分"
                     min={0}
                     max={59}
+                    lang="en"
+                    autoComplete="off"
+                    autoCorrect="off"
+                    autoCapitalize="off"
+                    spellCheck={false}
                     className="mk-time-part"
                     value={minuteInput}
+                    onBeforeInput={e => {
+                      if (e.data != null && !/^\d+$/.test(e.data)) e.preventDefault();
+                    }}
+                    onCompositionEnd={e => {
+                      const v = (e.target.value || '').replace(/\D/g, '').slice(0, 2);
+                      setMinuteInput(v);
+                    }}
                     onChange={e => {
                       // 分:0-59 才合法,第 2 碼讓分鐘超過 59 就拒絕
                       let v = e.target.value.replace(/\D/g, '').slice(0, 2);
