@@ -1722,7 +1722,30 @@
             {showDatePicker && (
               <div style={{ marginTop: 16, paddingTop: 16, borderTop: `1px solid ${C.border}`, display: 'flex', gap: 10, alignItems: 'center', flexWrap: 'wrap' }} className="fade-in">
                 <input type="date" style={{ ...S.input, width: 'auto', fontSize: 13, colorScheme: 'dark' }} value={meetingDate} onChange={e => { setMeetingDate(e.target.value); saveMeetingInfo(e.target.value, meetingTime); }} />
-                <input type="time" style={{ ...S.input, width: 'auto', fontSize: 13, colorScheme: 'dark' }} value={meetingTime} onChange={e => { setMeetingTime(e.target.value); saveMeetingInfo(meetingDate, e.target.value); }} />
+                {/* 時間用 text input 直接打字(原 type="time" 的 Safari 上下鍵很難用)
+                    onBlur 寬鬆解析:支援 9:30 / 09:30 / 0930 / 9.30,離開時統一正規化成 HH:MM
+                    inputMode="numeric" 讓手機跳數字鍵盤 */}
+                <input
+                  type="text"
+                  inputMode="numeric"
+                  placeholder="HH:MM"
+                  maxLength={5}
+                  style={{ ...S.input, width: 80, fontSize: 13, textAlign: 'center', fontVariantNumeric: 'tabular-nums' }}
+                  value={meetingTime}
+                  onChange={e => setMeetingTime(e.target.value)}
+                  onBlur={e => {
+                    const v = (e.target.value || '').trim();
+                    if (!v) { saveMeetingInfo(meetingDate, ''); return; }
+                    // 接受 H:MM / HH:MM / HHMM / H.MM 等格式
+                    const m = v.match(/^(\d{1,2})[:.\-\s]?(\d{2})$/);
+                    if (!m) { saveMeetingInfo(meetingDate, v); return; } // 無法解析就照打字內容存
+                    const h = String(Math.min(23, parseInt(m[1], 10))).padStart(2, '0');
+                    const mm = String(Math.min(59, parseInt(m[2], 10))).padStart(2, '0');
+                    const normalized = `${h}:${mm}`;
+                    setMeetingTime(normalized);
+                    saveMeetingInfo(meetingDate, normalized);
+                  }}
+                />
                 <button style={{ ...btn('primary'), padding: '7px 16px', fontSize: 13 }} onClick={() => { openNewRound(); setShowDatePicker(false); }}>✓ 確認開新準備室</button>
                 {(meetingDate || meetingTime) && (
                   <button style={{ ...btn('ghost'), padding: '6px 10px', fontSize: 12, color: C.textMut }} onClick={() => { setMeetingDate(''); setMeetingTime(''); saveMeetingInfo('', ''); }}>✕ 清除</button>
