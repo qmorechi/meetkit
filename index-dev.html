@@ -855,13 +855,52 @@
         return t && t !== '未命名專案';
       };
 
+      // 狀態相關 helpers(2026-04-27):active 一般顯示;paused 排到最後;closed 從清單隱藏
+      const sortByStatus = (list) => [...list].sort((a, b) => {
+        const aP = a.status === 'paused' ? 1 : 0;
+        const bP = b.status === 'paused' ? 1 : 0;
+        return aP - bP; // active 在前(0),paused 在後(1);內部維持 DB 原排序(meeting_date desc)
+      });
+
+      // 切換暫停 ↔ active(同一顆按鈕,依現狀切)
+      const togglePause = async (project) => {
+        const newStatus = project.status === 'paused' ? 'active' : 'paused';
+        const r = await db(`projects?id=eq.${project.id}`, {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json', Prefer: 'return=minimal' },
+          body: JSON.stringify({ status: newStatus }),
+        });
+        if (!r.ok) {
+          alert(`狀態更新失敗 (${r.status})\n如果是第一次用,請確認 Supabase 已執行 status 欄位的 migration。`);
+          return;
+        }
+        setMyProjects(prev => prev.map(p => p.id === project.id ? { ...p, status: newStatus } : p));
+      };
+
+      // 結案:軟刪除(status='closed'),從清單隱藏。日誌和提案不刪
+      const closeProject = async (project) => {
+        const ok = window.confirm(`確定結案「${project.title}」?\n\n日誌和提案會保留在 DB,但這個專案不再顯示於清單。\n要重啟請另開新案,Notion 連結再接回。`);
+        if (!ok) return;
+        const r = await db(`projects?id=eq.${project.id}`, {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json', Prefer: 'return=minimal' },
+          body: JSON.stringify({ status: 'closed' }),
+        });
+        if (!r.ok) {
+          alert(`結案失敗 (${r.status})\n如果是第一次用,請確認 Supabase 已執行 status 欄位的 migration。`);
+          return;
+        }
+        setMyProjects(prev => prev.filter(p => p.id !== project.id));
+      };
+
       const myEmail = (currentSession?.user?.email || '').toLowerCase();
 
       useEffect(() => {
         if (!myEmail) return;
         // 單一 query:RLS 會回傳所有「我 owner OR 我是成員」的專案,前端再切成兩堆
         // 注意:projects 沒有 code 欄位,id 本身就是 6 碼專案代碼(例如 A3X9KP)
-        db(`projects?select=id,title,meeting_date,owner_email&order=meeting_date.desc,id.asc`)
+        // status 欄位 2026-04-27 加的,舊資料預設 'active'
+        db(`projects?select=id,title,meeting_date,owner_email,status&order=meeting_date.desc,id.asc`)
           .then(async r => {
             if (!r.ok) {
               const errBody = await r.text().catch(() => '');
@@ -962,25 +1001,73 @@
         setCreating(false);
       };
 
-      const renderProjectItem = (p) => (
-        <div key={p.id} style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '9px 12px', background: C.bgInput, borderRadius: 8, border: `1px solid ${C.border}`, cursor: 'pointer', transition: 'border-color 0.15s' }}
-          onClick={() => onEnter(p.code || p.id)}
-          onMouseEnter={e => e.currentTarget.style.borderColor = C.accent + '66'}
-          onMouseLeave={e => e.currentTarget.style.borderColor = C.border}>
-          <div style={{ flex: 1, minWidth: 0 }}>
-            <div style={{ fontSize: 14, fontWeight: 500, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-              {p.title || '(未命名)'}
+      const renderProjectItem = (p, opts = {}) => {
+        const { showActions = false } = opts;
+        const isPaused = p.status === 'paused';
+        // 顏色定義(直接寫死,不擴 C palette):
+        // 暫停:#E0A800 偏暖黃,跟現有的 ec1d24 紅夠區分
+        // 結案:#ec1d24 跟 breathe 動畫的紅一致(品牌紅)
+        const PAUSE_COLOR = '#E0A800';
+        const CLOSE_COLOR = '#ec1d24';
+        const actionBtn = (color) => ({
+          background: 'transparent',
+          border: `1px solid ${color}66`,
+          color: color,
+          fontSize: 11,
+          padding: '3px 8px',
+          borderRadius: 5,
+          cursor: 'pointer',
+          fontFamily: 'inherit',
+          transition: 'background 0.15s, border-color 0.15s',
+          whiteSpace: 'nowrap',
+        });
+        return (
+          <div key={p.id} style={{
+            display: 'flex', alignItems: 'center', gap: 8,
+            padding: '9px 12px', background: C.bgInput, borderRadius: 8,
+            border: `1px solid ${C.border}`, cursor: 'pointer',
+            transition: 'border-color 0.15s, opacity 0.15s',
+            opacity: isPaused ? 0.55 : 1, // paused 整列降透明度
+          }}
+            onClick={() => onEnter(p.code || p.id)}
+            onMouseEnter={e => e.currentTarget.style.borderColor = C.accent + '66'}
+            onMouseLeave={e => e.currentTarget.style.borderColor = C.border}>
+            <div style={{ flex: 1, minWidth: 0 }}>
+              <div style={{ fontSize: 14, fontWeight: 500, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', display: 'flex', alignItems: 'center', gap: 6 }}>
+                <span style={{ overflow: 'hidden', textOverflow: 'ellipsis' }}>{p.title || '(未命名)'}</span>
+                {isPaused && <span style={{ fontSize: 10, color: PAUSE_COLOR, fontWeight: 400, flexShrink: 0 }}>⏸ 暫停中</span>}
+              </div>
+              <div style={{ fontSize: 11, color: C.textMut, fontFamily: 'monospace', letterSpacing: '0.08em', marginTop: 2 }}>
+                {p.code || p.id}{p.meeting_date ? `　·　${p.meeting_date}` : ''}
+              </div>
             </div>
-            <div style={{ fontSize: 11, color: C.textMut, fontFamily: 'monospace', letterSpacing: '0.08em', marginTop: 2 }}>
-              {p.code || p.id}{p.meeting_date ? `　·　${p.meeting_date}` : ''}
-            </div>
+            {/* 動作按鈕:只有「我建立的」清單才顯示(owner only,RLS 也只允許 owner 改) */}
+            {showActions && (
+              <div style={{ display: 'flex', gap: 4, flexShrink: 0 }}>
+                <button
+                  style={actionBtn(PAUSE_COLOR)}
+                  onClick={(e) => { e.stopPropagation(); togglePause(p); }}
+                  onMouseEnter={e => e.currentTarget.style.background = PAUSE_COLOR + '22'}
+                  onMouseLeave={e => e.currentTarget.style.background = 'transparent'}
+                  title={isPaused ? '恢復為進行中' : '暫停 — 排到清單最後'}
+                >{isPaused ? '恢復' : '暫停'}</button>
+                <button
+                  style={actionBtn(CLOSE_COLOR)}
+                  onClick={(e) => { e.stopPropagation(); closeProject(p); }}
+                  onMouseEnter={e => e.currentTarget.style.background = CLOSE_COLOR + '22'}
+                  onMouseLeave={e => e.currentTarget.style.background = 'transparent'}
+                  title="結案 — 從清單隱藏(資料保留在 DB)"
+                >結案</button>
+              </div>
+            )}
           </div>
-        </div>
-      );
+        );
+      };
 
       // 一次顯示 PAGE_SIZE 個項目,超過就在右側出現上下箭頭(每按一次捲 1 個)
       // 沒超過 PAGE_SIZE 就完全不出現箭頭,讓面板自然撐開收縮
-      const renderProjectListWithNav = (list, offset, setOffset) => {
+      // opts.showActions 控制每個 item 是否顯示「暫停 / 結案」按鈕(只在 owner 清單)
+      const renderProjectListWithNav = (list, offset, setOffset, opts = {}) => {
         const total = list.length;
         const showNav = total > PAGE_SIZE;
         // 防呆:offset 不要超出範圍(例如清單變短了)
@@ -1005,7 +1092,7 @@
         return (
           <div style={{ display: 'flex', gap: 6, alignItems: 'stretch' }}>
             <div style={{ flex: 1, display: 'flex', flexDirection: 'column', gap: 6, minWidth: 0 }}>
-              {visible.map(renderProjectItem)}
+              {visible.map(p => renderProjectItem(p, opts))}
             </div>
             {showNav && (
               <div style={{ display: 'flex', flexDirection: 'column', gap: 4, width: 28 }}>
@@ -1037,32 +1124,40 @@
 
           <div style={{ width: '100%', maxWidth: 460, display: 'flex', flexDirection: 'column', gap: 16 }}>
 
-            {/* 我建立的會議 — 過濾掉未命名空殼;最多顯示 5 個,超過用箭頭捲 */}
+            {/* 我建立的會議 — 過濾未命名空殼 + closed,paused 排到最後;最多顯示 5 個 */}
             {(() => {
-              const named = myProjects.filter(isNamedProject);
-              if (named.length === 0) return null;
+              const visible = sortByStatus(
+                myProjects
+                  .filter(p => p.status !== 'closed')
+                  .filter(isNamedProject)
+              );
+              if (visible.length === 0) return null;
               return (
                 <div style={S.panel}>
                   <div style={{ fontSize: 15, fontWeight: 600, marginBottom: 12, display: 'flex', alignItems: 'center', gap: 6 }}>
                     🧑‍💼 我建立的會議
-                    <span style={{ fontSize: 11, color: C.textMut, fontWeight: 400 }}>({named.length})</span>
+                    <span style={{ fontSize: 11, color: C.textMut, fontWeight: 400 }}>({visible.length})</span>
                   </div>
-                  {renderProjectListWithNav(named, myOffset, setMyOffset)}
+                  {renderProjectListWithNav(visible, myOffset, setMyOffset, { showActions: true })}
                 </div>
               );
             })()}
 
-            {/* 我被邀請的會議 — 同樣過濾未命名 + 5 個一頁 */}
+            {/* 我被邀請的會議 — 同樣過濾;沒有動作按鈕(owner 才能改狀態) */}
             {(() => {
-              const named = invitedProjects.filter(isNamedProject);
-              if (named.length === 0) return null;
+              const visible = sortByStatus(
+                invitedProjects
+                  .filter(p => p.status !== 'closed')
+                  .filter(isNamedProject)
+              );
+              if (visible.length === 0) return null;
               return (
                 <div style={S.panel}>
                   <div style={{ fontSize: 15, fontWeight: 600, marginBottom: 12, display: 'flex', alignItems: 'center', gap: 6 }}>
                     📨 我被邀請的會議
-                    <span style={{ fontSize: 11, color: C.textMut, fontWeight: 400 }}>({named.length})</span>
+                    <span style={{ fontSize: 11, color: C.textMut, fontWeight: 400 }}>({visible.length})</span>
                   </div>
-                  {renderProjectListWithNav(named, invitedOffset, setInvitedOffset)}
+                  {renderProjectListWithNav(visible, invitedOffset, setInvitedOffset)}
                 </div>
               );
             })()}
