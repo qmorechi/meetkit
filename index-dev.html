@@ -1798,9 +1798,9 @@
                     }}
                     onFocus={e => e.target.select()}
                     data-time-part="hour"
-                    style={{ background: 'transparent', border: 'none', outline: 'none', color: C.text, fontSize: 13, width: 26, textAlign: 'center', padding: 0, fontFamily: 'inherit', fontVariantNumeric: 'tabular-nums' }}
+                    style={{ background: 'transparent', border: 'none', outline: 'none', color: C.text, fontSize: 13, width: 18, textAlign: 'right', padding: 0, fontFamily: 'inherit', fontVariantNumeric: 'tabular-nums' }}
                   />
-                  <span style={{ fontSize: 13, color: C.textMut, padding: '0 2px' }}>:</span>
+                  <span style={{ fontSize: 13, color: C.textMut, padding: '0 1px' }}>:</span>
                   <input
                     type="text"
                     inputMode="numeric"
@@ -1825,7 +1825,7 @@
                     }}
                     onFocus={e => e.target.select()}
                     data-time-part="minute"
-                    style={{ background: 'transparent', border: 'none', outline: 'none', color: C.text, fontSize: 13, width: 26, textAlign: 'center', padding: 0, fontFamily: 'inherit', fontVariantNumeric: 'tabular-nums' }}
+                    style={{ background: 'transparent', border: 'none', outline: 'none', color: C.text, fontSize: 13, width: 18, textAlign: 'left', padding: 0, fontFamily: 'inherit', fontVariantNumeric: 'tabular-nums' }}
                   />
                 </div>
                 <button style={{ ...btn('primary'), padding: '7px 16px', fontSize: 13 }} onClick={() => { openNewRound(); setShowDatePicker(false); }}>✓ 確認開新準備室</button>
