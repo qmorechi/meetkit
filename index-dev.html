@@ -1516,6 +1516,10 @@
       const [notionTargetTitle, setNotionTargetTitle] = useState('');
       const [notionTesting, setNotionTesting] = useState(false);
       const [notionMsg, setNotionMsg] = useState('');
+      // 編輯模式:預設 false,沒有設定過時自動切 true 讓使用者能直接打字
+      // 載入到已有 URL 時 = false,鎖 read-only + 顯示「修改」按鈕
+      // 點「修改」 = true,變成編輯狀態 + 顯示「測試並儲存」按鈕
+      const [notionEditing, setNotionEditing] = useState(false);
       // 邀請白名單:此專案的 owner + members
       const [projectOwnerEmail, setProjectOwnerEmail] = useState('');
       const [members, setMembers] = useState([]);
@@ -1601,12 +1605,21 @@
 
       // ─── Notion 目標頁 + 專案 owner_email ──────────────────────────────
       // 載入該專案儲存過的 Notion parent page id 和 owner_email(後者決定使用者是否能改成員)
+      // notion_url 是 2026-04-27 加的,保存使用者貼的原始 URL;若沒有 fallback 用 page id
       useEffect(() => {
         if (!projectId) return;
-        db(`projects?id=eq.${projectId}&select=notion_parent_page_id,owner_email`)
+        db(`projects?id=eq.${projectId}&select=notion_parent_page_id,notion_url,owner_email`)
           .then(r => r.json()).then(d => {
-            const v = d?.[0]?.notion_parent_page_id || '';
-            if (v) setNotionTarget(v);
+            const url = d?.[0]?.notion_url || '';
+            const pageId = d?.[0]?.notion_parent_page_id || '';
+            // 顯示優先用 url(使用者貼的原樣),沒有再 fallback 用 pageId 包成 notion.so URL
+            const display = url || (pageId ? `https://www.notion.so/${pageId}` : '');
+            if (display) {
+              setNotionTarget(display);
+              setNotionEditing(false); // 已設定 → read-only + 顯示「修改」
+            } else {
+              setNotionEditing(true); // 完全沒設定 → 直接編輯
+            }
             setProjectOwnerEmail(d?.[0]?.owner_email || '');
           }).catch(() => {});
       }, [projectId]);
@@ -1861,13 +1874,17 @@
             setNotionTesting(false);
             return;
           }
-          // 存回 DB
+          // 存回 DB:同時寫 page id(歸檔用)和 notion_url(UI 顯示用,保留使用者貼的原樣)
           await db(`projects?id=eq.${projectId}`, {
             method: 'PATCH',
-            body: JSON.stringify({ notion_parent_page_id: pageId }),
+            body: JSON.stringify({
+              notion_parent_page_id: pageId,
+              notion_url: notionTarget.trim(),
+            }),
           });
           setNotionTargetTitle(testData.title || '');
           setNotionMsg(`✓ 已連到「${testData.title || pageId}」,之後歸檔會同步到這頁底下`);
+          setNotionEditing(false); // 儲存成功 → 切回 read-only,按鈕變「修改」
         } catch (e) {
           setNotionMsg(`❌ ${e.message || '連線失敗'}`);
         } finally {
@@ -1879,9 +1896,10 @@
         setNotionTarget('');
         setNotionTargetTitle('');
         setNotionMsg('');
+        setNotionEditing(true); // 清掉後直接進入編輯模式,讓使用者能立刻貼新 URL
         await db(`projects?id=eq.${projectId}`, {
           method: 'PATCH',
-          body: JSON.stringify({ notion_parent_page_id: null }),
+          body: JSON.stringify({ notion_parent_page_id: null, notion_url: null }),
         });
         showToast('✓ 已取消 Notion 目標頁,歸檔會改寫到預設資料庫');
       };
@@ -2183,16 +2201,33 @@
                     value={notionTarget}
                     onChange={e => setNotionTarget(e.target.value)}
                     placeholder="貼 Notion 頁面 URL(歸檔時寫到這頁底下)"
-                    style={{ ...S.input, flex: 1, fontSize: 12, padding: '6px 10px' }}
-                    onKeyDown={e => e.key === 'Enter' && saveNotionTarget()}
+                    readOnly={!notionEditing}
+                    style={{
+                      ...S.input,
+                      flex: 1, fontSize: 12, padding: '6px 10px',
+                      // read-only 時降透明度 + cursor 改成 default,讓使用者一眼就知道現在不能改
+                      opacity: notionEditing ? 1 : 0.65,
+                      cursor: notionEditing ? 'text' : 'default',
+                    }}
+                    onKeyDown={e => e.key === 'Enter' && notionEditing && saveNotionTarget()}
                   />
-                  <button
-                    style={{ ...btn('primary'), padding: '6px 12px', fontSize: 12, flexShrink: 0, opacity: notionTesting ? 0.6 : 1 }}
-                    disabled={notionTesting}
-                    onClick={saveNotionTarget}
-                  >
-                    {notionTesting ? '測試中…' : '測試並儲存'}
-                  </button>
+                  {notionEditing ? (
+                    <button
+                      style={{ ...btn('primary'), padding: '6px 12px', fontSize: 12, flexShrink: 0, opacity: notionTesting ? 0.6 : 1 }}
+                      disabled={notionTesting}
+                      onClick={saveNotionTarget}
+                    >
+                      {notionTesting ? '測試中…' : '測試並儲存'}
+                    </button>
+                  ) : (
+                    <button
+                      style={{ ...btn('ghost'), padding: '6px 12px', fontSize: 12, flexShrink: 0 }}
+                      onClick={() => setNotionEditing(true)}
+                      title="重新輸入 Notion URL"
+                    >
+                      ✏️ 修改
+                    </button>
+                  )}
                   {notionTarget && (
                     <button
                       style={{ ...btn('ghost'), padding: '6px 10px', fontSize: 12, flexShrink: 0, color: C.textMut }}
