@@ -1624,6 +1624,25 @@
           }).catch(() => {});
       }, [projectId]);
 
+      // 載入後若有 Notion URL,背景去 notion-fetch 抓 title 顯示常駐提示
+      // 訊息只在 read-only 狀態顯示,讓使用者一眼看到「歸檔會寫到哪個 Notion 頁」
+      // 失敗就靜默 — 主要功能(歸檔)不依賴這個訊息
+      useEffect(() => {
+        if (!notionTarget || notionTargetTitle || notionEditing) return;
+        const pageId = parseNotionPageId(notionTarget);
+        if (!pageId) return;
+        fetch(`${EDGE_BASE}/notion-fetch`, {
+          method: 'POST',
+          headers: EDGE_HEADERS,
+          body: JSON.stringify({ pageId, test: true }),
+        }).then(r => r.json()).then(d => {
+          if (d?.ok && d.title) {
+            setNotionTargetTitle(d.title);
+            setNotionMsg(`✓ 已連到「${d.title}」,歸檔會同步到這頁底下`);
+          }
+        }).catch(() => {});
+      }, [notionTarget, notionTargetTitle, notionEditing]);
+
       // ─── Members 管理 ─────────────────────────────────────────────────
       // 載入成員清單;RLS 會讓 owner 看到全部,member 只看到自己那一行
       const loadMembers = useCallback(() => {
