@@ -29,6 +29,10 @@
     ::-webkit-scrollbar-thumb { background: #2a2d35; border-radius: 4px; }
     input, textarea, button { font-family: inherit; }
     input:focus, textarea:focus { outline: none; }
+    /* 時/分輸入框:藏掉 type="number" 的上下旋鈕(Safari/Chrome) */
+    input.mk-time-part::-webkit-outer-spin-button,
+    input.mk-time-part::-webkit-inner-spin-button { -webkit-appearance: none; margin: 0; }
+    input.mk-time-part { -moz-appearance: textfield; appearance: textfield; }
     audio { background: #1a1d25; }
     @keyframes pulse { 0%, 100% { box-shadow: 0 0 0 0 rgba(192,57,43,0.4); } 50% { box-shadow: 0 0 0 8px rgba(192,57,43,0); } }
     @keyframes spin { to { transform: rotate(360deg); } }
@@ -841,6 +845,53 @@
       const [inviteEmailsInput, setInviteEmailsInput] = useState('');
       const [creating, setCreating] = useState(false);
       const [sendMsg, setSendMsg] = useState('');
+      // 一頁顯示 5 個,超過用上下箭頭捲(每次 1 個 item)
+      const PAGE_SIZE = 5;
+      const [myOffset, setMyOffset] = useState(0);
+      const [invitedOffset, setInvitedOffset] = useState(0);
+      // 過濾掉未命名 / 空名專案 — 這些大部分是測試或誤建的,不要塞滿清單
+      const isNamedProject = (p) => {
+        const t = (p?.title || '').trim();
+        return t && t !== '未命名專案';
+      };
+
+      // 狀態相關 helpers(2026-04-27):active 一般顯示;paused 排到最後;closed 從清單隱藏
+      const sortByStatus = (list) => [...list].sort((a, b) => {
+        const aP = a.status === 'paused' ? 1 : 0;
+        const bP = b.status === 'paused' ? 1 : 0;
+        return aP - bP; // active 在前(0),paused 在後(1);內部維持 DB 原排序(meeting_date desc)
+      });
+
+      // 切換暫停 ↔ active(同一顆按鈕,依現狀切)
+      const togglePause = async (project) => {
+        const newStatus = project.status === 'paused' ? 'active' : 'paused';
+        const r = await db(`projects?id=eq.${project.id}`, {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json', Prefer: 'return=minimal' },
+          body: JSON.stringify({ status: newStatus }),
+        });
+        if (!r.ok) {
+          alert(`狀態更新失敗 (${r.status})\n如果是第一次用,請確認 Supabase 已執行 status 欄位的 migration。`);
+          return;
+        }
+        setMyProjects(prev => prev.map(p => p.id === project.id ? { ...p, status: newStatus } : p));
+      };
+
+      // 結案:軟刪除(status='closed'),從清單隱藏。日誌和提案不刪
+      const closeProject = async (project) => {
+        const ok = window.confirm(`確定結案「${project.title}」?\n\n日誌和提案會保留在 DB,但這個專案不再顯示於清單。\n要重啟請另開新案,Notion 連結再接回。`);
+        if (!ok) return;
+        const r = await db(`projects?id=eq.${project.id}`, {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json', Prefer: 'return=minimal' },
+          body: JSON.stringify({ status: 'closed' }),
+        });
+        if (!r.ok) {
+          alert(`結案失敗 (${r.status})\n如果是第一次用,請確認 Supabase 已執行 status 欄位的 migration。`);
+          return;
+        }
+        setMyProjects(prev => prev.filter(p => p.id !== project.id));
+      };
 
       const myEmail = (currentSession?.user?.email || '').toLowerCase();
 
@@ -848,7 +899,8 @@
         if (!myEmail) return;
         // 單一 query:RLS 會回傳所有「我 owner OR 我是成員」的專案,前端再切成兩堆
         // 注意:projects 沒有 code 欄位,id 本身就是 6 碼專案代碼(例如 A3X9KP)
-        db(`projects?select=id,title,meeting_date,owner_email&order=meeting_date.desc,id.asc`)
+        // status 欄位 2026-04-27 加的,舊資料預設 'active'
+        db(`projects?select=id,title,meeting_date,owner_email,status&order=meeting_date.desc,id.asc`)
           .then(async r => {
             if (!r.ok) {
               const errBody = await r.text().catch(() => '');
@@ -949,21 +1001,118 @@
         setCreating(false);
       };
 
-      const renderProjectItem = (p) => (
-        <div key={p.id} style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '9px 12px', background: C.bgInput, borderRadius: 8, border: `1px solid ${C.border}`, cursor: 'pointer', transition: 'border-color 0.15s' }}
-          onClick={() => onEnter(p.code || p.id)}
-          onMouseEnter={e => e.currentTarget.style.borderColor = C.accent + '66'}
-          onMouseLeave={e => e.currentTarget.style.borderColor = C.border}>
-          <div style={{ flex: 1, minWidth: 0 }}>
-            <div style={{ fontSize: 14, fontWeight: 500, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-              {p.title || '(未命名)'}
+      const renderProjectItem = (p, opts = {}) => {
+        const { showActions = false } = opts;
+        const isPaused = p.status === 'paused';
+        // 顏色定義(直接寫死,不擴 C palette):
+        // 暫停:#E0A800 偏暖黃,跟現有的 ec1d24 紅夠區分
+        // 結案:#ec1d24 跟 breathe 動畫的紅一致(品牌紅)
+        const PAUSE_COLOR = '#E0A800';
+        const CLOSE_COLOR = '#ec1d24';
+        const actionBtn = (color) => ({
+          background: 'transparent',
+          border: `1px solid ${color}66`,
+          color: color,
+          fontSize: 11,
+          padding: '3px 8px',
+          borderRadius: 5,
+          cursor: 'pointer',
+          fontFamily: 'inherit',
+          transition: 'background 0.15s, border-color 0.15s',
+          whiteSpace: 'nowrap',
+        });
+        return (
+          <div key={p.id} style={{
+            display: 'flex', alignItems: 'center', gap: 8,
+            padding: '9px 12px', background: C.bgInput, borderRadius: 8,
+            border: `1px solid ${C.border}`, cursor: 'pointer',
+            transition: 'border-color 0.15s, opacity 0.15s',
+            opacity: isPaused ? 0.55 : 1, // paused 整列降透明度
+          }}
+            onClick={() => onEnter(p.code || p.id)}
+            onMouseEnter={e => e.currentTarget.style.borderColor = C.accent + '66'}
+            onMouseLeave={e => e.currentTarget.style.borderColor = C.border}>
+            <div style={{ flex: 1, minWidth: 0 }}>
+              <div style={{ fontSize: 14, fontWeight: 500, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', display: 'flex', alignItems: 'center', gap: 6 }}>
+                <span style={{ overflow: 'hidden', textOverflow: 'ellipsis' }}>{p.title || '(未命名)'}</span>
+                {isPaused && <span style={{ fontSize: 10, color: PAUSE_COLOR, fontWeight: 400, flexShrink: 0 }}>⏸ 暫停中</span>}
+              </div>
+              <div style={{ fontSize: 11, color: C.textMut, fontFamily: 'monospace', letterSpacing: '0.08em', marginTop: 2 }}>
+                {p.code || p.id}{p.meeting_date ? `　·　${p.meeting_date}` : ''}
+              </div>
             </div>
-            <div style={{ fontSize: 11, color: C.textMut, fontFamily: 'monospace', letterSpacing: '0.08em', marginTop: 2 }}>
-              {p.code || p.id}{p.meeting_date ? `　·　${p.meeting_date}` : ''}
-            </div>
+            {/* 動作按鈕:只有「我建立的」清單才顯示(owner only,RLS 也只允許 owner 改) */}
+            {showActions && (
+              <div style={{ display: 'flex', gap: 4, flexShrink: 0 }}>
+                <button
+                  style={actionBtn(PAUSE_COLOR)}
+                  onClick={(e) => { e.stopPropagation(); togglePause(p); }}
+                  onMouseEnter={e => e.currentTarget.style.background = PAUSE_COLOR + '22'}
+                  onMouseLeave={e => e.currentTarget.style.background = 'transparent'}
+                  title={isPaused ? '恢復為進行中' : '暫停 — 排到清單最後'}
+                >{isPaused ? '恢復' : '暫停'}</button>
+                <button
+                  style={actionBtn(CLOSE_COLOR)}
+                  onClick={(e) => { e.stopPropagation(); closeProject(p); }}
+                  onMouseEnter={e => e.currentTarget.style.background = CLOSE_COLOR + '22'}
+                  onMouseLeave={e => e.currentTarget.style.background = 'transparent'}
+                  title="結案 — 從清單隱藏(資料保留在 DB)"
+                >結案</button>
+              </div>
+            )}
           </div>
-        </div>
-      );
+        );
+      };
+
+      // 一次顯示 PAGE_SIZE 個項目,超過就在右側出現上下箭頭(每按一次捲 1 個)
+      // 沒超過 PAGE_SIZE 就完全不出現箭頭,讓面板自然撐開收縮
+      // opts.showActions 控制每個 item 是否顯示「暫停 / 結案」按鈕(只在 owner 清單)
+      const renderProjectListWithNav = (list, offset, setOffset, opts = {}) => {
+        const total = list.length;
+        const showNav = total > PAGE_SIZE;
+        // 防呆:offset 不要超出範圍(例如清單變短了)
+        const maxOffset = Math.max(0, total - PAGE_SIZE);
+        const safeOffset = Math.min(Math.max(0, offset), maxOffset);
+        const visible = list.slice(safeOffset, safeOffset + PAGE_SIZE);
+        const arrowBtn = (disabled) => ({
+          background: C.bgInput,
+          border: `1px solid ${C.border}`,
+          borderRadius: 6,
+          color: disabled ? C.textMut + '55' : C.textSec,
+          cursor: disabled ? 'default' : 'pointer',
+          fontSize: 11,
+          padding: '4px 6px',
+          flex: 1,
+          minHeight: 24,
+          display: 'flex',
+          alignItems: 'center',
+          justifyContent: 'center',
+          transition: 'border-color 0.15s, color 0.15s',
+        });
+        return (
+          <div style={{ display: 'flex', gap: 6, alignItems: 'stretch' }}>
+            <div style={{ flex: 1, display: 'flex', flexDirection: 'column', gap: 6, minWidth: 0 }}>
+              {visible.map(p => renderProjectItem(p, opts))}
+            </div>
+            {showNav && (
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 4, width: 28 }}>
+                <button
+                  style={arrowBtn(safeOffset === 0)}
+                  disabled={safeOffset === 0}
+                  onClick={() => setOffset(o => Math.max(0, o - 1))}
+                  title="往上"
+                >▲</button>
+                <button
+                  style={arrowBtn(safeOffset >= maxOffset)}
+                  disabled={safeOffset >= maxOffset}
+                  onClick={() => setOffset(o => Math.min(maxOffset, o + 1))}
+                  title="往下"
+                >▼</button>
+              </div>
+            )}
+          </div>
+        );
+      };
 
       return (
         <div style={{ minHeight: '100vh', display: 'flex', flexDirection: 'column', alignItems: 'center', padding: '40px 24px' }}>
@@ -975,31 +1124,43 @@
 
           <div style={{ width: '100%', maxWidth: 460, display: 'flex', flexDirection: 'column', gap: 16 }}>
 
-            {/* 我建立的會議 */}
-            {myProjects.length > 0 && (
-              <div style={S.panel}>
-                <div style={{ fontSize: 15, fontWeight: 600, marginBottom: 12, display: 'flex', alignItems: 'center', gap: 6 }}>
-                  🧑‍💼 我建立的會議
-                  <span style={{ fontSize: 11, color: C.textMut, fontWeight: 400 }}>({myProjects.length})</span>
+            {/* 我建立的會議 — 過濾未命名空殼 + closed,paused 排到最後;最多顯示 5 個 */}
+            {(() => {
+              const visible = sortByStatus(
+                myProjects
+                  .filter(p => p.status !== 'closed')
+                  .filter(isNamedProject)
+              );
+              if (visible.length === 0) return null;
+              return (
+                <div style={S.panel}>
+                  <div style={{ fontSize: 15, fontWeight: 600, marginBottom: 12, display: 'flex', alignItems: 'center', gap: 6 }}>
+                    🧑‍💼 我建立的會議
+                    <span style={{ fontSize: 11, color: C.textMut, fontWeight: 400 }}>({visible.length})</span>
+                  </div>
+                  {renderProjectListWithNav(visible, myOffset, setMyOffset, { showActions: true })}
                 </div>
-                <div style={{ display: 'flex', flexDirection: 'column', gap: 6, maxHeight: 280, overflowY: 'auto' }}>
-                  {myProjects.map(renderProjectItem)}
-                </div>
-              </div>
-            )}
+              );
+            })()}
 
-            {/* 我被邀請的會議 */}
-            {invitedProjects.length > 0 && (
-              <div style={S.panel}>
-                <div style={{ fontSize: 15, fontWeight: 600, marginBottom: 12, display: 'flex', alignItems: 'center', gap: 6 }}>
-                  📨 我被邀請的會議
-                  <span style={{ fontSize: 11, color: C.textMut, fontWeight: 400 }}>({invitedProjects.length})</span>
+            {/* 我被邀請的會議 — 同樣過濾;沒有動作按鈕(owner 才能改狀態) */}
+            {(() => {
+              const visible = sortByStatus(
+                invitedProjects
+                  .filter(p => p.status !== 'closed')
+                  .filter(isNamedProject)
+              );
+              if (visible.length === 0) return null;
+              return (
+                <div style={S.panel}>
+                  <div style={{ fontSize: 15, fontWeight: 600, marginBottom: 12, display: 'flex', alignItems: 'center', gap: 6 }}>
+                    📨 我被邀請的會議
+                    <span style={{ fontSize: 11, color: C.textMut, fontWeight: 400 }}>({visible.length})</span>
+                  </div>
+                  {renderProjectListWithNav(visible, invitedOffset, setInvitedOffset)}
                 </div>
-                <div style={{ display: 'flex', flexDirection: 'column', gap: 6, maxHeight: 280, overflowY: 'auto' }}>
-                  {invitedProjects.map(renderProjectItem)}
-                </div>
-              </div>
-            )}
+              );
+            })()}
 
             {/* 建立新會議 */}
             <div style={S.panel}>
@@ -1145,13 +1306,10 @@
                   <button
                     onClick={() => {
                       setPhase(p.id);
-                      const el = document.body;
-                      // 切到「會議進行」：請求全螢幕（含 Safari webkit 前綴；用 body 比 documentElement 更可靠）
-                      if (p.id === 1) {
-                        if (el.requestFullscreen) el.requestFullscreen().catch(() => {});
-                        else if (el.webkitRequestFullscreen) el.webkitRequestFullscreen();
-                      } else {
-                        // 離開會議進行：退出全螢幕
+                      // 進入「會議進行」不再自動全螢幕 — 全螢幕由點選提案內容才觸發
+                      // (2026-04-26)準備中頁要看到 tab 才能往回切;舊行為把 tab 蓋掉很困擾
+                      // 切到非「會議進行」tab → 退出全螢幕(如果有的話)
+                      if (p.id !== 1) {
                         const isFS = document.fullscreenElement || document.webkitFullscreenElement;
                         if (isFS) {
                           if (document.exitFullscreen) document.exitFullscreen().catch(() => {});
@@ -1224,11 +1382,31 @@
       // 邀請白名單:此專案的 owner + members
       const [projectOwnerEmail, setProjectOwnerEmail] = useState('');
       const [members, setMembers] = useState([]);
-      const [addEmailsInput, setAddEmailsInput] = useState('');
       const [addingMembers, setAddingMembers] = useState(false);
       const [membersMsg, setMembersMsg] = useState('');
       // 重寄邀請中的 email(避免同一列 double-click;一次只寄一封,UI 顯示「…」)
       const [resendingEmail, setResendingEmail] = useState('');
+      // 公司同事目錄 — 靜態 base(11 位常駐)+ 動態擴充(localStorage)
+      // 排序:emmy → debby → leo → ring → maruo → ray → kevin → bow → howard → alice → qmore
+      // 用 + New 加進來的新同事前綴存 localStorage,下次自動列出來
+      // 跨裝置不同步是有意的(Mac Studio / Windows 各自累積),要同步再升 Supabase 表
+      const COMPANY_DOMAIN = 'minimax.com.tw';
+      const STATIC_COMPANY_DIRECTORY = [
+        'emmy', 'debby', 'leo', 'ring', 'maruo', 'ray',
+        'kevin', 'bow', 'howard', 'alice', 'qmore',
+      ];
+      const EXTRA_COLLEAGUES_KEY = 'meetkit.extraColleagues';
+      const [extraColleagues, setExtraColleagues] = useState(() => {
+        try {
+          const raw = localStorage.getItem(EXTRA_COLLEAGUES_KEY);
+          if (!raw) return [];
+          const arr = JSON.parse(raw);
+          return Array.isArray(arr) ? arr.filter(x => typeof x === 'string') : [];
+        } catch { return []; }
+      });
+      // + New 內嵌輸入框的 state(預設收起,點 + New 才展開)
+      const [showNewInput, setShowNewInput] = useState(false);
+      const [newPrefix, setNewPrefix] = useState('');
       // 寄送時機:'now' 立即送 / 'schedule' 排程到指定時間
       // scheduledAt 存 <input type="datetime-local"> 的本地時間字串(YYYY-MM-DDTHH:mm)
       // 送給 Edge Function 前會用 toUtcIso 轉成 UTC ISO,Resend 的 scheduled_at 接 UTC
@@ -1236,9 +1414,44 @@
       const [scheduledAt, setScheduledAt] = useState('');
       const myEmail = (currentSession?.user?.email || '').toLowerCase();
       const isOwner = !!projectOwnerEmail && projectOwnerEmail.toLowerCase() === myEmail;
-      const [showUrlInput, setShowUrlInput] = useState(false);
+      // (2026-04-26 移除)showUrlInput 原本是 ⚙ 設定面板的 toggle,內容(Notion + 與會者)
+      //   已直接攤在表層,讓 owner 一眼看到「歸檔走到哪個 Notion 頁」+「誰會收到邀請」,不再需要展開
       const [showDatePicker, setShowDatePicker] = useState(false);
       const [showJournalRef, setShowJournalRef] = useState(false);
+      // 時/分拆成兩個獨立輸入框(2026-04-26):
+      // 兩個 local state 是因為使用者打字過程中字串會處於不完整狀態(例:剛打完「2」)
+      // 直接寫進 meetingTime 會被 saveMeetingInfo 即時打進 DB,Enter / blur 才正規化才合理
+      const [hourInput, setHourInput] = useState('');
+      const [minuteInput, setMinuteInput] = useState('');
+      // meetingTime 變動(從 DB 載入 / 外部 setMeetingTime / 清除)→ 同步本地兩個輸入框
+      useEffect(() => {
+        const [h = '', m = ''] = (meetingTime || '').split(':');
+        setHourInput(h);
+        setMinuteInput(m);
+      }, [meetingTime]);
+      // 把 hourInput / minuteInput 正規化成 HH:MM,寫進 meetingTime + DB
+      // 兩個都空白 = 清除時間;只有一個有值 = 另一個補 00
+      const commitMeetingTime = () => {
+        const h = parseInt(hourInput, 10);
+        const m = parseInt(minuteInput, 10);
+        const hEmpty = hourInput.trim() === '' || isNaN(h);
+        const mEmpty = minuteInput.trim() === '' || isNaN(m);
+        if (hEmpty && mEmpty) {
+          if (meetingTime !== '') { setMeetingTime(''); saveMeetingInfo(meetingDate, ''); }
+          return;
+        }
+        const hh = String(Math.min(23, Math.max(0, hEmpty ? 0 : h))).padStart(2, '0');
+        const mm = String(Math.min(59, Math.max(0, mEmpty ? 0 : m))).padStart(2, '0');
+        const normalized = `${hh}:${mm}`;
+        if (normalized !== meetingTime) {
+          setMeetingTime(normalized);
+          saveMeetingInfo(meetingDate, normalized);
+        } else {
+          // 正規化後等於現值,但本地輸入框可能還是「2」這種片段,要刷成「02」
+          setHourInput(hh);
+          setMinuteInput(mm);
+        }
+      };
       const contentRef = useRef();
       const attachRef = useRef();
       const cardFileRefs = useRef({});
@@ -1312,16 +1525,18 @@
         setScheduledAt(toLocalInput(d));
       };
 
-      // 新增成員:驗證 email → INSERT → 寄邀請信(立即或排程) → 重新載入
-      const addMembers = async () => {
-        const list = addEmailsInput.split(/[\s,;\n]+/).map(x => x.trim().toLowerCase()).filter(Boolean);
+      // ─── 加入成員核心:驗證 → INSERT → 寄邀請信 → 重載 ──────────────
+      // commitMembers 是 textarea 路徑和 label 一鍵路徑共用的底層邏輯
+      // 兩個入口的差別只在「email 從哪來」:textarea 解析整段字串,label 直接傳一個
+      const commitMembers = async (rawEmails) => {
+        const list = (rawEmails || []).map(x => String(x || '').trim().toLowerCase()).filter(Boolean);
         const valid = [...new Set(list.filter(x => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(x)))];
         // 排除已經是 owner / 已在名單的
         const existing = new Set(members.map(m => (m.member_email || '').toLowerCase()));
         const newOnes = valid.filter(e => e !== projectOwnerEmail.toLowerCase() && !existing.has(e));
         if (newOnes.length === 0) {
           setMembersMsg('⚠ 沒有新的有效 email(可能都已在名單中)');
-          return;
+          return false;
         }
         setAddingMembers(true);
         setMembersMsg('');
@@ -1366,12 +1581,54 @@
             ? `,將於 ${scheduledAt.replace('T', ' ')} 寄出`
             : ',邀請信寄送中';
           setMembersMsg(`✓ 已新增 ${newOnes.length} 位成員${whenMsg}`);
-          setAddEmailsInput('');
           loadMembers();
+          return true;
         } catch (e) {
           setMembersMsg(`❌ ${e.message || '新增失敗'}`);
+          return false;
         } finally {
           setAddingMembers(false);
+        }
+      };
+
+      // 一鍵加入(左欄 label 點選):立即提交該 email + 寄邀請信
+      // 排程模式下若沒設時間就擋住,提示先選時間
+      const quickAddOne = async (email) => {
+        if (scheduleMode === 'schedule' && !scheduledAt) {
+          setMembersMsg('⚠ 請先設定排程時間');
+          return;
+        }
+        await commitMembers([email]);
+      };
+
+      // + New 路徑:輸入前綴(或完整 email)→ commitMembers → 成功就存進 localStorage
+      // 同 domain 才存 prefix 進 extraColleagues,下次自動列出來成為常駐 label
+      // 異 domain(外部來賓)直接 commit,不存 — 下次需要再手動加
+      const addNewColleague = async () => {
+        if (scheduleMode === 'schedule' && !scheduledAt) {
+          setMembersMsg('⚠ 請先設定排程時間');
+          return;
+        }
+        const raw = newPrefix.trim().toLowerCase();
+        if (!raw) return;
+        const email = raw.includes('@') ? raw : `${raw}@${COMPANY_DOMAIN}`;
+        if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+          setMembersMsg('⚠ email 格式不正確');
+          return;
+        }
+        const ok = await commitMembers([email]);
+        if (ok) {
+          // 同 domain 才存 prefix 為常駐 label;異 domain 不污染候選清單
+          if (email.endsWith(`@${COMPANY_DOMAIN}`)) {
+            const prefix = email.split('@')[0];
+            if (!STATIC_COMPANY_DIRECTORY.includes(prefix) && !extraColleagues.includes(prefix)) {
+              const next = [...extraColleagues, prefix];
+              setExtraColleagues(next);
+              try { localStorage.setItem(EXTRA_COLLEAGUES_KEY, JSON.stringify(next)); } catch {}
+            }
+          }
+          setNewPrefix('');
+          setShowNewInput(false);
         }
       };
 
@@ -1392,7 +1649,7 @@
 
       // 重寄邀請信:只觸發 send-invite,不動 DB
       // 使用情境:成員說「我沒收到信」「誤刪了」「垃圾信撈不到」
-      // 注意和 addMembers 的差異 — 這裡跳過 INSERT,因為 email 早就在 project_members 了
+      // 注意和 commitMembers 的差異 — 這裡跳過 INSERT,因為 email 早就在 project_members 了
       const resendInvite = async (email) => {
         if (!isOwner || !email) return;
         setResendingEmail(email);
@@ -1523,7 +1780,15 @@
         }
         try {
           const res = await db("proposals", { method: 'POST', body: JSON.stringify({ ...form, project_id: projectId, file_url, file_name }) });
-          if (res.ok) { setForm({ author: '', title: '', content: '' }); setAttachFiles([]); if (attachRef.current) attachRef.current.value = ''; await loadProposals(); showToast('✓ 提案已送出！'); }
+          if (res.ok) {
+            // 送出後不清空姓名/標題/內容:同一場會議準備期間,常會連續送多份提案,清空逼使用者重打很煩
+            // 附件清空(已上傳到 storage,留著會在下次 submit 重複上傳)
+            // 「新會議預約後清空」是 Phase 3 才有的 lifecycle event(目前一個專案=一場會議,沒有重置點)
+            setAttachFiles([]);
+            if (attachRef.current) attachRef.current.value = '';
+            await loadProposals();
+            showToast('✓ 提案已送出！');
+          }
           else showToast('送出失敗，請再試一次');
         } catch { showToast('網路錯誤，請再試一次'); }
         finally { setSubmitting(false); }
@@ -1645,15 +1910,125 @@
                 })()}
               </div>
               <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexShrink: 0 }}>
-                <button style={{ ...btn('ghost'), padding: '7px 14px', fontSize: 13 }} onClick={() => { setShowDatePicker(v => !v); setShowUrlInput(false); }}>🗓 新會議預約</button>
-                <button style={{ ...btn('ghost'), padding: '8px 10px', fontSize: 13 }} title="設定" onClick={() => { setShowUrlInput(v => !v); setShowDatePicker(false); }}>⚙</button>
+                <button style={{ ...btn('ghost'), padding: '7px 14px', fontSize: 13 }} onClick={() => setShowDatePicker(v => !v)}>🗓 新會議預約</button>
               </div>
             </div>
 
             {showDatePicker && (
               <div style={{ marginTop: 16, paddingTop: 16, borderTop: `1px solid ${C.border}`, display: 'flex', gap: 10, alignItems: 'center', flexWrap: 'wrap' }} className="fade-in">
                 <input type="date" style={{ ...S.input, width: 'auto', fontSize: 13, colorScheme: 'dark' }} value={meetingDate} onChange={e => { setMeetingDate(e.target.value); saveMeetingInfo(e.target.value, meetingTime); }} />
-                <input type="time" style={{ ...S.input, width: 'auto', fontSize: 13, colorScheme: 'dark' }} value={meetingTime} onChange={e => { setMeetingTime(e.target.value); saveMeetingInfo(meetingDate, e.target.value); }} />
+                {/* 時 : 分 雙獨立輸入框(2026-04-26)
+                    時和分各自獨立打字,Enter / 跳出輸入框才正規化(commitMeetingTime)
+                    時打完 2 碼自動跳到分(autoAdvance);Backspace 在分為空時跳回時(未做,需要再加)
+                    視覺上模擬一個輸入框:外框統一,內部兩格無邊框 + 中間冒號 */}
+                <div style={{ ...S.input, width: 'auto', display: 'inline-flex', alignItems: 'center', padding: '0 8px', height: 32 }}>
+                  <input
+                    type="number"
+                    inputMode="numeric"
+                    placeholder="時"
+                    min={0}
+                    max={23}
+                    lang="en"
+                    autoComplete="off"
+                    autoCorrect="off"
+                    autoCapitalize="off"
+                    spellCheck={false}
+                    className="mk-time-part"
+                    value={hourInput}
+                    onBeforeInput={e => {
+                      // 攔住注音/中文輸入法 — 只要即將插入的字串不是純數字就拒絕
+                      // 注意:macOS Safari 可能不完全尊重 IME 合成的 preventDefault,
+                      // 但同時搭配 onChange 的 replace(/\D/g, '') 雙保險
+                      if (e.data != null && !/^\d+$/.test(e.data)) e.preventDefault();
+                    }}
+                    onCompositionEnd={e => {
+                      // IME 合成結束(例如使用者打了注音再選字)→ 強制清掉非數字
+                      // 不要在 compositionstart 做 blur+focus,那會讓使用者在中文 IME 狀態下根本打不進字
+                      const v = (e.target.value || '').replace(/\D/g, '').slice(0, 2);
+                      setHourInput(v);
+                    }}
+                    onChange={e => {
+                      // 24 小時制:0-23 才合法
+                      // 第 1 碼是 3-9 → 單碼即可(3,4,...,9 = 03,04,...,09),自動跳到分
+                      // 第 1 碼是 0-2 → 允許再打第 2 碼,但第 2 碼讓 hour 超過 23 就拒絕
+                      let v = e.target.value.replace(/\D/g, '').slice(0, 2);
+                      if (v.length === 2 && parseInt(v, 10) > 23) {
+                        // 例如打 "25":拒絕第 2 碼,只保留第 1 碼
+                        v = v[0];
+                      }
+                      setHourInput(v);
+                      // 兩種跳到分的時機:
+                      //   (a) 打滿合法 2 碼(如 09, 13, 23)
+                      //   (b) 打第 1 碼是 3-9(不可能再合法擴展)
+                      const shouldAdvance =
+                        (v.length === 2) ||
+                        (v.length === 1 && parseInt(v, 10) >= 3);
+                      if (shouldAdvance) {
+                        const next = e.target.parentElement?.querySelector('input[data-time-part="minute"]');
+                        if (next) next.focus();
+                      }
+                    }}
+                    onKeyDown={e => {
+                      // type=number 預設上下鍵會 +/- 1,我們不要這個行為
+                      if (e.key === 'ArrowUp' || e.key === 'ArrowDown') { e.preventDefault(); return; }
+                      if (e.key === 'Enter') { e.preventDefault(); commitMeetingTime(); e.target.blur(); }
+                    }}
+                    onBlur={e => {
+                      // 焦點只在時/分之間互跳(自動跳轉或手動 Tab)不要 commit:
+                      // 否則 onChange 觸發 next.focus() → 同步 blur → commitMeetingTime 讀到 stale state(空字串)
+                      // 把使用者剛打的數字一起抹掉。等使用者真正離開整個時間區才正規化。
+                      if (e.relatedTarget?.dataset?.timePart) return;
+                      commitMeetingTime();
+                    }}
+                    onFocus={e => e.target.select()}
+                    data-time-part="hour"
+                    style={{ background: 'transparent', border: 'none', outline: 'none', color: C.text, fontSize: 13, width: 18, textAlign: 'right', padding: 0, fontFamily: 'inherit', fontVariantNumeric: 'tabular-nums' }}
+                  />
+                  <span style={{ fontSize: 13, color: C.textMut, padding: '0 1px' }}>:</span>
+                  <input
+                    type="number"
+                    inputMode="numeric"
+                    placeholder="分"
+                    min={0}
+                    max={59}
+                    lang="en"
+                    autoComplete="off"
+                    autoCorrect="off"
+                    autoCapitalize="off"
+                    spellCheck={false}
+                    className="mk-time-part"
+                    value={minuteInput}
+                    onBeforeInput={e => {
+                      if (e.data != null && !/^\d+$/.test(e.data)) e.preventDefault();
+                    }}
+                    onCompositionEnd={e => {
+                      const v = (e.target.value || '').replace(/\D/g, '').slice(0, 2);
+                      setMinuteInput(v);
+                    }}
+                    onChange={e => {
+                      // 分:0-59 才合法,第 2 碼讓分鐘超過 59 就拒絕
+                      let v = e.target.value.replace(/\D/g, '').slice(0, 2);
+                      if (v.length === 2 && parseInt(v, 10) > 59) {
+                        v = v[0];
+                      }
+                      setMinuteInput(v);
+                    }}
+                    onKeyDown={e => {
+                      if (e.key === 'ArrowUp' || e.key === 'ArrowDown') { e.preventDefault(); return; }
+                      if (e.key === 'Enter') { e.preventDefault(); commitMeetingTime(); e.target.blur(); }
+                    }}
+                    onBlur={e => {
+                      // 焦點只在時/分之間互跳(自動跳轉或手動 Tab)不要 commit:
+                      // 否則 onChange 觸發 next.focus() → 同步 blur → commitMeetingTime 讀到 stale state(空字串)
+                      // 把使用者剛打的數字一起抹掉。等使用者真正離開整個時間區才正規化。
+                      if (e.relatedTarget?.dataset?.timePart) return;
+                      commitMeetingTime();
+                    }}
+                    onFocus={e => e.target.select()}
+                    data-time-part="minute"
+                    style={{ background: 'transparent', border: 'none', outline: 'none', color: C.text, fontSize: 13, width: 18, textAlign: 'left', padding: 0, fontFamily: 'inherit', fontVariantNumeric: 'tabular-nums' }}
+                  />
+                </div>
                 <button style={{ ...btn('primary'), padding: '7px 16px', fontSize: 13 }} onClick={() => { openNewRound(); setShowDatePicker(false); }}>✓ 確認開新準備室</button>
                 {(meetingDate || meetingTime) && (
                   <button style={{ ...btn('ghost'), padding: '6px 10px', fontSize: 12, color: C.textMut }} onClick={() => { setMeetingDate(''); setMeetingTime(''); saveMeetingInfo('', ''); }}>✕ 清除</button>
@@ -1661,9 +2036,10 @@
               </div>
             )}
 
-            {showUrlInput && (
-              <div style={{ marginTop: 16, paddingTop: 16, borderTop: `1px solid ${C.border}`, display: 'flex', flexDirection: 'column', gap: 10 }} className="fade-in">
-                {/* Route C:Notion 目標頁 picker — 每個專案獨立綁一個 Notion 頁 */}
+            {/* Notion 設定 + 與會者管理 — 直接攤在表層,不再藏 ⚙ 後面
+                理由:owner 在準備期會大量加同事 / 重寄邀請,藏在點擊面板裡每次都要多一步 */}
+            <div style={{ marginTop: 16, paddingTop: 16, borderTop: `1px solid ${C.border}`, display: 'flex', flexDirection: 'column', gap: 10 }}>
+              {/* Route C:Notion 目標頁 picker — 每個專案獨立綁一個 Notion 頁 */}
                 <div style={{ display: 'flex', gap: 10, alignItems: 'center' }}>
                   <span style={{ fontSize: 12, color: C.textMut, width: 72, flexShrink: 0 }}>📓 Notion</span>
                   <input
@@ -1700,60 +2076,172 @@
                   先到 Notion 把該頁「⋯ → Add connections → MeetKit」分享給 integration,才能寫入。
                 </div>
 
-                {/* 📬 與會者白名單 — 只有 owner 能加 / 移除;member 只看得到自己 */}
+                {/* 📬 與會者白名單(2026-04-26 改為左右兩欄)
+                    左欄 = 同事候選(STATIC_COMPANY_DIRECTORY + extraColleagues 扣掉已加入的);點一下立即提交 + 寄邀請信
+                    左欄末尾的 + New 展開內嵌前綴輸入框,加入後存 localStorage 變常駐 label
+                    右欄 = 與會人員(owner + members);按 X 移除後,若該 email 在 directory 內會自動回到左欄
+                    schedule radios + textarea 共用,放在兩欄下方
+                    member 視角:左欄不顯示,只看得到右欄自己那一列 */}
                 <div style={{ marginTop: 8, paddingTop: 14, borderTop: `1px dashed ${C.border}` }}>
                   <div style={{ display: 'flex', gap: 10, alignItems: 'flex-start', marginBottom: 8 }}>
                     <span style={{ fontSize: 12, color: C.textMut, width: 72, flexShrink: 0, paddingTop: 4 }}>📬 與會者</span>
                     <div style={{ flex: 1, minWidth: 0 }}>
-                      {/* 現有成員清單 */}
-                      <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, marginBottom: 10 }}>
-                        {projectOwnerEmail && (
-                          <div style={{ display: 'inline-flex', alignItems: 'center', gap: 5, padding: '3px 8px', background: C.accent + '22', color: C.accent, borderRadius: 6, fontSize: 11 }}>
-                            👑 {projectOwnerEmail}
-                          </div>
-                        )}
-                        {members.map(m => (
-                          <div key={m.member_email} style={{ display: 'inline-flex', alignItems: 'center', gap: 4, padding: '3px 8px', background: C.bgInput, border: `1px solid ${C.border}`, borderRadius: 6, fontSize: 11 }}>
-                            {m.member_email}
-                            {isOwner && m.member_email !== myEmail && (
-                              <>
-                                <button
-                                  onClick={() => resendInvite(m.member_email)}
-                                  disabled={resendingEmail === m.member_email}
-                                  style={{ background: 'none', border: 'none', color: C.textMut, cursor: 'pointer', fontSize: 11, padding: 0, lineHeight: 1, opacity: resendingEmail === m.member_email ? 0.4 : 1 }}
-                                  title="重寄邀請信"
-                                >
-                                  {resendingEmail === m.member_email ? '…' : '✉'}
-                                </button>
-                                <button
-                                  onClick={() => removeMember(m.member_email)}
-                                  style={{ background: 'none', border: 'none', color: C.textMut, cursor: 'pointer', fontSize: 11, padding: 0, lineHeight: 1 }}
-                                  title="移除此成員"
-                                >
-                                  ✕
-                                </button>
-                              </>
-                            )}
-                          </div>
-                        ))}
-                        {members.length === 0 && !projectOwnerEmail && (
-                          <span style={{ fontSize: 11, color: C.textMut }}>載入中…</span>
-                        )}
-                      </div>
 
-                      {/* 新增成員(只有 owner 能操作) */}
                       {isOwner ? (
                         <>
-                          {/* textarea 高度固定 60-120px,內容多就內部捲動(避免整個面板被撐開) */}
-                          <textarea
-                            value={addEmailsInput}
-                            onChange={e => setAddEmailsInput(e.target.value)}
-                            placeholder={`新增成員 email(一行一個,或逗號分隔)\n例:\nalice@example.com\nbob@example.com`}
-                            style={{ ...S.input, minHeight: 60, maxHeight: 120, overflowY: 'auto', fontSize: 12, padding: '6px 10px', fontFamily: 'inherit', resize: 'none', width: '100%', boxSizing: 'border-box' }}
-                          />
+                          {/* 上半:左右兩欄 */}
+                          {(() => {
+                            const memberSet = new Set(members.map(m => (m.member_email || '').toLowerCase()));
+                            const ownerLc = (projectOwnerEmail || '').toLowerCase();
+                            // 候選 = (static + extras) 扣掉已是 owner 或 member 的
+                            const allPrefixes = [...new Set([...STATIC_COMPANY_DIRECTORY, ...extraColleagues])];
+                            const candidates = allPrefixes
+                              .map(p => `${p}@${COMPANY_DOMAIN}`)
+                              .filter(e => e !== ownerLc && !memberSet.has(e));
+                            return (
+                              <div style={{ display: 'flex', gap: 10, marginBottom: 12 }}>
+                                {/* 左欄:同事候選 */}
+                                <div style={{ flex: 1, minWidth: 0, padding: 10, background: C.bgInput, border: `1px solid ${C.border}`, borderRadius: 8 }}>
+                                  <div style={{ fontSize: 10, color: C.textMut, marginBottom: 6, fontWeight: 600 }}>
+                                    💼 同事候選 · 點一下加入
+                                  </div>
+                                  <div style={{ display: 'flex', flexWrap: 'wrap', gap: 5 }}>
+                                    {candidates.map(email => {
+                                      const prefix = email.split('@')[0];
+                                      return (
+                                        <button
+                                          type="button"
+                                          key={email}
+                                          onClick={() => quickAddOne(email)}
+                                          disabled={addingMembers}
+                                          title={`點一下加入 ${email}`}
+                                          style={{
+                                            padding: '3px 9px',
+                                            background: 'transparent',
+                                            border: `1px solid ${C.border}`,
+                                            borderRadius: 6,
+                                            fontSize: 11,
+                                            color: C.textSec,
+                                            cursor: addingMembers ? 'wait' : 'pointer',
+                                            fontFamily: 'inherit',
+                                            lineHeight: 1.4,
+                                            opacity: addingMembers ? 0.5 : 1,
+                                          }}
+                                        >
+                                          + {prefix}
+                                        </button>
+                                      );
+                                    })}
+                                    {/* + New:展開內嵌前綴輸入框,加入後永久成為候選 label */}
+                                    {!showNewInput ? (
+                                      <button
+                                        type="button"
+                                        onClick={() => { setShowNewInput(true); setMembersMsg(''); }}
+                                        disabled={addingMembers}
+                                        title="加入新同事(輸入 email 前綴)"
+                                        style={{
+                                          padding: '3px 9px',
+                                          background: 'transparent',
+                                          border: `1px dashed ${C.accent}66`,
+                                          borderRadius: 6,
+                                          fontSize: 11,
+                                          color: C.accent,
+                                          cursor: addingMembers ? 'wait' : 'pointer',
+                                          fontFamily: 'inherit',
+                                          lineHeight: 1.4,
+                                          opacity: addingMembers ? 0.5 : 1,
+                                        }}
+                                      >
+                                        + New
+                                      </button>
+                                    ) : (
+                                      <div style={{ display: 'inline-flex', alignItems: 'center', gap: 4, padding: '2px 4px', background: C.bgPanel, border: `1px solid ${C.accent}66`, borderRadius: 6 }}>
+                                        <input
+                                          type="text"
+                                          autoFocus
+                                          value={newPrefix}
+                                          onChange={e => setNewPrefix(e.target.value)}
+                                          onKeyDown={e => {
+                                            if (e.key === 'Enter') { e.preventDefault(); addNewColleague(); }
+                                            else if (e.key === 'Escape') { setShowNewInput(false); setNewPrefix(''); }
+                                          }}
+                                          placeholder="email 前綴"
+                                          style={{ background: 'transparent', border: 'none', outline: 'none', color: C.text, fontSize: 11, fontFamily: 'inherit', width: 90, padding: '2px 4px' }}
+                                        />
+                                        <span style={{ fontSize: 10, color: C.textMut }}>@{COMPANY_DOMAIN}</span>
+                                        <button
+                                          type="button"
+                                          onClick={addNewColleague}
+                                          disabled={addingMembers || !newPrefix.trim()}
+                                          title="加入並寄邀請"
+                                          style={{ background: C.accent, border: 'none', color: '#fff', borderRadius: 4, fontSize: 10, padding: '2px 7px', cursor: 'pointer', fontFamily: 'inherit', opacity: (addingMembers || !newPrefix.trim()) ? 0.4 : 1 }}
+                                        >
+                                          {addingMembers ? '…' : '✓'}
+                                        </button>
+                                        <button
+                                          type="button"
+                                          onClick={() => { setShowNewInput(false); setNewPrefix(''); }}
+                                          title="取消"
+                                          style={{ background: 'none', border: 'none', color: C.textMut, fontSize: 11, padding: 0, cursor: 'pointer', lineHeight: 1 }}
+                                        >
+                                          ✕
+                                        </button>
+                                      </div>
+                                    )}
+                                  </div>
+                                </div>
 
-                          {/* 寄送時機:立即 vs 排程到指定時間(Resend scheduled_at) */}
-                          <div style={{ marginTop: 8, fontSize: 11, color: C.textSec, display: 'flex', gap: 14, alignItems: 'center', flexWrap: 'wrap' }}>
+                                {/* 右欄:與會人員 */}
+                                <div style={{ flex: 1, minWidth: 0, padding: 10, background: C.accent + '08', border: `1px solid ${C.accent}33`, borderRadius: 8 }}>
+                                  <div style={{ fontSize: 10, color: C.textMut, marginBottom: 6, fontWeight: 600 }}>
+                                    ✓ 與會人員 · 按 X 移除
+                                  </div>
+                                  <div style={{ display: 'flex', flexWrap: 'wrap', gap: 5 }}>
+                                    {projectOwnerEmail && (
+                                      <div style={{ display: 'inline-flex', alignItems: 'center', gap: 5, padding: '3px 8px', background: C.accent + '22', color: C.accent, borderRadius: 6, fontSize: 11 }}>
+                                        👑 {projectOwnerEmail.split('@')[0]}
+                                      </div>
+                                    )}
+                                    {members.map(m => {
+                                      const prefix = (m.member_email || '').split('@')[0];
+                                      return (
+                                        <div key={m.member_email} title={m.member_email} style={{ display: 'inline-flex', alignItems: 'center', gap: 4, padding: '3px 8px', background: C.bgPanel, border: `1px solid ${C.border}`, borderRadius: 6, fontSize: 11 }}>
+                                          {prefix}
+                                          {m.member_email !== myEmail && (
+                                            <>
+                                              <button
+                                                onClick={() => resendInvite(m.member_email)}
+                                                disabled={resendingEmail === m.member_email}
+                                                style={{ background: 'none', border: 'none', color: C.textMut, cursor: 'pointer', fontSize: 11, padding: 0, lineHeight: 1, opacity: resendingEmail === m.member_email ? 0.4 : 1 }}
+                                                title="重寄邀請信"
+                                              >
+                                                {resendingEmail === m.member_email ? '…' : '✉'}
+                                              </button>
+                                              <button
+                                                onClick={() => removeMember(m.member_email)}
+                                                style={{ background: 'none', border: 'none', color: C.textMut, cursor: 'pointer', fontSize: 11, padding: 0, lineHeight: 1 }}
+                                                title="移除此成員(回到左欄)"
+                                              >
+                                                ✕
+                                              </button>
+                                            </>
+                                          )}
+                                        </div>
+                                      );
+                                    })}
+                                    {members.length === 0 && (
+                                      <span style={{ fontSize: 11, color: C.textMut, lineHeight: 1.6 }}>
+                                        (除了你以外還沒人)
+                                      </span>
+                                    )}
+                                  </div>
+                                </div>
+                              </div>
+                            );
+                          })()}
+
+                          {/* 寄送時機(共用於左欄一鍵 + + New) */}
+                          <div style={{ marginTop: 4, fontSize: 11, color: C.textSec, display: 'flex', gap: 14, alignItems: 'center', flexWrap: 'wrap' }}>
                             <label style={{ display: 'inline-flex', alignItems: 'center', gap: 4, cursor: 'pointer' }}>
                               <input type="radio" name={`sm-${projectId}`} checked={scheduleMode === 'now'} onChange={() => setScheduleMode('now')} />
                               立即寄送
@@ -1782,35 +2270,36 @@
                             </div>
                           )}
 
-                          <div style={{ display: 'flex', gap: 8, marginTop: 8, alignItems: 'center', flexWrap: 'wrap' }}>
-                            <button
-                              style={{ ...btn('primary'), padding: '6px 14px', fontSize: 12, opacity: addingMembers ? 0.6 : 1 }}
-                              disabled={addingMembers || !addEmailsInput.trim() || (scheduleMode === 'schedule' && !scheduledAt)}
-                              onClick={addMembers}
-                            >
-                              {addingMembers
-                                ? '加入中…'
-                                : scheduleMode === 'schedule'
-                                  ? '＋ 加入並排程邀請信'
-                                  : '＋ 加入並寄邀請信'}
-                            </button>
-                            {membersMsg && (
-                              <span style={{ fontSize: 11, color: membersMsg.startsWith('✓') ? C.success : (membersMsg.startsWith('⚠') ? '#fa0' : '#f88') }}>
-                                {membersMsg}
-                              </span>
-                            )}
-                          </div>
+                          {membersMsg && (
+                            <div style={{ marginTop: 8, fontSize: 11, color: membersMsg.startsWith('✓') ? C.success : (membersMsg.startsWith('⚠') ? '#fa0' : '#f88') }}>
+                              {membersMsg}
+                            </div>
+                          )}
                         </>
                       ) : (
-                        <div style={{ fontSize: 11, color: C.textMut, lineHeight: 1.5 }}>
-                          只有專案建立者(owner)可以新增或移除成員。
-                        </div>
+                        <>
+                          {/* member 視角:只看到自己被加入這個專案 */}
+                          <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, marginBottom: 8 }}>
+                            {projectOwnerEmail && (
+                              <div style={{ display: 'inline-flex', alignItems: 'center', gap: 5, padding: '3px 8px', background: C.accent + '22', color: C.accent, borderRadius: 6, fontSize: 11 }}>
+                                👑 {projectOwnerEmail}
+                              </div>
+                            )}
+                            {members.map(m => (
+                              <div key={m.member_email} style={{ display: 'inline-flex', alignItems: 'center', gap: 4, padding: '3px 8px', background: C.bgInput, border: `1px solid ${C.border}`, borderRadius: 6, fontSize: 11 }}>
+                                {m.member_email}
+                              </div>
+                            ))}
+                          </div>
+                          <div style={{ fontSize: 11, color: C.textMut, lineHeight: 1.5 }}>
+                            只有專案建立者(owner)可以新增或移除成員。
+                          </div>
+                        </>
                       )}
                     </div>
                   </div>
                 </div>
               </div>
-            )}
           </div>
 
           {lastMeeting && (
@@ -2466,12 +2955,7 @@
                   >
                     ▶ 開始錄音
                   </button>
-                  <button
-                    style={{ ...btn('ghost'), width: '100%', padding: 10, fontSize: 13, marginTop: 8, color: C.textSec }}
-                    onClick={() => setPhase(0)}
-                  >
-                    ← 回會前提案
-                  </button>
+                  {/* (2026-04-26 移除「← 回會前提案」按鈕) — 上方 tab 常駐可直接切回 */}
                 </div>
               )}
               {recordingState === 'in_progress' && (
@@ -3522,9 +4006,8 @@ ${txText}
       const [notionParentPageId, setNotionParentPageId] = useState('');
       const [isRecording, setIsRecording] = useState(false);
       const [recordingSeconds, setRecordingSeconds] = useState(0);
-      const [headerHidden, setHeaderHidden] = useState(false);
+      const [headerHidden, setHeaderHidden] = useState(false); // 保留 state(Header 元件吃 hidden prop),但永遠是 false
       const [isFullscreen, setIsFullscreen] = useState(false);
-      const lastScrollY = useRef(0);
 
       // ─── App 層全螢幕按鈕（Meeting 元件外，確保 position:fixed 不受父層影響）─────
       useEffect(() => {
@@ -3558,59 +4041,10 @@ ${txText}
         if (active) setRecordingSeconds(seconds);
       };
 
-      // ─── Header 隱藏/顯示（全螢幕請求已移到 tab onClick，避免被瀏覽器擋）─────────────
-      useEffect(() => {
-        if (phase === 1) {
-          setHeaderHidden(true);
-          lastScrollY.current = window.scrollY;
-        } else {
-          setHeaderHidden(false);
-        }
-      }, [phase]);
-
-      // 往上滑：退出全螢幕，Header 重新出現
-      useEffect(() => {
-        if (phase !== 1) return;
-        // 退出全螢幕的 helper（含 Safari webkit 前綴）
-        const exitFS = () => {
-          const isFS = document.fullscreenElement || document.webkitFullscreenElement;
-          if (isFS) {
-            if (document.exitFullscreen) document.exitFullscreen().catch(() => {});
-            else if (document.webkitExitFullscreen) document.webkitExitFullscreen();
-          }
-        };
-        const onScroll = () => {
-          const y = window.scrollY;
-          if (y < lastScrollY.current - 40) {
-            // 往上滑超過 40px
-            exitFS();
-            setHeaderHidden(false);
-          } else if (y > lastScrollY.current + 10) {
-            // 往下滑就隱藏 Header
-            setHeaderHidden(true);
-          }
-          lastScrollY.current = y;
-        };
-        // 觸控裝置：用 touchstart/touchend 偵測上滑手勢
-        let touchStartY = 0;
-        const onTouchStart = (e) => { touchStartY = e.touches[0].clientY; };
-        const onTouchEnd = (e) => {
-          const dy = e.changedTouches[0].clientY - touchStartY;
-          if (dy > 60) {
-            // 往下拉（手指向下移動超過 60px）→ 顯示 Header
-            exitFS();
-            setHeaderHidden(false);
-          }
-        };
-        window.addEventListener('scroll', onScroll, { passive: true });
-        window.addEventListener('touchstart', onTouchStart, { passive: true });
-        window.addEventListener('touchend', onTouchEnd, { passive: true });
-        return () => {
-          window.removeEventListener('scroll', onScroll);
-          window.removeEventListener('touchstart', onTouchStart);
-          window.removeEventListener('touchend', onTouchEnd);
-        };
-      }, [phase]);
+      // ─── Header 永遠常駐(2026-04-26 移除 phase=1 自動隱藏 + 滑動 toggle 邏輯)─────────
+      // 舊行為:進「會議進行」就把 Header 藏掉,搭配 requestFullscreen + 滑動偵測再顯示
+      // 新行為:Header 永遠在,全螢幕改成由「點提案內容」才觸發
+      // 全螢幕中要看 tab 的話,點右下角浮動的「↙ 縮小」即可
 
       useEffect(() => {
         if (!projectId) return;
@@ -3711,7 +4145,11 @@ ${txText}
             recordingSeconds={recordingSeconds}
             hidden={headerHidden}
           />
-          {phase === 0 && <PreMeeting projectId={projectId} proposals={proposals} setProposals={setProposals} setSyncOk={setSyncOk} journal={journal} projectTitle={projectTitle} meetingDate={meetingDate} setMeetingDate={setMeetingDate} meetingTime={meetingTime} setMeetingTime={setMeetingTime} briefing={briefing} />}
+          {/* PreMeeting: 永遠掛載，避免切換 tab 時 unmount 導致草稿（提案者姓名/標題/內容/附件選擇）被清空 */}
+          {/* 同事在準備期會在 tabs 之間來回切（檢查日誌、看附件、回提案區），切回來資料還在 */}
+          <div style={{ display: phase === 0 ? 'block' : 'none' }}>
+            <PreMeeting projectId={projectId} proposals={proposals} setProposals={setProposals} setSyncOk={setSyncOk} journal={journal} projectTitle={projectTitle} meetingDate={meetingDate} setMeetingDate={setMeetingDate} meetingTime={meetingTime} setMeetingTime={setMeetingTime} briefing={briefing} />
+          </div>
           {/* Meeting: 永遠掛載，避免切換 tab 時 unmount 導致計時狀態歸零 */}
           <div style={{ display: phase === 1 ? 'block' : 'none' }}>
             <Meeting proposals={proposals} setProposals={setProposals} projectId={projectId} briefing={briefing}
