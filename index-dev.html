@@ -3700,9 +3700,8 @@ ${txText}
       const [notionParentPageId, setNotionParentPageId] = useState('');
       const [isRecording, setIsRecording] = useState(false);
       const [recordingSeconds, setRecordingSeconds] = useState(0);
-      const [headerHidden, setHeaderHidden] = useState(false);
+      const [headerHidden, setHeaderHidden] = useState(false); // 保留 state(Header 元件吃 hidden prop),但永遠是 false
       const [isFullscreen, setIsFullscreen] = useState(false);
-      const lastScrollY = useRef(0);
 
       // ─── App 層全螢幕按鈕（Meeting 元件外，確保 position:fixed 不受父層影響）─────
       useEffect(() => {
@@ -3736,59 +3735,10 @@ ${txText}
         if (active) setRecordingSeconds(seconds);
       };
 
-      // ─── Header 隱藏/顯示（全螢幕請求已移到 tab onClick，避免被瀏覽器擋）─────────────
-      useEffect(() => {
-        if (phase === 1) {
-          setHeaderHidden(true);
-          lastScrollY.current = window.scrollY;
-        } else {
-          setHeaderHidden(false);
-        }
-      }, [phase]);
-
-      // 往上滑：退出全螢幕，Header 重新出現
-      useEffect(() => {
-        if (phase !== 1) return;
-        // 退出全螢幕的 helper（含 Safari webkit 前綴）
-        const exitFS = () => {
-          const isFS = document.fullscreenElement || document.webkitFullscreenElement;
-          if (isFS) {
-            if (document.exitFullscreen) document.exitFullscreen().catch(() => {});
-            else if (document.webkitExitFullscreen) document.webkitExitFullscreen();
-          }
-        };
-        const onScroll = () => {
-          const y = window.scrollY;
-          if (y < lastScrollY.current - 40) {
-            // 往上滑超過 40px
-            exitFS();
-            setHeaderHidden(false);
-          } else if (y > lastScrollY.current + 10) {
-            // 往下滑就隱藏 Header
-            setHeaderHidden(true);
-          }
-          lastScrollY.current = y;
-        };
-        // 觸控裝置：用 touchstart/touchend 偵測上滑手勢
-        let touchStartY = 0;
-        const onTouchStart = (e) => { touchStartY = e.touches[0].clientY; };
-        const onTouchEnd = (e) => {
-          const dy = e.changedTouches[0].clientY - touchStartY;
-          if (dy > 60) {
-            // 往下拉（手指向下移動超過 60px）→ 顯示 Header
-            exitFS();
-            setHeaderHidden(false);
-          }
-        };
-        window.addEventListener('scroll', onScroll, { passive: true });
-        window.addEventListener('touchstart', onTouchStart, { passive: true });
-        window.addEventListener('touchend', onTouchEnd, { passive: true });
-        return () => {
-          window.removeEventListener('scroll', onScroll);
-          window.removeEventListener('touchstart', onTouchStart);
-          window.removeEventListener('touchend', onTouchEnd);
-        };
-      }, [phase]);
+      // ─── Header 永遠常駐(2026-04-26 移除 phase=1 自動隱藏 + 滑動 toggle 邏輯)─────────
+      // 舊行為:進「會議進行」就把 Header 藏掉,搭配 requestFullscreen + 滑動偵測再顯示
+      // 新行為:Header 永遠在,全螢幕改成由「點提案內容」才觸發
+      // 全螢幕中要看 tab 的話,點右下角浮動的「↙ 縮小」即可
 
       useEffect(() => {
         if (!projectId) return;
