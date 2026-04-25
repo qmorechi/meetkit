@@ -1224,19 +1224,31 @@
       // 邀請白名單:此專案的 owner + members
       const [projectOwnerEmail, setProjectOwnerEmail] = useState('');
       const [members, setMembers] = useState([]);
-      const [addEmailsInput, setAddEmailsInput] = useState('');
       const [addingMembers, setAddingMembers] = useState(false);
       const [membersMsg, setMembersMsg] = useState('');
       // 重寄邀請中的 email(避免同一列 double-click;一次只寄一封,UI 顯示「…」)
       const [resendingEmail, setResendingEmail] = useState('');
-      // 公司同事目錄(2026-04-26 改為硬編固定清單)
-      // 11 位常駐成員,左欄 label 預設全列,點一下立即加入並寄邀請信
+      // 公司同事目錄 — 靜態 base(11 位常駐)+ 動態擴充(localStorage)
       // 排序:emmy → debby → leo → ring → maruo → ray → kevin → bow → howard → alice → qmore
-      // 全部都是 @minimax.com.tw,Resend 寄件者是 meetkit@mx.design 不影響收件
-      const COMPANY_DIRECTORY = [
+      // 用 + New 加進來的新同事前綴存 localStorage,下次自動列出來
+      // 跨裝置不同步是有意的(Mac Studio / Windows 各自累積),要同步再升 Supabase 表
+      const COMPANY_DOMAIN = 'minimax.com.tw';
+      const STATIC_COMPANY_DIRECTORY = [
         'emmy', 'debby', 'leo', 'ring', 'maruo', 'ray',
         'kevin', 'bow', 'howard', 'alice', 'qmore',
-      ].map(prefix => `${prefix}@minimax.com.tw`);
+      ];
+      const EXTRA_COLLEAGUES_KEY = 'meetkit.extraColleagues';
+      const [extraColleagues, setExtraColleagues] = useState(() => {
+        try {
+          const raw = localStorage.getItem(EXTRA_COLLEAGUES_KEY);
+          if (!raw) return [];
+          const arr = JSON.parse(raw);
+          return Array.isArray(arr) ? arr.filter(x => typeof x === 'string') : [];
+        } catch { return []; }
+      });
+      // + New 內嵌輸入框的 state(預設收起,點 + New 才展開)
+      const [showNewInput, setShowNewInput] = useState(false);
+      const [newPrefix, setNewPrefix] = useState('');
       // 寄送時機:'now' 立即送 / 'schedule' 排程到指定時間
       // scheduledAt 存 <input type="datetime-local"> 的本地時間字串(YYYY-MM-DDTHH:mm)
       // 送給 Edge Function 前會用 toUtcIso 轉成 UTC ISO,Resend 的 scheduled_at 接 UTC
@@ -1397,11 +1409,35 @@
         await commitMembers([email]);
       };
 
-      // textarea 路徑:解析整段字串後交給 commitMembers,成功才清空 textarea
-      const addMembers = async () => {
-        const list = addEmailsInput.split(/[\s,;\n]+/).map(x => x.trim()).filter(Boolean);
-        const ok = await commitMembers(list);
-        if (ok) setAddEmailsInput('');
+      // + New 路徑:輸入前綴(或完整 email)→ commitMembers → 成功就存進 localStorage
+      // 同 domain 才存 prefix 進 extraColleagues,下次自動列出來成為常駐 label
+      // 異 domain(外部來賓)直接 commit,不存 — 下次需要再手動加
+      const addNewColleague = async () => {
+        if (scheduleMode === 'schedule' && !scheduledAt) {
+          setMembersMsg('⚠ 請先設定排程時間');
+          return;
+        }
+        const raw = newPrefix.trim().toLowerCase();
+        if (!raw) return;
+        const email = raw.includes('@') ? raw : `${raw}@${COMPANY_DOMAIN}`;
+        if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+          setMembersMsg('⚠ email 格式不正確');
+          return;
+        }
+        const ok = await commitMembers([email]);
+        if (ok) {
+          // 同 domain 才存 prefix 為常駐 label;異 domain 不污染候選清單
+          if (email.endsWith(`@${COMPANY_DOMAIN}`)) {
+            const prefix = email.split('@')[0];
+            if (!STATIC_COMPANY_DIRECTORY.includes(prefix) && !extraColleagues.includes(prefix)) {
+              const next = [...extraColleagues, prefix];
+              setExtraColleagues(next);
+              try { localStorage.setItem(EXTRA_COLLEAGUES_KEY, JSON.stringify(next)); } catch {}
+            }
+          }
+          setNewPrefix('');
+          setShowNewInput(false);
+        }
       };
 
       const removeMember = async (email) => {
@@ -1421,7 +1457,7 @@
 
       // 重寄邀請信:只觸發 send-invite,不動 DB
       // 使用情境:成員說「我沒收到信」「誤刪了」「垃圾信撈不到」
-      // 注意和 addMembers 的差異 — 這裡跳過 INSERT,因為 email 早就在 project_members 了
+      // 注意和 commitMembers 的差異 — 這裡跳過 INSERT,因為 email 早就在 project_members 了
       const resendInvite = async (email) => {
         if (!isOwner || !email) return;
         setResendingEmail(email);
@@ -1738,7 +1774,8 @@
                 </div>
 
                 {/* 📬 與會者白名單(2026-04-26 改為左右兩欄)
-                    左欄 = 同事候選(COMPANY_DIRECTORY 扣掉已加入的);點一下立即提交 + 寄邀請信
+                    左欄 = 同事候選(STATIC_COMPANY_DIRECTORY + extraColleagues 扣掉已加入的);點一下立即提交 + 寄邀請信
+                    左欄末尾的 + New 展開內嵌前綴輸入框,加入後存 localStorage 變常駐 label
                     右欄 = 與會人員(owner + members);按 X 移除後,若該 email 在 directory 內會自動回到左欄
                     schedule radios + textarea 共用,放在兩欄下方
                     member 視角:左欄不顯示,只看得到右欄自己那一列 */}
@@ -1753,8 +1790,11 @@
                           {(() => {
                             const memberSet = new Set(members.map(m => (m.member_email || '').toLowerCase()));
                             const ownerLc = (projectOwnerEmail || '').toLowerCase();
-                            // 候選 = directory 扣掉已是 owner 或 member 的
-                            const candidates = COMPANY_DIRECTORY.filter(e => e !== ownerLc && !memberSet.has(e));
+                            // 候選 = (static + extras) 扣掉已是 owner 或 member 的
+                            const allPrefixes = [...new Set([...STATIC_COMPANY_DIRECTORY, ...extraColleagues])];
+                            const candidates = allPrefixes
+                              .map(p => `${p}@${COMPANY_DOMAIN}`)
+                              .filter(e => e !== ownerLc && !memberSet.has(e));
                             return (
                               <div style={{ display: 'flex', gap: 10, marginBottom: 12 }}>
                                 {/* 左欄:同事候選 */}
@@ -1762,40 +1802,90 @@
                                   <div style={{ fontSize: 10, color: C.textMut, marginBottom: 6, fontWeight: 600 }}>
                                     💼 同事候選 · 點一下加入
                                   </div>
-                                  {candidates.length === 0 ? (
-                                    <div style={{ fontSize: 11, color: C.textMut, lineHeight: 1.6 }}>
-                                      所有同事都已加入這場會議
-                                    </div>
-                                  ) : (
-                                    <div style={{ display: 'flex', flexWrap: 'wrap', gap: 5 }}>
-                                      {candidates.map(email => {
-                                        const prefix = email.split('@')[0];
-                                        return (
-                                          <button
-                                            type="button"
-                                            key={email}
-                                            onClick={() => quickAddOne(email)}
-                                            disabled={addingMembers}
-                                            title={`點一下加入 ${email}`}
-                                            style={{
-                                              padding: '3px 9px',
-                                              background: 'transparent',
-                                              border: `1px solid ${C.border}`,
-                                              borderRadius: 6,
-                                              fontSize: 11,
-                                              color: C.textSec,
-                                              cursor: addingMembers ? 'wait' : 'pointer',
-                                              fontFamily: 'inherit',
-                                              lineHeight: 1.4,
-                                              opacity: addingMembers ? 0.5 : 1,
-                                            }}
-                                          >
-                                            + {prefix}
-                                          </button>
-                                        );
-                                      })}
-                                    </div>
-                                  )}
+                                  <div style={{ display: 'flex', flexWrap: 'wrap', gap: 5 }}>
+                                    {candidates.map(email => {
+                                      const prefix = email.split('@')[0];
+                                      return (
+                                        <button
+                                          type="button"
+                                          key={email}
+                                          onClick={() => quickAddOne(email)}
+                                          disabled={addingMembers}
+                                          title={`點一下加入 ${email}`}
+                                          style={{
+                                            padding: '3px 9px',
+                                            background: 'transparent',
+                                            border: `1px solid ${C.border}`,
+                                            borderRadius: 6,
+                                            fontSize: 11,
+                                            color: C.textSec,
+                                            cursor: addingMembers ? 'wait' : 'pointer',
+                                            fontFamily: 'inherit',
+                                            lineHeight: 1.4,
+                                            opacity: addingMembers ? 0.5 : 1,
+                                          }}
+                                        >
+                                          + {prefix}
+                                        </button>
+                                      );
+                                    })}
+                                    {/* + New:展開內嵌前綴輸入框,加入後永久成為候選 label */}
+                                    {!showNewInput ? (
+                                      <button
+                                        type="button"
+                                        onClick={() => { setShowNewInput(true); setMembersMsg(''); }}
+                                        disabled={addingMembers}
+                                        title="加入新同事(輸入 email 前綴)"
+                                        style={{
+                                          padding: '3px 9px',
+                                          background: 'transparent',
+                                          border: `1px dashed ${C.accent}66`,
+                                          borderRadius: 6,
+                                          fontSize: 11,
+                                          color: C.accent,
+                                          cursor: addingMembers ? 'wait' : 'pointer',
+                                          fontFamily: 'inherit',
+                                          lineHeight: 1.4,
+                                          opacity: addingMembers ? 0.5 : 1,
+                                        }}
+                                      >
+                                        + New
+                                      </button>
+                                    ) : (
+                                      <div style={{ display: 'inline-flex', alignItems: 'center', gap: 4, padding: '2px 4px', background: C.bgPanel, border: `1px solid ${C.accent}66`, borderRadius: 6 }}>
+                                        <input
+                                          type="text"
+                                          autoFocus
+                                          value={newPrefix}
+                                          onChange={e => setNewPrefix(e.target.value)}
+                                          onKeyDown={e => {
+                                            if (e.key === 'Enter') { e.preventDefault(); addNewColleague(); }
+                                            else if (e.key === 'Escape') { setShowNewInput(false); setNewPrefix(''); }
+                                          }}
+                                          placeholder="email 前綴"
+                                          style={{ background: 'transparent', border: 'none', outline: 'none', color: C.text, fontSize: 11, fontFamily: 'inherit', width: 90, padding: '2px 4px' }}
+                                        />
+                                        <span style={{ fontSize: 10, color: C.textMut }}>@{COMPANY_DOMAIN}</span>
+                                        <button
+                                          type="button"
+                                          onClick={addNewColleague}
+                                          disabled={addingMembers || !newPrefix.trim()}
+                                          title="加入並寄邀請"
+                                          style={{ background: C.accent, border: 'none', color: '#fff', borderRadius: 4, fontSize: 10, padding: '2px 7px', cursor: 'pointer', fontFamily: 'inherit', opacity: (addingMembers || !newPrefix.trim()) ? 0.4 : 1 }}
+                                        >
+                                          {addingMembers ? '…' : '✓'}
+                                        </button>
+                                        <button
+                                          type="button"
+                                          onClick={() => { setShowNewInput(false); setNewPrefix(''); }}
+                                          title="取消"
+                                          style={{ background: 'none', border: 'none', color: C.textMut, fontSize: 11, padding: 0, cursor: 'pointer', lineHeight: 1 }}
+                                        >
+                                          ✕
+                                        </button>
+                                      </div>
+                                    )}
+                                  </div>
                                 </div>
 
                                 {/* 右欄:與會人員 */}
@@ -1847,7 +1937,7 @@
                             );
                           })()}
 
-                          {/* 寄送時機(共用於左欄一鍵 + textarea 寄邀請) */}
+                          {/* 寄送時機(共用於左欄一鍵 + + New) */}
                           <div style={{ marginTop: 4, fontSize: 11, color: C.textSec, display: 'flex', gap: 14, alignItems: 'center', flexWrap: 'wrap' }}>
                             <label style={{ display: 'inline-flex', alignItems: 'center', gap: 4, cursor: 'pointer' }}>
                               <input type="radio" name={`sm-${projectId}`} checked={scheduleMode === 'now'} onChange={() => setScheduleMode('now')} />
@@ -1876,32 +1966,6 @@
                               )}
                             </div>
                           )}
-
-                          {/* 下半:textarea — 名單外 / 外部來賓 fallback */}
-                          <div style={{ marginTop: 10 }}>
-                            <div style={{ fontSize: 10, color: C.textMut, marginBottom: 4 }}>
-                              名單外的人(外部來賓 / 新同事)
-                            </div>
-                            <textarea
-                              value={addEmailsInput}
-                              onChange={e => setAddEmailsInput(e.target.value)}
-                              placeholder={`email 一行一個,或逗號分隔\n例:client@example.com`}
-                              style={{ ...S.input, minHeight: 50, maxHeight: 120, overflowY: 'auto', fontSize: 12, padding: '6px 10px', fontFamily: 'inherit', resize: 'none', width: '100%', boxSizing: 'border-box' }}
-                            />
-                            <div style={{ display: 'flex', gap: 8, marginTop: 6, alignItems: 'center', flexWrap: 'wrap' }}>
-                              <button
-                                style={{ ...btn('primary'), padding: '6px 14px', fontSize: 12, opacity: addingMembers ? 0.6 : 1 }}
-                                disabled={addingMembers || !addEmailsInput.trim() || (scheduleMode === 'schedule' && !scheduledAt)}
-                                onClick={addMembers}
-                              >
-                                {addingMembers
-                                  ? '加入中…'
-                                  : scheduleMode === 'schedule'
-                                    ? '＋ 加入並排程邀請信'
-                                    : '＋ 加入並寄邀請信'}
-                              </button>
-                            </div>
-                          </div>
 
                           {membersMsg && (
                             <div style={{ marginTop: 8, fontSize: 11, color: membersMsg.startsWith('✓') ? C.success : (membersMsg.startsWith('⚠') ? '#fa0' : '#f88') }}>
