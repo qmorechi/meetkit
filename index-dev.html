@@ -1523,7 +1523,15 @@
         }
         try {
           const res = await db("proposals", { method: 'POST', body: JSON.stringify({ ...form, project_id: projectId, file_url, file_name }) });
-          if (res.ok) { setForm({ author: '', title: '', content: '' }); setAttachFiles([]); if (attachRef.current) attachRef.current.value = ''; await loadProposals(); showToast('✓ 提案已送出！'); }
+          if (res.ok) {
+            // 送出後不清空姓名/標題/內容:同一場會議準備期間,常會連續送多份提案,清空逼使用者重打很煩
+            // 附件清空(已上傳到 storage,留著會在下次 submit 重複上傳)
+            // 「新會議預約後清空」是 Phase 3 才有的 lifecycle event(目前一個專案=一場會議,沒有重置點)
+            setAttachFiles([]);
+            if (attachRef.current) attachRef.current.value = '';
+            await loadProposals();
+            showToast('✓ 提案已送出！');
+          }
           else showToast('送出失敗，請再試一次');
         } catch { showToast('網路錯誤，請再試一次'); }
         finally { setSubmitting(false); }
