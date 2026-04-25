@@ -1145,13 +1145,10 @@
                   <button
                     onClick={() => {
                       setPhase(p.id);
-                      const el = document.body;
-                      // 切到「會議進行」：請求全螢幕（含 Safari webkit 前綴；用 body 比 documentElement 更可靠）
-                      if (p.id === 1) {
-                        if (el.requestFullscreen) el.requestFullscreen().catch(() => {});
-                        else if (el.webkitRequestFullscreen) el.webkitRequestFullscreen();
-                      } else {
-                        // 離開會議進行：退出全螢幕
+                      // 進入「會議進行」不再自動全螢幕 — 全螢幕由點選提案內容才觸發
+                      // (2026-04-26)準備中頁要看到 tab 才能往回切;舊行為把 tab 蓋掉很困擾
+                      // 切到非「會議進行」tab → 退出全螢幕(如果有的話)
+                      if (p.id !== 1) {
                         const isFS = document.fullscreenElement || document.webkitFullscreenElement;
                         if (isFS) {
                           if (document.exitFullscreen) document.exitFullscreen().catch(() => {});
@@ -2652,12 +2649,7 @@
                   >
                     ▶ 開始錄音
                   </button>
-                  <button
-                    style={{ ...btn('ghost'), width: '100%', padding: 10, fontSize: 13, marginTop: 8, color: C.textSec }}
-                    onClick={() => setPhase(0)}
-                  >
-                    ← 回會前提案
-                  </button>
+                  {/* (2026-04-26 移除「← 回會前提案」按鈕) — 上方 tab 常駐可直接切回 */}
                 </div>
               )}
               {recordingState === 'in_progress' && (
