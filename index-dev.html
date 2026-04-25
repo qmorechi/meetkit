@@ -29,6 +29,10 @@
     ::-webkit-scrollbar-thumb { background: #2a2d35; border-radius: 4px; }
     input, textarea, button { font-family: inherit; }
     input:focus, textarea:focus { outline: none; }
+    /* 時/分輸入框:藏掉 type="number" 的上下旋鈕(Safari/Chrome) */
+    input.mk-time-part::-webkit-outer-spin-button,
+    input.mk-time-part::-webkit-inner-spin-button { -webkit-appearance: none; margin: 0; }
+    input.mk-time-part { -moz-appearance: textfield; appearance: textfield; }
     audio { background: #1a1d25; }
     @keyframes pulse { 0%, 100% { box-shadow: 0 0 0 0 rgba(192,57,43,0.4); } 50% { box-shadow: 0 0 0 8px rgba(192,57,43,0); } }
     @keyframes spin { to { transform: rotate(360deg); } }
@@ -1762,10 +1766,12 @@
                     視覺上模擬一個輸入框:外框統一,內部兩格無邊框 + 中間冒號 */}
                 <div style={{ ...S.input, width: 'auto', display: 'inline-flex', alignItems: 'center', padding: '0 8px', height: 32 }}>
                   <input
-                    type="text"
+                    type="number"
                     inputMode="numeric"
                     placeholder="時"
-                    maxLength={2}
+                    min={0}
+                    max={23}
+                    className="mk-time-part"
                     value={hourInput}
                     onChange={e => {
                       // 24 小時制:0-23 才合法
@@ -1788,7 +1794,11 @@
                         if (next) next.focus();
                       }
                     }}
-                    onKeyDown={e => { if (e.key === 'Enter') { e.preventDefault(); commitMeetingTime(); e.target.blur(); } }}
+                    onKeyDown={e => {
+                      // type=number 預設上下鍵會 +/- 1,我們不要這個行為
+                      if (e.key === 'ArrowUp' || e.key === 'ArrowDown') { e.preventDefault(); return; }
+                      if (e.key === 'Enter') { e.preventDefault(); commitMeetingTime(); e.target.blur(); }
+                    }}
                     onBlur={e => {
                       // 焦點只在時/分之間互跳(自動跳轉或手動 Tab)不要 commit:
                       // 否則 onChange 觸發 next.focus() → 同步 blur → commitMeetingTime 讀到 stale state(空字串)
@@ -1802,10 +1812,12 @@
                   />
                   <span style={{ fontSize: 13, color: C.textMut, padding: '0 1px' }}>:</span>
                   <input
-                    type="text"
+                    type="number"
                     inputMode="numeric"
                     placeholder="分"
-                    maxLength={2}
+                    min={0}
+                    max={59}
+                    className="mk-time-part"
                     value={minuteInput}
                     onChange={e => {
                       // 分:0-59 才合法,第 2 碼讓分鐘超過 59 就拒絕
@@ -1815,7 +1827,10 @@
                       }
                       setMinuteInput(v);
                     }}
-                    onKeyDown={e => { if (e.key === 'Enter') { e.preventDefault(); commitMeetingTime(); e.target.blur(); } }}
+                    onKeyDown={e => {
+                      if (e.key === 'ArrowUp' || e.key === 'ArrowDown') { e.preventDefault(); return; }
+                      if (e.key === 'Enter') { e.preventDefault(); commitMeetingTime(); e.target.blur(); }
+                    }}
                     onBlur={e => {
                       // 焦點只在時/分之間互跳(自動跳轉或手動 Tab)不要 commit:
                       // 否則 onChange 觸發 next.focus() → 同步 blur → commitMeetingTime 讀到 stale state(空字串)
