@@ -1768,10 +1768,22 @@
                     maxLength={2}
                     value={hourInput}
                     onChange={e => {
-                      const v = e.target.value.replace(/\D/g, '').slice(0, 2);
+                      // 24 小時制:0-23 才合法
+                      // 第 1 碼是 3-9 → 單碼即可(3,4,...,9 = 03,04,...,09),自動跳到分
+                      // 第 1 碼是 0-2 → 允許再打第 2 碼,但第 2 碼讓 hour 超過 23 就拒絕
+                      let v = e.target.value.replace(/\D/g, '').slice(0, 2);
+                      if (v.length === 2 && parseInt(v, 10) > 23) {
+                        // 例如打 "25":拒絕第 2 碼,只保留第 1 碼
+                        v = v[0];
+                      }
                       setHourInput(v);
-                      // 時打滿 2 碼自動跳到分(便利,不強制)
-                      if (v.length === 2) {
+                      // 兩種跳到分的時機:
+                      //   (a) 打滿合法 2 碼(如 09, 13, 23)
+                      //   (b) 打第 1 碼是 3-9(不可能再合法擴展)
+                      const shouldAdvance =
+                        (v.length === 2) ||
+                        (v.length === 1 && parseInt(v, 10) >= 3);
+                      if (shouldAdvance) {
                         const next = e.target.parentElement?.querySelector('input[data-time-part="minute"]');
                         if (next) next.focus();
                       }
@@ -1789,7 +1801,14 @@
                     placeholder="分"
                     maxLength={2}
                     value={minuteInput}
-                    onChange={e => setMinuteInput(e.target.value.replace(/\D/g, '').slice(0, 2))}
+                    onChange={e => {
+                      // 分:0-59 才合法,第 2 碼讓分鐘超過 59 就拒絕
+                      let v = e.target.value.replace(/\D/g, '').slice(0, 2);
+                      if (v.length === 2 && parseInt(v, 10) > 59) {
+                        v = v[0];
+                      }
+                      setMinuteInput(v);
+                    }}
                     onKeyDown={e => { if (e.key === 'Enter') { e.preventDefault(); commitMeetingTime(); e.target.blur(); } }}
                     onBlur={commitMeetingTime}
                     onFocus={e => e.target.select()}
