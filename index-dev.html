@@ -1789,7 +1789,13 @@
                       }
                     }}
                     onKeyDown={e => { if (e.key === 'Enter') { e.preventDefault(); commitMeetingTime(); e.target.blur(); } }}
-                    onBlur={commitMeetingTime}
+                    onBlur={e => {
+                      // 焦點只在時/分之間互跳(自動跳轉或手動 Tab)不要 commit:
+                      // 否則 onChange 觸發 next.focus() → 同步 blur → commitMeetingTime 讀到 stale state(空字串)
+                      // 把使用者剛打的數字一起抹掉。等使用者真正離開整個時間區才正規化。
+                      if (e.relatedTarget?.dataset?.timePart) return;
+                      commitMeetingTime();
+                    }}
                     onFocus={e => e.target.select()}
                     data-time-part="hour"
                     style={{ background: 'transparent', border: 'none', outline: 'none', color: C.text, fontSize: 13, width: 26, textAlign: 'center', padding: 0, fontFamily: 'inherit', fontVariantNumeric: 'tabular-nums' }}
@@ -1810,7 +1816,13 @@
                       setMinuteInput(v);
                     }}
                     onKeyDown={e => { if (e.key === 'Enter') { e.preventDefault(); commitMeetingTime(); e.target.blur(); } }}
-                    onBlur={commitMeetingTime}
+                    onBlur={e => {
+                      // 焦點只在時/分之間互跳(自動跳轉或手動 Tab)不要 commit:
+                      // 否則 onChange 觸發 next.focus() → 同步 blur → commitMeetingTime 讀到 stale state(空字串)
+                      // 把使用者剛打的數字一起抹掉。等使用者真正離開整個時間區才正規化。
+                      if (e.relatedTarget?.dataset?.timePart) return;
+                      commitMeetingTime();
+                    }}
                     onFocus={e => e.target.select()}
                     data-time-part="minute"
                     style={{ background: 'transparent', border: 'none', outline: 'none', color: C.text, fontSize: 13, width: 26, textAlign: 'center', padding: 0, fontFamily: 'inherit', fontVariantNumeric: 'tabular-nums' }}
