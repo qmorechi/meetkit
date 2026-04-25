@@ -1229,6 +1229,10 @@
       const [membersMsg, setMembersMsg] = useState('');
       // 重寄邀請中的 email(避免同一列 double-click;一次只寄一封,UI 顯示「…」)
       const [resendingEmail, setResendingEmail] = useState('');
+      // 公司同事目錄:從所有可見的 project_members 抓同 domain 的 email,給 label-style 一鍵加入
+      // 不另開 directory 表;RLS 自然限定我看得到的範圍(我擁有的專案 + 我加入的專案的同列)
+      // 邀越多人,目錄越完整 — 第一次邀請的新人要打字,之後就變 label
+      const [knownColleagues, setKnownColleagues] = useState([]);
       // 寄送時機:'now' 立即送 / 'schedule' 排程到指定時間
       // scheduledAt 存 <input type="datetime-local"> 的本地時間字串(YYYY-MM-DDTHH:mm)
       // 送給 Edge Function 前會用 toUtcIso 轉成 UTC ISO,Resend 的 scheduled_at 接 UTC
@@ -1273,6 +1277,25 @@
 
       useEffect(() => { loadMembers(); }, [loadMembers]);
 
+      // ─── 公司同事目錄(cross-project 聚合)─────────────────────
+      // 從歷史 project_members 抓我看得到的所有同事 email,當作快速加入的 label 來源
+      // 同 domain 才顯示(避免誤把客戶當同事),自己不顯示在自己的 label 列裡
+      const loadKnownColleagues = useCallback(() => {
+        const me = (currentSession?.user?.email || '').toLowerCase();
+        if (!me) return;
+        const myDomain = me.split('@')[1];
+        if (!myDomain) return;
+        db(`project_members?select=member_email&limit=500`)
+          .then(r => r.json()).then(rows => {
+            if (!Array.isArray(rows)) return;
+            const uniq = [...new Set(rows.map(r => (r.member_email || '').toLowerCase()))]
+              .filter(e => e && e.endsWith('@' + myDomain) && e !== me)
+              .sort();
+            setKnownColleagues(uniq);
+          }).catch(() => {});
+      }, []);
+      useEffect(() => { loadKnownColleagues(); }, [loadKnownColleagues, projectId]);
+
       // ─── 排程寄送 helpers ──────────────────────────────────────
       // datetime-local 字串(無時區,瀏覽器當本地時間解讀)→ UTC ISO
       // Resend 的 scheduled_at 接 UTC ISO 或 natural language,這裡統一用 UTC ISO 最穩
@@ -1313,6 +1336,19 @@
       };
 
       // 新增成員:驗證 email → INSERT → 寄邀請信(立即或排程) → 重新載入
+      // 點 label = 在 textarea 的待加入清單中切換該 email(進去 / 拿掉)
+      // 不直接 commit,讓使用者還能選排程模式 + 確認後才按主按鈕
+      const toggleColleague = (email) => {
+        const lc = String(email || '').toLowerCase();
+        if (!lc) return;
+        const current = addEmailsInput.split(/[\s,;\n]+/).map(x => x.trim().toLowerCase()).filter(Boolean);
+        if (current.includes(lc)) {
+          setAddEmailsInput(current.filter(e => e !== lc).join('\n'));
+        } else {
+          setAddEmailsInput(current.length ? current.concat(lc).join('\n') : lc);
+        }
+      };
+
       const addMembers = async () => {
         const list = addEmailsInput.split(/[\s,;\n]+/).map(x => x.trim().toLowerCase()).filter(Boolean);
         const valid = [...new Set(list.filter(x => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(x)))];
@@ -1752,7 +1788,55 @@
                       {/* 新增成員(只有 owner 能操作) */}
                       {isOwner ? (
                         <>
-                          {/* textarea 高度固定 60-120px,內容多就內部捲動(避免整個面板被撐開) */}
+                          {/* 公司同事快速加入 label — 從歷史 project_members 同 domain 聚合而來
+                              點 label 把 email 加到下面的 textarea,再按主按鈕一次寄出
+                              已是本專案 member 或 owner 的不出現在這裡(他們會在上面的 chips 區) */}
+                          {(() => {
+                            const queuedSet = new Set(
+                              addEmailsInput.split(/[\s,;\n]+/).map(x => x.trim().toLowerCase()).filter(Boolean)
+                            );
+                            const memberSet = new Set(members.map(m => (m.member_email || '').toLowerCase()));
+                            const ownerLc = (projectOwnerEmail || '').toLowerCase();
+                            const candidates = knownColleagues.filter(e => e !== ownerLc && !memberSet.has(e));
+                            if (candidates.length === 0) return null;
+                            return (
+                              <div style={{ marginBottom: 8 }}>
+                                <div style={{ fontSize: 10, color: C.textMut, marginBottom: 5 }}>
+                                  💼 同事快速加入(點選 label,再按下方按鈕寄邀請)
+                                </div>
+                                <div style={{ display: 'flex', flexWrap: 'wrap', gap: 5 }}>
+                                  {candidates.map(email => {
+                                    const prefix = email.split('@')[0];
+                                    const queued = queuedSet.has(email);
+                                    return (
+                                      <button
+                                        type="button"
+                                        key={email}
+                                        onClick={() => toggleColleague(email)}
+                                        title={email}
+                                        style={{
+                                          padding: '3px 9px',
+                                          background: queued ? C.accent + '22' : 'transparent',
+                                          border: `1px solid ${queued ? C.accent : C.border}`,
+                                          borderRadius: 6,
+                                          fontSize: 11,
+                                          color: queued ? C.accent : C.textSec,
+                                          cursor: 'pointer',
+                                          fontFamily: 'inherit',
+                                          lineHeight: 1.4,
+                                        }}
+                                      >
+                                        {queued ? `✓ ${prefix}` : `+ ${prefix}`}
+                                      </button>
+                                    );
+                                  })}
+                                </div>
+                              </div>
+                            );
+                          })()}
+
+                          {/* textarea 高度固定 60-120px,內容多就內部捲動(避免整個面板被撐開)
+                              用於名單上找不到的新同事 / 外部來賓 — 同事直接點上面的 label */}
                           <textarea
                             value={addEmailsInput}
                             onChange={e => setAddEmailsInput(e.target.value)}
