@@ -1229,10 +1229,14 @@
       const [membersMsg, setMembersMsg] = useState('');
       // 重寄邀請中的 email(避免同一列 double-click;一次只寄一封,UI 顯示「…」)
       const [resendingEmail, setResendingEmail] = useState('');
-      // 公司同事目錄:從所有可見的 project_members 抓同 domain 的 email,給 label-style 一鍵加入
-      // 不另開 directory 表;RLS 自然限定我看得到的範圍(我擁有的專案 + 我加入的專案的同列)
-      // 邀越多人,目錄越完整 — 第一次邀請的新人要打字,之後就變 label
-      const [knownColleagues, setKnownColleagues] = useState([]);
+      // 公司同事目錄(2026-04-26 改為硬編固定清單)
+      // 11 位常駐成員,左欄 label 預設全列,點一下立即加入並寄邀請信
+      // 排序:emmy → debby → leo → ring → maruo → ray → kevin → bow → howard → alice → qmore
+      // 全部都是 @minimax.com.tw,Resend 寄件者是 meetkit@mx.design 不影響收件
+      const COMPANY_DIRECTORY = [
+        'emmy', 'debby', 'leo', 'ring', 'maruo', 'ray',
+        'kevin', 'bow', 'howard', 'alice', 'qmore',
+      ].map(prefix => `${prefix}@minimax.com.tw`);
       // 寄送時機:'now' 立即送 / 'schedule' 排程到指定時間
       // scheduledAt 存 <input type="datetime-local"> 的本地時間字串(YYYY-MM-DDTHH:mm)
       // 送給 Edge Function 前會用 toUtcIso 轉成 UTC ISO,Resend 的 scheduled_at 接 UTC
@@ -1278,25 +1282,6 @@
 
       useEffect(() => { loadMembers(); }, [loadMembers]);
 
-      // ─── 公司同事目錄(cross-project 聚合)─────────────────────
-      // 從歷史 project_members 抓我看得到的所有同事 email,當作快速加入的 label 來源
-      // 同 domain 才顯示(避免誤把客戶當同事),自己不顯示在自己的 label 列裡
-      const loadKnownColleagues = useCallback(() => {
-        const me = (currentSession?.user?.email || '').toLowerCase();
-        if (!me) return;
-        const myDomain = me.split('@')[1];
-        if (!myDomain) return;
-        db(`project_members?select=member_email&limit=500`)
-          .then(r => r.json()).then(rows => {
-            if (!Array.isArray(rows)) return;
-            const uniq = [...new Set(rows.map(r => (r.member_email || '').toLowerCase()))]
-              .filter(e => e && e.endsWith('@' + myDomain) && e !== me)
-              .sort();
-            setKnownColleagues(uniq);
-          }).catch(() => {});
-      }, []);
-      useEffect(() => { loadKnownColleagues(); }, [loadKnownColleagues, projectId]);
-
       // ─── 排程寄送 helpers ──────────────────────────────────────
       // datetime-local 字串(無時區,瀏覽器當本地時間解讀)→ UTC ISO
       // Resend 的 scheduled_at 接 UTC ISO 或 natural language,這裡統一用 UTC ISO 最穩
@@ -1336,29 +1321,18 @@
         setScheduledAt(toLocalInput(d));
       };
 
-      // 新增成員:驗證 email → INSERT → 寄邀請信(立即或排程) → 重新載入
-      // 點 label = 在 textarea 的待加入清單中切換該 email(進去 / 拿掉)
-      // 不直接 commit,讓使用者還能選排程模式 + 確認後才按主按鈕
-      const toggleColleague = (email) => {
-        const lc = String(email || '').toLowerCase();
-        if (!lc) return;
-        const current = addEmailsInput.split(/[\s,;\n]+/).map(x => x.trim().toLowerCase()).filter(Boolean);
-        if (current.includes(lc)) {
-          setAddEmailsInput(current.filter(e => e !== lc).join('\n'));
-        } else {
-          setAddEmailsInput(current.length ? current.concat(lc).join('\n') : lc);
-        }
-      };
-
-      const addMembers = async () => {
-        const list = addEmailsInput.split(/[\s,;\n]+/).map(x => x.trim().toLowerCase()).filter(Boolean);
+      // ─── 加入成員核心:驗證 → INSERT → 寄邀請信 → 重載 ──────────────
+      // commitMembers 是 textarea 路徑和 label 一鍵路徑共用的底層邏輯
+      // 兩個入口的差別只在「email 從哪來」:textarea 解析整段字串,label 直接傳一個
+      const commitMembers = async (rawEmails) => {
+        const list = (rawEmails || []).map(x => String(x || '').trim().toLowerCase()).filter(Boolean);
         const valid = [...new Set(list.filter(x => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(x)))];
         // 排除已經是 owner / 已在名單的
         const existing = new Set(members.map(m => (m.member_email || '').toLowerCase()));
         const newOnes = valid.filter(e => e !== projectOwnerEmail.toLowerCase() && !existing.has(e));
         if (newOnes.length === 0) {
           setMembersMsg('⚠ 沒有新的有效 email(可能都已在名單中)');
-          return;
+          return false;
         }
         setAddingMembers(true);
         setMembersMsg('');
@@ -1403,13 +1377,31 @@
             ? `,將於 ${scheduledAt.replace('T', ' ')} 寄出`
             : ',邀請信寄送中';
           setMembersMsg(`✓ 已新增 ${newOnes.length} 位成員${whenMsg}`);
-          setAddEmailsInput('');
           loadMembers();
+          return true;
         } catch (e) {
           setMembersMsg(`❌ ${e.message || '新增失敗'}`);
+          return false;
         } finally {
           setAddingMembers(false);
         }
+      };
+
+      // 一鍵加入(左欄 label 點選):立即提交該 email + 寄邀請信
+      // 排程模式下若沒設時間就擋住,提示先選時間
+      const quickAddOne = async (email) => {
+        if (scheduleMode === 'schedule' && !scheduledAt) {
+          setMembersMsg('⚠ 請先設定排程時間');
+          return;
+        }
+        await commitMembers([email]);
+      };
+
+      // textarea 路徑:解析整段字串後交給 commitMembers,成功才清空 textarea
+      const addMembers = async () => {
+        const list = addEmailsInput.split(/[\s,;\n]+/).map(x => x.trim()).filter(Boolean);
+        const ok = await commitMembers(list);
+        if (ok) setAddEmailsInput('');
       };
 
       const removeMember = async (email) => {
@@ -1745,108 +1737,118 @@
                   先到 Notion 把該頁「⋯ → Add connections → MeetKit」分享給 integration,才能寫入。
                 </div>
 
-                {/* 📬 與會者白名單 — 只有 owner 能加 / 移除;member 只看得到自己 */}
+                {/* 📬 與會者白名單(2026-04-26 改為左右兩欄)
+                    左欄 = 同事候選(COMPANY_DIRECTORY 扣掉已加入的);點一下立即提交 + 寄邀請信
+                    右欄 = 與會人員(owner + members);按 X 移除後,若該 email 在 directory 內會自動回到左欄
+                    schedule radios + textarea 共用,放在兩欄下方
+                    member 視角:左欄不顯示,只看得到右欄自己那一列 */}
                 <div style={{ marginTop: 8, paddingTop: 14, borderTop: `1px dashed ${C.border}` }}>
                   <div style={{ display: 'flex', gap: 10, alignItems: 'flex-start', marginBottom: 8 }}>
                     <span style={{ fontSize: 12, color: C.textMut, width: 72, flexShrink: 0, paddingTop: 4 }}>📬 與會者</span>
                     <div style={{ flex: 1, minWidth: 0 }}>
-                      {/* 現有成員清單 */}
-                      <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, marginBottom: 10 }}>
-                        {projectOwnerEmail && (
-                          <div style={{ display: 'inline-flex', alignItems: 'center', gap: 5, padding: '3px 8px', background: C.accent + '22', color: C.accent, borderRadius: 6, fontSize: 11 }}>
-                            👑 {projectOwnerEmail}
-                          </div>
-                        )}
-                        {members.map(m => (
-                          <div key={m.member_email} style={{ display: 'inline-flex', alignItems: 'center', gap: 4, padding: '3px 8px', background: C.bgInput, border: `1px solid ${C.border}`, borderRadius: 6, fontSize: 11 }}>
-                            {m.member_email}
-                            {isOwner && m.member_email !== myEmail && (
-                              <>
-                                <button
-                                  onClick={() => resendInvite(m.member_email)}
-                                  disabled={resendingEmail === m.member_email}
-                                  style={{ background: 'none', border: 'none', color: C.textMut, cursor: 'pointer', fontSize: 11, padding: 0, lineHeight: 1, opacity: resendingEmail === m.member_email ? 0.4 : 1 }}
-                                  title="重寄邀請信"
-                                >
-                                  {resendingEmail === m.member_email ? '…' : '✉'}
-                                </button>
-                                <button
-                                  onClick={() => removeMember(m.member_email)}
-                                  style={{ background: 'none', border: 'none', color: C.textMut, cursor: 'pointer', fontSize: 11, padding: 0, lineHeight: 1 }}
-                                  title="移除此成員"
-                                >
-                                  ✕
-                                </button>
-                              </>
-                            )}
-                          </div>
-                        ))}
-                        {members.length === 0 && !projectOwnerEmail && (
-                          <span style={{ fontSize: 11, color: C.textMut }}>載入中…</span>
-                        )}
-                      </div>
 
-                      {/* 新增成員(只有 owner 能操作) */}
                       {isOwner ? (
                         <>
-                          {/* 公司同事快速加入 label — 從歷史 project_members 同 domain 聚合而來
-                              點 label 把 email 加到下面的 textarea,再按主按鈕一次寄出
-                              已是本專案 member 或 owner 的不出現在這裡(他們會在上面的 chips 區) */}
+                          {/* 上半:左右兩欄 */}
                           {(() => {
-                            const queuedSet = new Set(
-                              addEmailsInput.split(/[\s,;\n]+/).map(x => x.trim().toLowerCase()).filter(Boolean)
-                            );
                             const memberSet = new Set(members.map(m => (m.member_email || '').toLowerCase()));
                             const ownerLc = (projectOwnerEmail || '').toLowerCase();
-                            const candidates = knownColleagues.filter(e => e !== ownerLc && !memberSet.has(e));
-                            if (candidates.length === 0) return null;
+                            // 候選 = directory 扣掉已是 owner 或 member 的
+                            const candidates = COMPANY_DIRECTORY.filter(e => e !== ownerLc && !memberSet.has(e));
                             return (
-                              <div style={{ marginBottom: 8 }}>
-                                <div style={{ fontSize: 10, color: C.textMut, marginBottom: 5 }}>
-                                  💼 同事快速加入(點選 label,再按下方按鈕寄邀請)
+                              <div style={{ display: 'flex', gap: 10, marginBottom: 12 }}>
+                                {/* 左欄:同事候選 */}
+                                <div style={{ flex: 1, minWidth: 0, padding: 10, background: C.bgInput, border: `1px solid ${C.border}`, borderRadius: 8 }}>
+                                  <div style={{ fontSize: 10, color: C.textMut, marginBottom: 6, fontWeight: 600 }}>
+                                    💼 同事候選 · 點一下加入
+                                  </div>
+                                  {candidates.length === 0 ? (
+                                    <div style={{ fontSize: 11, color: C.textMut, lineHeight: 1.6 }}>
+                                      所有同事都已加入這場會議
+                                    </div>
+                                  ) : (
+                                    <div style={{ display: 'flex', flexWrap: 'wrap', gap: 5 }}>
+                                      {candidates.map(email => {
+                                        const prefix = email.split('@')[0];
+                                        return (
+                                          <button
+                                            type="button"
+                                            key={email}
+                                            onClick={() => quickAddOne(email)}
+                                            disabled={addingMembers}
+                                            title={`點一下加入 ${email}`}
+                                            style={{
+                                              padding: '3px 9px',
+                                              background: 'transparent',
+                                              border: `1px solid ${C.border}`,
+                                              borderRadius: 6,
+                                              fontSize: 11,
+                                              color: C.textSec,
+                                              cursor: addingMembers ? 'wait' : 'pointer',
+                                              fontFamily: 'inherit',
+                                              lineHeight: 1.4,
+                                              opacity: addingMembers ? 0.5 : 1,
+                                            }}
+                                          >
+                                            + {prefix}
+                                          </button>
+                                        );
+                                      })}
+                                    </div>
+                                  )}
                                 </div>
-                                <div style={{ display: 'flex', flexWrap: 'wrap', gap: 5 }}>
-                                  {candidates.map(email => {
-                                    const prefix = email.split('@')[0];
-                                    const queued = queuedSet.has(email);
-                                    return (
-                                      <button
-                                        type="button"
-                                        key={email}
-                                        onClick={() => toggleColleague(email)}
-                                        title={email}
-                                        style={{
-                                          padding: '3px 9px',
-                                          background: queued ? C.accent + '22' : 'transparent',
-                                          border: `1px solid ${queued ? C.accent : C.border}`,
-                                          borderRadius: 6,
-                                          fontSize: 11,
-                                          color: queued ? C.accent : C.textSec,
-                                          cursor: 'pointer',
-                                          fontFamily: 'inherit',
-                                          lineHeight: 1.4,
-                                        }}
-                                      >
-                                        {queued ? `✓ ${prefix}` : `+ ${prefix}`}
-                                      </button>
-                                    );
-                                  })}
+
+                                {/* 右欄:與會人員 */}
+                                <div style={{ flex: 1, minWidth: 0, padding: 10, background: C.accent + '08', border: `1px solid ${C.accent}33`, borderRadius: 8 }}>
+                                  <div style={{ fontSize: 10, color: C.textMut, marginBottom: 6, fontWeight: 600 }}>
+                                    ✓ 與會人員 · 按 X 移除
+                                  </div>
+                                  <div style={{ display: 'flex', flexWrap: 'wrap', gap: 5 }}>
+                                    {projectOwnerEmail && (
+                                      <div style={{ display: 'inline-flex', alignItems: 'center', gap: 5, padding: '3px 8px', background: C.accent + '22', color: C.accent, borderRadius: 6, fontSize: 11 }}>
+                                        👑 {projectOwnerEmail.split('@')[0]}
+                                      </div>
+                                    )}
+                                    {members.map(m => {
+                                      const prefix = (m.member_email || '').split('@')[0];
+                                      return (
+                                        <div key={m.member_email} title={m.member_email} style={{ display: 'inline-flex', alignItems: 'center', gap: 4, padding: '3px 8px', background: C.bgPanel, border: `1px solid ${C.border}`, borderRadius: 6, fontSize: 11 }}>
+                                          {prefix}
+                                          {m.member_email !== myEmail && (
+                                            <>
+                                              <button
+                                                onClick={() => resendInvite(m.member_email)}
+                                                disabled={resendingEmail === m.member_email}
+                                                style={{ background: 'none', border: 'none', color: C.textMut, cursor: 'pointer', fontSize: 11, padding: 0, lineHeight: 1, opacity: resendingEmail === m.member_email ? 0.4 : 1 }}
+                                                title="重寄邀請信"
+                                              >
+                                                {resendingEmail === m.member_email ? '…' : '✉'}
+                                              </button>
+                                              <button
+                                                onClick={() => removeMember(m.member_email)}
+                                                style={{ background: 'none', border: 'none', color: C.textMut, cursor: 'pointer', fontSize: 11, padding: 0, lineHeight: 1 }}
+                                                title="移除此成員(回到左欄)"
+                                              >
+                                                ✕
+                                              </button>
+                                            </>
+                                          )}
+                                        </div>
+                                      );
+                                    })}
+                                    {members.length === 0 && (
+                                      <span style={{ fontSize: 11, color: C.textMut, lineHeight: 1.6 }}>
+                                        (除了你以外還沒人)
+                                      </span>
+                                    )}
+                                  </div>
                                 </div>
                               </div>
                             );
                           })()}
 
-                          {/* textarea 高度固定 60-120px,內容多就內部捲動(避免整個面板被撐開)
-                              用於名單上找不到的新同事 / 外部來賓 — 同事直接點上面的 label */}
-                          <textarea
-                            value={addEmailsInput}
-                            onChange={e => setAddEmailsInput(e.target.value)}
-                            placeholder={`新增成員 email(一行一個,或逗號分隔)\n例:\nalice@example.com\nbob@example.com`}
-                            style={{ ...S.input, minHeight: 60, maxHeight: 120, overflowY: 'auto', fontSize: 12, padding: '6px 10px', fontFamily: 'inherit', resize: 'none', width: '100%', boxSizing: 'border-box' }}
-                          />
-
-                          {/* 寄送時機:立即 vs 排程到指定時間(Resend scheduled_at) */}
-                          <div style={{ marginTop: 8, fontSize: 11, color: C.textSec, display: 'flex', gap: 14, alignItems: 'center', flexWrap: 'wrap' }}>
+                          {/* 寄送時機(共用於左欄一鍵 + textarea 寄邀請) */}
+                          <div style={{ marginTop: 4, fontSize: 11, color: C.textSec, display: 'flex', gap: 14, alignItems: 'center', flexWrap: 'wrap' }}>
                             <label style={{ display: 'inline-flex', alignItems: 'center', gap: 4, cursor: 'pointer' }}>
                               <input type="radio" name={`sm-${projectId}`} checked={scheduleMode === 'now'} onChange={() => setScheduleMode('now')} />
                               立即寄送
@@ -1875,29 +1877,57 @@
                             </div>
                           )}
 
-                          <div style={{ display: 'flex', gap: 8, marginTop: 8, alignItems: 'center', flexWrap: 'wrap' }}>
-                            <button
-                              style={{ ...btn('primary'), padding: '6px 14px', fontSize: 12, opacity: addingMembers ? 0.6 : 1 }}
-                              disabled={addingMembers || !addEmailsInput.trim() || (scheduleMode === 'schedule' && !scheduledAt)}
-                              onClick={addMembers}
-                            >
-                              {addingMembers
-                                ? '加入中…'
-                                : scheduleMode === 'schedule'
-                                  ? '＋ 加入並排程邀請信'
-                                  : '＋ 加入並寄邀請信'}
-                            </button>
-                            {membersMsg && (
-                              <span style={{ fontSize: 11, color: membersMsg.startsWith('✓') ? C.success : (membersMsg.startsWith('⚠') ? '#fa0' : '#f88') }}>
-                                {membersMsg}
-                              </span>
-                            )}
+                          {/* 下半:textarea — 名單外 / 外部來賓 fallback */}
+                          <div style={{ marginTop: 10 }}>
+                            <div style={{ fontSize: 10, color: C.textMut, marginBottom: 4 }}>
+                              名單外的人(外部來賓 / 新同事)
+                            </div>
+                            <textarea
+                              value={addEmailsInput}
+                              onChange={e => setAddEmailsInput(e.target.value)}
+                              placeholder={`email 一行一個,或逗號分隔\n例:client@example.com`}
+                              style={{ ...S.input, minHeight: 50, maxHeight: 120, overflowY: 'auto', fontSize: 12, padding: '6px 10px', fontFamily: 'inherit', resize: 'none', width: '100%', boxSizing: 'border-box' }}
+                            />
+                            <div style={{ display: 'flex', gap: 8, marginTop: 6, alignItems: 'center', flexWrap: 'wrap' }}>
+                              <button
+                                style={{ ...btn('primary'), padding: '6px 14px', fontSize: 12, opacity: addingMembers ? 0.6 : 1 }}
+                                disabled={addingMembers || !addEmailsInput.trim() || (scheduleMode === 'schedule' && !scheduledAt)}
+                                onClick={addMembers}
+                              >
+                                {addingMembers
+                                  ? '加入中…'
+                                  : scheduleMode === 'schedule'
+                                    ? '＋ 加入並排程邀請信'
+                                    : '＋ 加入並寄邀請信'}
+                              </button>
+                            </div>
                           </div>
+
+                          {membersMsg && (
+                            <div style={{ marginTop: 8, fontSize: 11, color: membersMsg.startsWith('✓') ? C.success : (membersMsg.startsWith('⚠') ? '#fa0' : '#f88') }}>
+                              {membersMsg}
+                            </div>
+                          )}
                         </>
                       ) : (
-                        <div style={{ fontSize: 11, color: C.textMut, lineHeight: 1.5 }}>
-                          只有專案建立者(owner)可以新增或移除成員。
-                        </div>
+                        <>
+                          {/* member 視角:只看到自己被加入這個專案 */}
+                          <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, marginBottom: 8 }}>
+                            {projectOwnerEmail && (
+                              <div style={{ display: 'inline-flex', alignItems: 'center', gap: 5, padding: '3px 8px', background: C.accent + '22', color: C.accent, borderRadius: 6, fontSize: 11 }}>
+                                👑 {projectOwnerEmail}
+                              </div>
+                            )}
+                            {members.map(m => (
+                              <div key={m.member_email} style={{ display: 'inline-flex', alignItems: 'center', gap: 4, padding: '3px 8px', background: C.bgInput, border: `1px solid ${C.border}`, borderRadius: 6, fontSize: 11 }}>
+                                {m.member_email}
+                              </div>
+                            ))}
+                          </div>
+                          <div style={{ fontSize: 11, color: C.textMut, lineHeight: 1.5 }}>
+                            只有專案建立者(owner)可以新增或移除成員。
+                          </div>
+                        </>
                       )}
                     </div>
                   </div>
