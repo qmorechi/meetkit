@@ -3711,7 +3711,11 @@ ${txText}
             recordingSeconds={recordingSeconds}
             hidden={headerHidden}
           />
-          {phase === 0 && <PreMeeting projectId={projectId} proposals={proposals} setProposals={setProposals} setSyncOk={setSyncOk} journal={journal} projectTitle={projectTitle} meetingDate={meetingDate} setMeetingDate={setMeetingDate} meetingTime={meetingTime} setMeetingTime={setMeetingTime} briefing={briefing} />}
+          {/* PreMeeting: 永遠掛載，避免切換 tab 時 unmount 導致草稿（提案者姓名/標題/內容/附件選擇）被清空 */}
+          {/* 同事在準備期會在 tabs 之間來回切（檢查日誌、看附件、回提案區），切回來資料還在 */}
+          <div style={{ display: phase === 0 ? 'block' : 'none' }}>
+            <PreMeeting projectId={projectId} proposals={proposals} setProposals={setProposals} setSyncOk={setSyncOk} journal={journal} projectTitle={projectTitle} meetingDate={meetingDate} setMeetingDate={setMeetingDate} meetingTime={meetingTime} setMeetingTime={setMeetingTime} briefing={briefing} />
+          </div>
           {/* Meeting: 永遠掛載，避免切換 tab 時 unmount 導致計時狀態歸零 */}
           <div style={{ display: phase === 1 ? 'block' : 'none' }}>
             <Meeting proposals={proposals} setProposals={setProposals} projectId={projectId} briefing={briefing}
