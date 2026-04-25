@@ -1240,7 +1240,8 @@
       const [scheduledAt, setScheduledAt] = useState('');
       const myEmail = (currentSession?.user?.email || '').toLowerCase();
       const isOwner = !!projectOwnerEmail && projectOwnerEmail.toLowerCase() === myEmail;
-      const [showUrlInput, setShowUrlInput] = useState(false);
+      // (2026-04-26 移除)showUrlInput 原本是 ⚙ 設定面板的 toggle,內容(Notion + 與會者)
+      //   已直接攤在表層,讓 owner 一眼看到「歸檔走到哪個 Notion 頁」+「誰會收到邀請」,不再需要展開
       const [showDatePicker, setShowDatePicker] = useState(false);
       const [showJournalRef, setShowJournalRef] = useState(false);
       const contentRef = useRef();
@@ -1689,8 +1690,7 @@
                 })()}
               </div>
               <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexShrink: 0 }}>
-                <button style={{ ...btn('ghost'), padding: '7px 14px', fontSize: 13 }} onClick={() => { setShowDatePicker(v => !v); setShowUrlInput(false); }}>🗓 新會議預約</button>
-                <button style={{ ...btn('ghost'), padding: '8px 10px', fontSize: 13 }} title="設定" onClick={() => { setShowUrlInput(v => !v); setShowDatePicker(false); }}>⚙</button>
+                <button style={{ ...btn('ghost'), padding: '7px 14px', fontSize: 13 }} onClick={() => setShowDatePicker(v => !v)}>🗓 新會議預約</button>
               </div>
             </div>
 
@@ -1705,9 +1705,10 @@
               </div>
             )}
 
-            {showUrlInput && (
-              <div style={{ marginTop: 16, paddingTop: 16, borderTop: `1px solid ${C.border}`, display: 'flex', flexDirection: 'column', gap: 10 }} className="fade-in">
-                {/* Route C:Notion 目標頁 picker — 每個專案獨立綁一個 Notion 頁 */}
+            {/* Notion 設定 + 與會者管理 — 直接攤在表層,不再藏 ⚙ 後面
+                理由:owner 在準備期會大量加同事 / 重寄邀請,藏在點擊面板裡每次都要多一步 */}
+            <div style={{ marginTop: 16, paddingTop: 16, borderTop: `1px solid ${C.border}`, display: 'flex', flexDirection: 'column', gap: 10 }}>
+              {/* Route C:Notion 目標頁 picker — 每個專案獨立綁一個 Notion 頁 */}
                 <div style={{ display: 'flex', gap: 10, alignItems: 'center' }}>
                   <span style={{ fontSize: 12, color: C.textMut, width: 72, flexShrink: 0 }}>📓 Notion</span>
                   <input
@@ -1902,7 +1903,6 @@
                   </div>
                 </div>
               </div>
-            )}
           </div>
 
           {lastMeeting && (
