@@ -1257,6 +1257,40 @@
       //   已直接攤在表層,讓 owner 一眼看到「歸檔走到哪個 Notion 頁」+「誰會收到邀請」,不再需要展開
       const [showDatePicker, setShowDatePicker] = useState(false);
       const [showJournalRef, setShowJournalRef] = useState(false);
+      // 時/分拆成兩個獨立輸入框(2026-04-26):
+      // 兩個 local state 是因為使用者打字過程中字串會處於不完整狀態(例:剛打完「2」)
+      // 直接寫進 meetingTime 會被 saveMeetingInfo 即時打進 DB,Enter / blur 才正規化才合理
+      const [hourInput, setHourInput] = useState('');
+      const [minuteInput, setMinuteInput] = useState('');
+      // meetingTime 變動(從 DB 載入 / 外部 setMeetingTime / 清除)→ 同步本地兩個輸入框
+      useEffect(() => {
+        const [h = '', m = ''] = (meetingTime || '').split(':');
+        setHourInput(h);
+        setMinuteInput(m);
+      }, [meetingTime]);
+      // 把 hourInput / minuteInput 正規化成 HH:MM,寫進 meetingTime + DB
+      // 兩個都空白 = 清除時間;只有一個有值 = 另一個補 00
+      const commitMeetingTime = () => {
+        const h = parseInt(hourInput, 10);
+        const m = parseInt(minuteInput, 10);
+        const hEmpty = hourInput.trim() === '' || isNaN(h);
+        const mEmpty = minuteInput.trim() === '' || isNaN(m);
+        if (hEmpty && mEmpty) {
+          if (meetingTime !== '') { setMeetingTime(''); saveMeetingInfo(meetingDate, ''); }
+          return;
+        }
+        const hh = String(Math.min(23, Math.max(0, hEmpty ? 0 : h))).padStart(2, '0');
+        const mm = String(Math.min(59, Math.max(0, mEmpty ? 0 : m))).padStart(2, '0');
+        const normalized = `${hh}:${mm}`;
+        if (normalized !== meetingTime) {
+          setMeetingTime(normalized);
+          saveMeetingInfo(meetingDate, normalized);
+        } else {
+          // 正規化後等於現值,但本地輸入框可能還是「2」這種片段,要刷成「02」
+          setHourInput(hh);
+          setMinuteInput(mm);
+        }
+      };
       const contentRef = useRef();
       const attachRef = useRef();
       const cardFileRefs = useRef({});
@@ -1722,30 +1756,47 @@
             {showDatePicker && (
               <div style={{ marginTop: 16, paddingTop: 16, borderTop: `1px solid ${C.border}`, display: 'flex', gap: 10, alignItems: 'center', flexWrap: 'wrap' }} className="fade-in">
                 <input type="date" style={{ ...S.input, width: 'auto', fontSize: 13, colorScheme: 'dark' }} value={meetingDate} onChange={e => { setMeetingDate(e.target.value); saveMeetingInfo(e.target.value, meetingTime); }} />
-                {/* 時間用 text input 直接打字(原 type="time" 的 Safari 上下鍵很難用)
-                    onBlur 寬鬆解析:支援 9:30 / 09:30 / 0930 / 9.30,離開時統一正規化成 HH:MM
-                    inputMode="numeric" 讓手機跳數字鍵盤 */}
-                <input
-                  type="text"
-                  inputMode="numeric"
-                  placeholder="HH:MM"
-                  maxLength={5}
-                  style={{ ...S.input, width: 80, fontSize: 13, textAlign: 'center', fontVariantNumeric: 'tabular-nums' }}
-                  value={meetingTime}
-                  onChange={e => setMeetingTime(e.target.value)}
-                  onBlur={e => {
-                    const v = (e.target.value || '').trim();
-                    if (!v) { saveMeetingInfo(meetingDate, ''); return; }
-                    // 接受 H:MM / HH:MM / HHMM / H.MM 等格式
-                    const m = v.match(/^(\d{1,2})[:.\-\s]?(\d{2})$/);
-                    if (!m) { saveMeetingInfo(meetingDate, v); return; } // 無法解析就照打字內容存
-                    const h = String(Math.min(23, parseInt(m[1], 10))).padStart(2, '0');
-                    const mm = String(Math.min(59, parseInt(m[2], 10))).padStart(2, '0');
-                    const normalized = `${h}:${mm}`;
-                    setMeetingTime(normalized);
-                    saveMeetingInfo(meetingDate, normalized);
-                  }}
-                />
+                {/* 時 : 分 雙獨立輸入框(2026-04-26)
+                    時和分各自獨立打字,Enter / 跳出輸入框才正規化(commitMeetingTime)
+                    時打完 2 碼自動跳到分(autoAdvance);Backspace 在分為空時跳回時(未做,需要再加)
+                    視覺上模擬一個輸入框:外框統一,內部兩格無邊框 + 中間冒號 */}
+                <div style={{ ...S.input, width: 'auto', display: 'inline-flex', alignItems: 'center', padding: '0 8px', height: 32 }}>
+                  <input
+                    type="text"
+                    inputMode="numeric"
+                    placeholder="時"
+                    maxLength={2}
+                    value={hourInput}
+                    onChange={e => {
+                      const v = e.target.value.replace(/\D/g, '').slice(0, 2);
+                      setHourInput(v);
+                      // 時打滿 2 碼自動跳到分(便利,不強制)
+                      if (v.length === 2) {
+                        const next = e.target.parentElement?.querySelector('input[data-time-part="minute"]');
+                        if (next) next.focus();
+                      }
+                    }}
+                    onKeyDown={e => { if (e.key === 'Enter') { e.preventDefault(); commitMeetingTime(); e.target.blur(); } }}
+                    onBlur={commitMeetingTime}
+                    onFocus={e => e.target.select()}
+                    data-time-part="hour"
+                    style={{ background: 'transparent', border: 'none', outline: 'none', color: C.text, fontSize: 13, width: 26, textAlign: 'center', padding: 0, fontFamily: 'inherit', fontVariantNumeric: 'tabular-nums' }}
+                  />
+                  <span style={{ fontSize: 13, color: C.textMut, padding: '0 2px' }}>:</span>
+                  <input
+                    type="text"
+                    inputMode="numeric"
+                    placeholder="分"
+                    maxLength={2}
+                    value={minuteInput}
+                    onChange={e => setMinuteInput(e.target.value.replace(/\D/g, '').slice(0, 2))}
+                    onKeyDown={e => { if (e.key === 'Enter') { e.preventDefault(); commitMeetingTime(); e.target.blur(); } }}
+                    onBlur={commitMeetingTime}
+                    onFocus={e => e.target.select()}
+                    data-time-part="minute"
+                    style={{ background: 'transparent', border: 'none', outline: 'none', color: C.text, fontSize: 13, width: 26, textAlign: 'center', padding: 0, fontFamily: 'inherit', fontVariantNumeric: 'tabular-nums' }}
+                  />
+                </div>
                 <button style={{ ...btn('primary'), padding: '7px 16px', fontSize: 13 }} onClick={() => { openNewRound(); setShowDatePicker(false); }}>✓ 確認開新準備室</button>
                 {(meetingDate || meetingTime) && (
                   <button style={{ ...btn('ghost'), padding: '6px 10px', fontSize: 12, color: C.textMut }} onClick={() => { setMeetingDate(''); setMeetingTime(''); saveMeetingInfo('', ''); }}>✕ 清除</button>
