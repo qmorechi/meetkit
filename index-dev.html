@@ -845,6 +845,15 @@
       const [inviteEmailsInput, setInviteEmailsInput] = useState('');
       const [creating, setCreating] = useState(false);
       const [sendMsg, setSendMsg] = useState('');
+      // 一頁顯示 5 個,超過用上下箭頭捲(每次 1 個 item)
+      const PAGE_SIZE = 5;
+      const [myOffset, setMyOffset] = useState(0);
+      const [invitedOffset, setInvitedOffset] = useState(0);
+      // 過濾掉未命名 / 空名專案 — 這些大部分是測試或誤建的,不要塞滿清單
+      const isNamedProject = (p) => {
+        const t = (p?.title || '').trim();
+        return t && t !== '未命名專案';
+      };
 
       const myEmail = (currentSession?.user?.email || '').toLowerCase();
 
@@ -969,6 +978,55 @@
         </div>
       );
 
+      // 一次顯示 PAGE_SIZE 個項目,超過就在右側出現上下箭頭(每按一次捲 1 個)
+      // 沒超過 PAGE_SIZE 就完全不出現箭頭,讓面板自然撐開收縮
+      const renderProjectListWithNav = (list, offset, setOffset) => {
+        const total = list.length;
+        const showNav = total > PAGE_SIZE;
+        // 防呆:offset 不要超出範圍(例如清單變短了)
+        const maxOffset = Math.max(0, total - PAGE_SIZE);
+        const safeOffset = Math.min(Math.max(0, offset), maxOffset);
+        const visible = list.slice(safeOffset, safeOffset + PAGE_SIZE);
+        const arrowBtn = (disabled) => ({
+          background: C.bgInput,
+          border: `1px solid ${C.border}`,
+          borderRadius: 6,
+          color: disabled ? C.textMut + '55' : C.textSec,
+          cursor: disabled ? 'default' : 'pointer',
+          fontSize: 11,
+          padding: '4px 6px',
+          flex: 1,
+          minHeight: 24,
+          display: 'flex',
+          alignItems: 'center',
+          justifyContent: 'center',
+          transition: 'border-color 0.15s, color 0.15s',
+        });
+        return (
+          <div style={{ display: 'flex', gap: 6, alignItems: 'stretch' }}>
+            <div style={{ flex: 1, display: 'flex', flexDirection: 'column', gap: 6, minWidth: 0 }}>
+              {visible.map(renderProjectItem)}
+            </div>
+            {showNav && (
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 4, width: 28 }}>
+                <button
+                  style={arrowBtn(safeOffset === 0)}
+                  disabled={safeOffset === 0}
+                  onClick={() => setOffset(o => Math.max(0, o - 1))}
+                  title="往上"
+                >▲</button>
+                <button
+                  style={arrowBtn(safeOffset >= maxOffset)}
+                  disabled={safeOffset >= maxOffset}
+                  onClick={() => setOffset(o => Math.min(maxOffset, o + 1))}
+                  title="往下"
+                >▼</button>
+              </div>
+            )}
+          </div>
+        );
+      };
+
       return (
         <div style={{ minHeight: '100vh', display: 'flex', flexDirection: 'column', alignItems: 'center', padding: '40px 24px' }}>
           <div style={{ marginBottom: 32, textAlign: 'center' }}>
@@ -979,31 +1037,35 @@
 
           <div style={{ width: '100%', maxWidth: 460, display: 'flex', flexDirection: 'column', gap: 16 }}>
 
-            {/* 我建立的會議 */}
-            {myProjects.length > 0 && (
-              <div style={S.panel}>
-                <div style={{ fontSize: 15, fontWeight: 600, marginBottom: 12, display: 'flex', alignItems: 'center', gap: 6 }}>
-                  🧑‍💼 我建立的會議
-                  <span style={{ fontSize: 11, color: C.textMut, fontWeight: 400 }}>({myProjects.length})</span>
+            {/* 我建立的會議 — 過濾掉未命名空殼;最多顯示 5 個,超過用箭頭捲 */}
+            {(() => {
+              const named = myProjects.filter(isNamedProject);
+              if (named.length === 0) return null;
+              return (
+                <div style={S.panel}>
+                  <div style={{ fontSize: 15, fontWeight: 600, marginBottom: 12, display: 'flex', alignItems: 'center', gap: 6 }}>
+                    🧑‍💼 我建立的會議
+                    <span style={{ fontSize: 11, color: C.textMut, fontWeight: 400 }}>({named.length})</span>
+                  </div>
+                  {renderProjectListWithNav(named, myOffset, setMyOffset)}
                 </div>
-                <div style={{ display: 'flex', flexDirection: 'column', gap: 6, maxHeight: 280, overflowY: 'auto' }}>
-                  {myProjects.map(renderProjectItem)}
-                </div>
-              </div>
-            )}
+              );
+            })()}
 
-            {/* 我被邀請的會議 */}
-            {invitedProjects.length > 0 && (
-              <div style={S.panel}>
-                <div style={{ fontSize: 15, fontWeight: 600, marginBottom: 12, display: 'flex', alignItems: 'center', gap: 6 }}>
-                  📨 我被邀請的會議
-                  <span style={{ fontSize: 11, color: C.textMut, fontWeight: 400 }}>({invitedProjects.length})</span>
+            {/* 我被邀請的會議 — 同樣過濾未命名 + 5 個一頁 */}
+            {(() => {
+              const named = invitedProjects.filter(isNamedProject);
+              if (named.length === 0) return null;
+              return (
+                <div style={S.panel}>
+                  <div style={{ fontSize: 15, fontWeight: 600, marginBottom: 12, display: 'flex', alignItems: 'center', gap: 6 }}>
+                    📨 我被邀請的會議
+                    <span style={{ fontSize: 11, color: C.textMut, fontWeight: 400 }}>({named.length})</span>
+                  </div>
+                  {renderProjectListWithNav(named, invitedOffset, setInvitedOffset)}
                 </div>
-                <div style={{ display: 'flex', flexDirection: 'column', gap: 6, maxHeight: 280, overflowY: 'auto' }}>
-                  {invitedProjects.map(renderProjectItem)}
-                </div>
-              </div>
-            )}
+              );
+            })()}
 
             {/* 建立新會議 */}
             <div style={S.panel}>
