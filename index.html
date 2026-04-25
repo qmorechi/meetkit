@@ -623,6 +623,53 @@
       whisperPrompt: 'Cosmoship, 宇宙小艇, SIPAI, 偷瞄的X, MX Design, Figma, Supabase, Anthropic, Claude, ComfyUI, Flux, MeetKit',
     };
 
+    // ─── Whisper 用量追蹤(本機估算,2026-04-27)───────────────────────────────
+    // OpenAI 不開放 sk- key 查 billing,只能本地累積 + 用公訂價估算
+    // 跨裝置不會同步,但對「我這台機器今天用了多少」這個問題夠用
+    const WHISPER_PRICE_PER_MIN = 0.006; // OpenAI 公訂 $0.006 / 分鐘
+    const WHISPER_USAGE_KEY = 'meetkit.whisperUsage';
+    const todayKey = () => new Date().toISOString().slice(0, 10); // YYYY-MM-DD
+    const monthKey = () => new Date().toISOString().slice(0, 7); // YYYY-MM
+
+    const loadWhisperUsage = () => {
+      try {
+        const raw = localStorage.getItem(WHISPER_USAGE_KEY);
+        if (!raw) return { dailySeconds: {}, totalSeconds: 0 };
+        const parsed = JSON.parse(raw);
+        return {
+          dailySeconds: parsed.dailySeconds || {},
+          totalSeconds: parsed.totalSeconds || 0,
+        };
+      } catch {
+        return { dailySeconds: {}, totalSeconds: 0 };
+      }
+    };
+
+    const recordWhisperUsage = (seconds) => {
+      if (!seconds || seconds <= 0) return;
+      const usage = loadWhisperUsage();
+      const day = todayKey();
+      usage.dailySeconds[day] = (usage.dailySeconds[day] || 0) + seconds;
+      usage.totalSeconds = (usage.totalSeconds || 0) + seconds;
+      try { localStorage.setItem(WHISPER_USAGE_KEY, JSON.stringify(usage)); } catch {}
+      // 通知 Header 更新
+      window.dispatchEvent(new CustomEvent('meetkit:whisper-usage-updated'));
+    };
+
+    // 計算特定區間累積秒數(月份 = 本月所有日加總)
+    const sumMonthSeconds = (dailySeconds, mKey) => {
+      let sum = 0;
+      for (const [day, secs] of Object.entries(dailySeconds || {})) {
+        if (day.startsWith(mKey)) sum += secs;
+      }
+      return sum;
+    };
+
+    const resetWhisperUsage = () => {
+      try { localStorage.removeItem(WHISPER_USAGE_KEY); } catch {}
+      window.dispatchEvent(new CustomEvent('meetkit:whisper-usage-updated'));
+    };
+
     // 階段 3a：單段 Whisper（含重試）
     const transcribeSegment = async (segment, openaiKey, attempt = 1) => {
       try {
@@ -688,6 +735,11 @@
         }
       };
       await Promise.all(Array(AUDIO_CONFIG.parallelChannels).fill(null).map(worker));
+      // 累積成功段落的音訊長度到本機用量(只算成功的,失敗段不計費)
+      const billableSeconds = results
+        .filter(r => r && !r.error && r.durationSec)
+        .reduce((sum, r) => sum + r.durationSec, 0);
+      if (billableSeconds > 0) recordWhisperUsage(billableSeconds);
       return results;
     };
 
@@ -1247,6 +1299,29 @@
 
       useEffect(() => { setDraft(projectTitle); }, [projectTitle]);
 
+      // Whisper 用量顯示(本機估算,跨裝置不同步)
+      const [whisperUsage, setWhisperUsage] = useState(loadWhisperUsage);
+      const [showUsageDetail, setShowUsageDetail] = useState(false);
+      useEffect(() => {
+        const refresh = () => setWhisperUsage(loadWhisperUsage());
+        window.addEventListener('meetkit:whisper-usage-updated', refresh);
+        return () => window.removeEventListener('meetkit:whisper-usage-updated', refresh);
+      }, []);
+      // 點外面關掉 popover
+      useEffect(() => {
+        if (!showUsageDetail) return;
+        const onDocClick = (e) => {
+          if (!e.target.closest?.('[data-mk-usage]')) setShowUsageDetail(false);
+        };
+        document.addEventListener('click', onDocClick);
+        return () => document.removeEventListener('click', onDocClick);
+      }, [showUsageDetail]);
+      const todaySec = whisperUsage.dailySeconds[todayKey()] || 0;
+      const monthSec = sumMonthSeconds(whisperUsage.dailySeconds, monthKey());
+      const totalSec = whisperUsage.totalSeconds || 0;
+      const fmtMin = (s) => (s / 60).toFixed(1);
+      const fmtCost = (s) => ((s / 60) * WHISPER_PRICE_PER_MIN).toFixed(3);
+
       const save = async () => {
         await db(`projects?id=eq.${projectId}`, {
           method: 'PATCH',
@@ -1354,6 +1429,68 @@
               <div style={{ display: 'flex', alignItems: 'center', gap: 5, fontSize: 12, color: C.textSec }}>
               <span style={{ width: 7, height: 7, borderRadius: '50%', background: syncOk ? C.success : C.textMut, display: 'inline-block', boxShadow: syncOk ? `0 0 0 2px ${C.success}44` : 'none' }} />
               <span className="hide-mobile">{syncOk ? '即時同步' : '離線'}</span>
+              </div>
+              {/* 🎙 Whisper 用量(本機估算,點開看 today/month/total)*/}
+              <div data-mk-usage style={{ position: 'relative', fontSize: 12 }} className="hide-mobile">
+                <button
+                  onClick={(e) => { e.stopPropagation(); setShowUsageDetail(v => !v); }}
+                  style={{
+                    background: 'transparent',
+                    border: `1px solid ${C.border}`,
+                    borderRadius: 12,
+                    padding: '3px 9px',
+                    color: C.textSec,
+                    fontSize: 11,
+                    cursor: 'pointer',
+                    fontFamily: 'inherit',
+                    fontVariantNumeric: 'tabular-nums',
+                    display: 'flex', alignItems: 'center', gap: 4,
+                  }}
+                  title="Whisper 用量(本機估算)"
+                >
+                  🎙 {fmtMin(todaySec)}m
+                  <span style={{ color: C.textMut }}>·</span>
+                  <span style={{ color: C.textMut }}>${fmtCost(todaySec)}</span>
+                </button>
+                {showUsageDetail && (
+                  <div data-mk-usage style={{
+                    position: 'absolute', top: 'calc(100% + 6px)', right: 0,
+                    background: C.bgPanel, border: `1px solid ${C.border}`, borderRadius: 8,
+                    padding: '12px 14px', minWidth: 220, zIndex: 200,
+                    boxShadow: '0 4px 16px rgba(0,0,0,0.5)',
+                  }}>
+                    <div style={{ fontWeight: 600, marginBottom: 8, fontSize: 12, color: C.text }}>
+                      🎙 Whisper 用量(本機估算)
+                    </div>
+                    <div style={{ display: 'flex', flexDirection: 'column', gap: 5, fontSize: 11, fontVariantNumeric: 'tabular-nums' }}>
+                      <div style={{ display: 'flex', justifyContent: 'space-between', gap: 12 }}>
+                        <span style={{ color: C.textSec }}>今日</span>
+                        <span style={{ color: C.text }}>{fmtMin(todaySec)} 分　<span style={{ color: C.textMut }}>~${fmtCost(todaySec)}</span></span>
+                      </div>
+                      <div style={{ display: 'flex', justifyContent: 'space-between', gap: 12 }}>
+                        <span style={{ color: C.textSec }}>本月</span>
+                        <span style={{ color: C.text }}>{fmtMin(monthSec)} 分　<span style={{ color: C.textMut }}>~${fmtCost(monthSec)}</span></span>
+                      </div>
+                      <div style={{ display: 'flex', justifyContent: 'space-between', gap: 12 }}>
+                        <span style={{ color: C.textSec }}>累計</span>
+                        <span style={{ color: C.text }}>{fmtMin(totalSec)} 分　<span style={{ color: C.textMut }}>~${fmtCost(totalSec)}</span></span>
+                      </div>
+                    </div>
+                    <div style={{ marginTop: 10, paddingTop: 8, borderTop: `1px solid ${C.border}`, fontSize: 10, color: C.textMut, lineHeight: 1.5 }}>
+                      OpenAI 公訂 $0.006/分鐘 估算。<br/>
+                      跨裝置不同步;只算成功上傳的段落。
+                    </div>
+                    <button
+                      onClick={(e) => { e.stopPropagation(); if (window.confirm('確定要清空本機 Whisper 用量紀錄?')) resetWhisperUsage(); }}
+                      style={{
+                        marginTop: 8, width: '100%',
+                        background: 'transparent', border: `1px solid ${C.border}`,
+                        borderRadius: 5, padding: '4px 8px', color: C.textMut,
+                        fontSize: 10, cursor: 'pointer', fontFamily: 'inherit',
+                      }}
+                    >清空紀錄</button>
+                  </div>
+                )}
               </div>
             </div>
           </div>
