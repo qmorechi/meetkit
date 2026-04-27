@@ -2450,6 +2450,13 @@
                     {notionMsg}
                   </div>
                 )}
+                {/* 編輯狀態下常駐的操作提示 — Notion 內部 integration 不出現在「Add a new connection」推薦清單,
+                    必須手動搜尋名字;同事第一次設定常卡在這步,所以放成 default 提示 */}
+                {notionEditing && (
+                  <div style={{ fontSize: 11, color: C.textMut, paddingLeft: 82, lineHeight: 1.6 }}>
+                    💡 第一次用?到那頁/資料庫右上 <b>⋯</b> → <b>Connections</b> → 搜尋框打 <b>MeetKit</b> → 加入,再回來貼 URL
+                  </div>
+                )}
                 {/* Notion Share 提示面板:兩個觸發點(設定連結成功 + 加新 member 成功)共用
                     Notion 公開 API 沒有「程式分享 page 給個別 user」的 endpoint,只能 owner 手動到 Notion 加
                     emails 來源由觸發點決定:設定連結 = owner+全 members;加人 = 累積「這輪新加的」
