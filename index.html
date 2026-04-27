@@ -4207,6 +4207,25 @@ ${txText}
         }
       };
 
+      // 重新同步到目前設定的 Notion 目標。用於「之前同步到舊目標、現在改了 parent 想補寫」的情境
+      // (例:同事 Bow 一開始貼錯 DB URL,日誌寫進預設 DB 他看不到,改到正確 DB 後要補救)
+      // 直接再呼叫 onSyncToNotion 會建一個新 page 並 PATCH 覆蓋舊的 notion_page_id;
+      // 舊那頁留在原處不刪(避免誤刪有用內容,使用者可自行手動清理)
+      const handleResyncOne = async (e, entry) => {
+        e.stopPropagation();
+        if (!onSyncToNotion) return;
+        if (!confirm(`「${entry.date}」已同步過。要重新寫到目前設定的 Notion 目標嗎?\n（會建立一筆新紀錄,舊的那頁不會自動刪除,需手動清理）`)) return;
+        setSyncingId(entry.id);
+        const result = await onSyncToNotion(entry);
+        setSyncingId(null);
+        if (result.ok) {
+          setSyncedIds(prev => new Set([...prev, entry.id]));
+          if (result.url) window.open(result.url, '_blank');
+        } else {
+          alert('重新同步失敗，請稍後再試');
+        }
+      };
+
       const filtered = journal.slice().reverse().filter(m => {
         if (!search.trim()) return true;
         const q = search.toLowerCase();
@@ -4283,7 +4302,15 @@ ${txText}
                     <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
                       {onSyncToNotion && (
                         syncedIds.has(m.id) || m.notion_page_id
-                          ? <span style={{ ...badge('#2ecc71', '#e8faf0'), fontSize: 10, padding: '2px 7px' }}>✓ Notion</span>
+                          ? <>
+                              <span style={{ ...badge('#2ecc71', '#e8faf0'), fontSize: 10, padding: '2px 7px' }}>✓ Notion</span>
+                              <button
+                                style={{ ...btn('ghost'), padding: '3px 6px', fontSize: 12, color: C.textMut, borderColor: 'transparent', opacity: syncingId === m.id ? 0.5 : 1 }}
+                                disabled={syncingId === m.id}
+                                title="重新同步到目前設定的 Notion 目標（舊的不會自動刪除）"
+                                onClick={e => handleResyncOne(e, m)}
+                              >{syncingId === m.id ? '…' : '↻'}</button>
+                            </>
                           : <button
                               style={{ ...btn('ghost'), padding: '3px 8px', fontSize: 11, color: '#666', borderColor: 'transparent', opacity: syncingId === m.id ? 0.5 : 1 }}
                               disabled={syncingId === m.id}
