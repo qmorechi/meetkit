@@ -155,16 +155,20 @@ Deno.serve(async (req) => {
   if (req.method === 'OPTIONS') return new Response('ok', { headers: cors });
 
   try {
-    // notionParentPageId: 可選。由前端從 projects.notion_parent_page_id 傳入。
-    //   - 有值 → 寫到該 page 底下(subpage),properties 只用 Name
-    //   - 沒值 → 沿用舊行為,寫到 NOTION_DB_ID 指定的資料庫
-    const { journal, projectTitle, isoDate, notionParentPageId } = await req.json();
+    // notionParentPageId + notionParentType:由前端從 projects 傳入,決定歸檔位置
+    //   parentType='page'      → 寫到該 page 底下(subpage),properties 只用 title
+    //   parentType='database'  → 在使用者指定的 database 新增一列(2026-04-27 新增)
+    //                            撈 DB schema 找 title property 名字,只寫 title 欄,其它欄留空
+    //   notionParentPageId 沒值 → 沿用舊行為,寫到 NOTION_DB_ID 指定的預設資料庫
+    const { journal, projectTitle, isoDate, notionParentPageId, notionParentType } = await req.json();
 
     const token = Deno.env.get('NOTION_TOKEN');
     const dbId  = Deno.env.get('NOTION_DB_ID');
     if (!token) throw new Error('NOTION_TOKEN 未設定');
-    const useCustomPage = !!(notionParentPageId && String(notionParentPageId).trim());
-    if (!useCustomPage && !dbId) throw new Error('NOTION_DB_ID 未設定且未指定 notionParentPageId');
+    const hasCustomTarget = !!(notionParentPageId && String(notionParentPageId).trim());
+    const useUserDb   = hasCustomTarget && notionParentType === 'database';
+    const useUserPage = hasCustomTarget && notionParentType !== 'database'; // 預設 page,跟舊資料相容
+    if (!hasCustomTarget && !dbId) throw new Error('NOTION_DB_ID 未設定且未指定 notionParentPageId');
 
     const pageTitle = `${journal.date}｜${projectTitle || '未命名專案'}`;
     const summarySnippet = (journal.summary || '').slice(0, 2000);
@@ -197,24 +201,46 @@ Deno.serve(async (req) => {
       blocks.push(...paragraphBlocks(journal.transcript));
     }
 
-    // ─── 建立 Notion page（最多 100 blocks）───────────────────────
-    // 兩種 parent 模式:
-    //   1) page_id(useCustomPage) → 變成 subpage,只能用 Name 這種 title property
-    //   2) database_id(預設)      → 進指定資料庫,可帶完整 properties(會議日期/專案名稱/摘要)
-    const parent = useCustomPage
-      ? { page_id: notionParentPageId }
-      : { database_id: dbId };
-    const properties = useCustomPage
-      ? {
-          // subpage 只支援 title 類型的 property,欄位名固定為 "title"
-          title: [{ text: { content: pageTitle } }],
-        }
-      : {
-          'Name':   { title:     [{ text: { content: pageTitle } }] },
-          '會議日期': { date:      isoDate ? { start: isoDate } : null },
-          '專案名稱': { rich_text: [{ text: { content: projectTitle || '' } }] },
-          '摘要':    { rich_text: [{ text: { content: summarySnippet } }] },
-        };
+    // ─── 建立 Notion page(最多 100 blocks)───────────────────────
+    // 三種 parent 模式:
+    //   1) useUserPage   → 變成 subpage,parent={page_id},title property 名固定 "title"
+    //   2) useUserDb     → 在使用者 DB 新增列,parent={database_id};但 title property 名 = DB 自訂
+    //                      (中文名「名稱」/「會議名稱」都可能,要先撈 DB schema 找到 type='title' 的欄位)
+    //   3) 預設(都沒指定) → 寫進 NOTION_DB_ID 指定的官方資料庫,properties 寫死 (Name/會議日期/專案名稱/摘要)
+    let parent: object;
+    let properties: object;
+    if (useUserDb) {
+      const dbRes = await fetch(`${NOTION_API}/databases/${notionParentPageId}`, {
+        headers: { 'Authorization': `Bearer ${token}`, 'Notion-Version': '2022-06-28' },
+      });
+      if (!dbRes.ok) {
+        const errBody = await dbRes.json().catch(() => ({}));
+        throw new Error(`讀取使用者資料庫失敗 (${dbRes.status}): ${errBody.message || '請確認 integration 已加到該資料庫'}`);
+      }
+      const dbData = await dbRes.json();
+      let titlePropName = '';
+      for (const [name, prop] of Object.entries(dbData.properties || {})) {
+        if ((prop as any)?.type === 'title') { titlePropName = name; break; }
+      }
+      if (!titlePropName) throw new Error('使用者資料庫沒有 title 欄位,無法建立列');
+      parent = { database_id: notionParentPageId };
+      properties = {
+        [titlePropName]: { title: [{ text: { content: pageTitle } }] },
+      };
+    } else if (useUserPage) {
+      parent = { page_id: notionParentPageId };
+      properties = {
+        title: [{ text: { content: pageTitle } }],
+      };
+    } else {
+      parent = { database_id: dbId };
+      properties = {
+        'Name':   { title:     [{ text: { content: pageTitle } }] },
+        '會議日期': { date:      isoDate ? { start: isoDate } : null },
+        '專案名稱': { rich_text: [{ text: { content: projectTitle || '' } }] },
+        '摘要':    { rich_text: [{ text: { content: summarySnippet } }] },
+      };
+    }
 
     const res = await fetch(`${NOTION_API}/pages`, {
       method: 'POST',

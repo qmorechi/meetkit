@@ -7,9 +7,10 @@
 // 其父頁面/資料庫,就能讀。404 代表沒分享。
 //
 // 前端呼叫格式：
-//   POST { pageId: string, test?: boolean }
-//     test=true → 只檢查是否能讀,回 { ok, title }
+//   POST { pageId: string, test?: boolean, parentType?: 'page' | 'database' }
+//     test=true  → 只檢查是否能讀(page 走 /pages/{id};database 走 /databases/{id}),回 { ok, title }
 //     test=false → 完整抓頁面 + 遞迴子 blocks,攤平成 markdown,回 { ok, title, markdown, images }
+//                  (test=false 一律當 page 處理 — 提案參照不會貼 database URL)
 //
 // 部署：
 //   supabase functions deploy notion-fetch --project-ref yrugcgzkomydmorgzwhb --no-verify-jwt
@@ -31,7 +32,7 @@ Deno.serve(async (req) => {
     if (!token) throw new Error('NOTION_TOKEN 未設定');
 
     const body = await req.json();
-    const { pageId, test = false } = body;
+    const { pageId, test = false, parentType = 'page' } = body;
     if (!pageId) throw new Error('缺少 pageId');
 
     const headers = {
@@ -39,12 +40,18 @@ Deno.serve(async (req) => {
       'Notion-Version': NOTION_VERSION,
     };
 
-    // 1) 先打 pages API 確認頁面存在 + integration 有權限
-    const pageRes = await fetch(`${NOTION_API}/pages/${pageId}`, { headers });
+    // test=true + parentType='database' → 走 /databases/{id} 驗證(Bow 那種貼 DB URL 的情境)
+    // 其餘(test=false 或 parentType='page')→ 走 /pages/{id}
+    const isDbValidation = test && parentType === 'database';
+    const validateUrl = isDbValidation
+      ? `${NOTION_API}/databases/${pageId}`
+      : `${NOTION_API}/pages/${pageId}`;
+    const pageRes = await fetch(validateUrl, { headers });
     if (!pageRes.ok) {
       const err = await pageRes.json().catch(() => ({}));
+      const target = isDbValidation ? '此資料庫' : '此頁';
       const hint = pageRes.status === 404
-        ? '此頁尚未分享給 MeetKit integration(請到該頁 ⋯ 選單 → Add connections → 選 MeetKit),或頁面 ID 錯誤'
+        ? `${target}尚未分享給 MeetKit integration(請到該${isDbValidation ? '資料庫' : '頁'} ⋯ 選單 → Add connections → 選 MeetKit),或 ID 錯誤`
         : pageRes.status === 401
         ? 'NOTION_TOKEN 失效,請重新產生'
         : `Notion API ${pageRes.status}`;
@@ -54,12 +61,13 @@ Deno.serve(async (req) => {
       );
     }
     const pageData = await pageRes.json();
-    const title = extractTitle(pageData);
+    // database 物件的 title 在頂層 title array;page 物件的在 properties 裡某個 type='title' 欄位
+    const title = isDbValidation ? extractDatabaseTitle(pageData) : extractTitle(pageData);
 
     // test 模式：只確認能讀,不撈內容
     if (test) {
       return new Response(
-        JSON.stringify({ ok: true, title, pageId }),
+        JSON.stringify({ ok: true, title, pageId, parentType }),
         { headers: { ...cors, 'Content-Type': 'application/json' } }
       );
     }
@@ -100,6 +108,13 @@ function extractTitle(pageData: any): string {
     }
   }
   return '(無標題)';
+}
+
+// database 物件的 title 在頂層 title array,跟 page 不一樣
+function extractDatabaseTitle(dbData: any): string {
+  const arr = dbData?.title || [];
+  const text = arr.map((t: any) => t.plain_text || '').join('').trim();
+  return text || '(無標題資料庫)';
 }
 
 // 遞迴撈 children blocks,攤平成 Markdown

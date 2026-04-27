@@ -1673,6 +1673,10 @@
       const [notionTargetTitle, setNotionTargetTitle] = useState('');
       const [notionTesting, setNotionTesting] = useState(false);
       const [notionMsg, setNotionMsg] = useState('');
+      // 'page' (預設,subpage 模式) 或 'database'(歸檔變新增一列,2026-04-27)
+      // 由 saveNotionTarget 從 URL 自動偵測(?v= 在 URL → database)
+      // 寫進 projects.notion_parent_type,syncEntryToNotion 載入後傳給 notion-sync
+      const [notionParentType, setNotionParentType] = useState('page');
       // 編輯模式:預設 false,沒有設定過時自動切 true 讓使用者能直接打字
       // 載入到已有 URL 時 = false,鎖 read-only + 顯示「修改」按鈕
       // 點「修改」 = true,變成編輯狀態 + 顯示「測試並儲存」按鈕
@@ -1757,10 +1761,11 @@
       // notion_url 是 2026-04-27 加的,保存使用者貼的原始 URL;若沒有 fallback 用 page id
       useEffect(() => {
         if (!projectId) return;
-        db(`projects?id=eq.${projectId}&select=notion_parent_page_id,notion_url,owner_email`)
+        db(`projects?id=eq.${projectId}&select=notion_parent_page_id,notion_parent_type,notion_url,owner_email`)
           .then(r => r.json()).then(d => {
             const url = d?.[0]?.notion_url || '';
             const pageId = d?.[0]?.notion_parent_page_id || '';
+            const ptype = d?.[0]?.notion_parent_type || 'page'; // null = 舊資料 → 當 page
             // 顯示優先用 url(使用者貼的原樣),沒有再 fallback 用 pageId 包成 notion.so URL
             const display = url || (pageId ? `https://www.notion.so/${pageId}` : '');
             if (display) {
@@ -1769,12 +1774,13 @@
             } else {
               setNotionEditing(true); // 完全沒設定 → 直接編輯
             }
+            setNotionParentType(ptype);
             setProjectOwnerEmail(d?.[0]?.owner_email || '');
           }).catch(() => {});
       }, [projectId]);
 
       // 載入後若有 Notion URL,背景去 notion-fetch 抓 title 顯示常駐提示
-      // 訊息只在 read-only 狀態顯示,讓使用者一眼看到「歸檔會寫到哪個 Notion 頁」
+      // 訊息只在 read-only 狀態顯示,讓使用者一眼看到「歸檔會寫到哪個 Notion 頁/資料庫」
       // 失敗就靜默 — 主要功能(歸檔)不依賴這個訊息
       useEffect(() => {
         if (!notionTarget || notionTargetTitle || notionEditing) return;
@@ -1783,14 +1789,15 @@
         fetch(`${EDGE_BASE}/notion-fetch`, {
           method: 'POST',
           headers: EDGE_HEADERS,
-          body: JSON.stringify({ pageId, test: true }),
+          body: JSON.stringify({ pageId, test: true, parentType: notionParentType }),
         }).then(r => r.json()).then(d => {
           if (d?.ok && d.title) {
             setNotionTargetTitle(d.title);
-            setNotionMsg(`✓ 已連到「${d.title}」,歸檔會同步到這頁底下`);
+            const targetWord = notionParentType === 'database' ? '資料庫,每場會議會新增一列' : '頁面,歸檔會寫到這頁底下';
+            setNotionMsg(`✓ 已連到「${d.title}」(${targetWord})`);
           }
         }).catch(() => {});
-      }, [notionTarget, notionTargetTitle, notionEditing]);
+      }, [notionTarget, notionTargetTitle, notionEditing, notionParentType]);
 
       // ─── Members 管理 ─────────────────────────────────────────────────
       // 載入成員清單;RLS 會讓 owner 看到全部,member 只看到自己那一行
@@ -2012,7 +2019,7 @@
         }
       };
 
-      // 從 Notion URL 或 raw id 抓出 32 字元 page id
+      // 從 Notion URL 或 raw id 抓出 32 字元 id
       // 支援:
       //   - https://www.notion.so/Page-Title-abc123def456...
       //   - https://www.notion.so/workspace/abc123def456...
@@ -2021,45 +2028,59 @@
       const parseNotionPageId = (raw) => {
         if (!raw) return '';
         const s = raw.trim();
-        // 先抓 32 hex 或 UUID 風格
         const m = s.match(/([0-9a-f]{32}|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/i);
         if (!m) return '';
         return m[1].replace(/-/g, '').toLowerCase();
       };
 
-      // 測試 + 儲存 Notion 目標頁
-      // 流程:1) parse page id 2) 呼叫 notion-fetch test 確認可讀 3) 存進 projects.notion_parent_page_id
+      // 區分使用者貼的是 Notion page 還是 database
+      // database URL 一定帶 ?v=<view_id>(那串 v= 是 view id,本體 32 hex 才是 database id)
+      // page URL 沒有 ?v= 參數
+      // 回傳 { id, type } where type: 'page' | 'database'
+      const parseNotionTarget = (raw) => {
+        const id = parseNotionPageId(raw);
+        if (!id) return { id: '', type: 'page' };
+        const s = (raw || '').trim();
+        const isDb = /[?&]v=[0-9a-f-]{32,36}/i.test(s);
+        return { id, type: isDb ? 'database' : 'page' };
+      };
+
+      // 測試 + 儲存 Notion 目標頁(page 或 database 都接)
+      // 流程:1) parse id + type  2) notion-fetch test 帶 parentType 驗證  3) 存 page_id + url + type
       const saveNotionTarget = async () => {
-        const pageId = parseNotionPageId(notionTarget);
+        const { id: pageId, type: parentType } = parseNotionTarget(notionTarget);
         if (!pageId) {
-          setNotionMsg('⚠ 找不到有效的 Notion page id(貼 Notion 頁面完整 URL 最穩)');
+          setNotionMsg('⚠ 找不到有效的 Notion id(貼完整 URL 最穩,page 或 database 都可以)');
           return;
         }
         setNotionTesting(true);
         setNotionMsg('');
         try {
-          // 先 test 能不能讀
+          // 先 test 能不能讀(database 走 /databases/{id};page 走 /pages/{id})
           const testRes = await fetch(`${EDGE_BASE}/notion-fetch`, {
             method: 'POST',
             headers: EDGE_HEADERS,
-            body: JSON.stringify({ pageId, test: true }),
+            body: JSON.stringify({ pageId, test: true, parentType }),
           });
           const testData = await testRes.json();
           if (!testData.ok) {
-            setNotionMsg(`❌ ${testData.hint || testData.error || '無法讀取該頁'}`);
+            setNotionMsg(`❌ ${testData.hint || testData.error || '無法讀取該目標'}`);
             setNotionTesting(false);
             return;
           }
-          // 存回 DB:同時寫 page id(歸檔用)和 notion_url(UI 顯示用,保留使用者貼的原樣)
+          // 存回 DB:page id(歸檔用)、type(決定 parent 寫法)、url(UI 顯示用)
           await db(`projects?id=eq.${projectId}`, {
             method: 'PATCH',
             body: JSON.stringify({
               notion_parent_page_id: pageId,
+              notion_parent_type: parentType,
               notion_url: notionTarget.trim(),
             }),
           });
+          setNotionParentType(parentType);
           setNotionTargetTitle(testData.title || '');
-          setNotionMsg(`✓ 已連到「${testData.title || pageId}」,之後歸檔會同步到這頁底下`);
+          const targetWord = parentType === 'database' ? '資料庫,每場會議會新增一列' : '頁面,歸檔會寫到這頁底下';
+          setNotionMsg(`✓ 已連到「${testData.title || pageId}」(${targetWord})`);
           setNotionEditing(false); // 儲存成功 → 切回 read-only,按鈕變「修改」
           // 跳出「請到 Notion Share 加人」提示(API 不支援自動分享)
           // 列出當下所有已知與會者 — 這是「設定連結」當下的一次性同步清單
@@ -2082,9 +2103,10 @@
         setNotionMsg('');
         setNotionShareHint({ visible: false, emails: [] }); // 連結都拿掉了,提示也收起 + 清空累積
         setNotionEditing(true); // 清掉後直接進入編輯模式,讓使用者能立刻貼新 URL
+        setNotionParentType('page'); // 重置成預設,下次貼新 URL 再依新 URL 重新偵測
         await db(`projects?id=eq.${projectId}`, {
           method: 'PATCH',
-          body: JSON.stringify({ notion_parent_page_id: null, notion_url: null }),
+          body: JSON.stringify({ notion_parent_page_id: null, notion_parent_type: 'page', notion_url: null }),
         });
         showToast('✓ 已取消 Notion 目標頁,歸檔會改寫到預設資料庫');
       };
@@ -4428,6 +4450,8 @@ ${txText}
       const [briefing,  setBriefing]  = useState('');
       // Route C:此專案綁定的 Notion parent page id(歸檔時傳給 notion-sync)
       const [notionParentPageId, setNotionParentPageId] = useState('');
+      // 'page' 或 'database',決定 notion-sync 用 { page_id } 還是 { database_id }
+      const [notionParentType, setNotionParentType] = useState('page');
       const [isRecording, setIsRecording] = useState(false);
       const [recordingSeconds, setRecordingSeconds] = useState(0);
       const [headerHidden, setHeaderHidden] = useState(false); // 保留 state(Header 元件吃 hidden prop),但永遠是 false
@@ -4476,13 +4500,14 @@ ${txText}
         if (sessionStorage.getItem(`mk_auth_${projectId}`)) setAuthed(true);
         // Load journal from Supabase
         db(`journals?project_id=eq.${projectId}&order=created_at.asc`).then(r => r.json()).then(d => { if (Array.isArray(d)) setJournal(d); }).catch(() => {});
-        // Load project info(含 notion_parent_page_id,給 syncEntryToNotion 用)
-        db(`projects?id=eq.${projectId}&select=title,meeting_date,meeting_time,briefing,notion_parent_page_id`).then(r => r.json()).then(d => {
+        // Load project info(含 notion_parent_page_id + parent_type,給 syncEntryToNotion 用)
+        db(`projects?id=eq.${projectId}&select=title,meeting_date,meeting_time,briefing,notion_parent_page_id,notion_parent_type`).then(r => r.json()).then(d => {
           if (d[0]?.title) setProjectTitle(d[0].title);
           if (d[0]?.meeting_date) setMeetingDate(d[0].meeting_date);
           if (d[0]?.meeting_time) setMeetingTime(d[0].meeting_time);
           if (d[0]?.briefing) setBriefing(d[0].briefing);
           if (d[0]?.notion_parent_page_id) setNotionParentPageId(d[0].notion_parent_page_id);
+          if (d[0]?.notion_parent_type) setNotionParentType(d[0].notion_parent_type); // null = 舊資料 → 預設 'page'
         }).catch(() => {});
       }, [projectId]);
 
@@ -4509,7 +4534,13 @@ ${txText}
               'Content-Type': 'application/json',
               'Authorization': `Bearer ${SB_KEY}`,
             },
-            body: JSON.stringify({ journal: entry, projectTitle, isoDate, notionParentPageId: notionParentPageId || null }),
+            body: JSON.stringify({
+              journal: entry,
+              projectTitle,
+              isoDate,
+              notionParentPageId: notionParentPageId || null,
+              notionParentType: notionParentPageId ? notionParentType : null, // 沒設目標頁時 type 不傳,讓 notion-sync 走預設資料庫
+            }),
           });
           const data = await res.json();
           if (!res.ok) throw new Error(data.error || 'Notion 同步失敗');
