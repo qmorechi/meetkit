@@ -39,7 +39,8 @@ Deno.serve(async (req) => {
     if (!apiKey) throw new Error('RESEND_API_KEY 未設定');
 
     const from = Deno.env.get('RESEND_FROM') || 'MeetKit <meetkit@mx.design>';
-    const baseUrl = Deno.env.get('MEETKIT_BASE_URL') || 'https://meetkit.mx.design/index-dev.html';
+    // 預設指正式環境 index.html;開發測試請設 MEETKIT_BASE_URL secret 蓋過(例如 .../index-dev.html)
+    const baseUrl = Deno.env.get('MEETKIT_BASE_URL') || 'https://meetkit.mx.design/index.html';
 
     const body = await req.json();
     const {

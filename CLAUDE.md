@@ -209,6 +209,47 @@ Helper functions `public.is_project_owner(pid)` 和 `public.is_project_member(pi
 
 但**現階段的 owner + member 兩層就夠用**,別過度工程化。
 
+### MeetKit 權限 ≠ Notion 權限(2026-04-27 補述)
+
+**這兩套權限是分開的兩座山,不會互相同步。**
+
+MeetKit 的白名單(`project_members`)只管「誰能看 / 改這個 MeetKit 專案」。
+Notion 的歸檔頁權限,**Notion 那邊自己另外設**,MeetKit 不會、也無法替你設。
+
+#### 為什麼不能自動同步
+
+- Notion API 沒有「把 page 分享給某個 user」的 endpoint(2026-04 為止確認)
+- Internal integration 只能讓 MeetKit 自己寫入,**不會**讓使用者看得到歸檔頁
+- 唯一寫得進 Notion 的角色是「擁有該頁編輯權的真人」,所以共享動作只能由 owner 在 Notion UI 手動做
+
+#### 每個專案各自設權限,不要全 workspace 開放
+
+每個 MeetKit 專案都對應**一個獨立的 Notion parent page**(存在 `projects.notion_parent_page_id`)。
+專案之間的歸檔頁互相獨立,owner 只把「這場會議的與會者」加進「這場會議的 parent page」分享名單。
+
+❌ 不要把整個 mx.design workspace 設成「公司全員可看」 — SIPAI / 客戶會議混在裡面,合規會出事
+✅ 每個 parent page 只分享給該場會議的 owner + members
+
+#### UX 的妥協:share-hint 提示面板
+
+既然 API 自動化做不到,MeetKit 在兩個時機跳 share-hint 面板提示 owner 手動去 Notion 補權限:
+
+1. **第一次貼 Notion URL 存檔成功時** — 列出 owner + 當時所有 members
+2. **後續 commitMembers 加新成員成功時** — 累積待加清單(已通知過的不重複)
+
+面板內容:
+- 一鍵複製整批 email(貼到 Notion 的 Share dialog)
+- 一鍵打開 Notion parent page
+- 「我加好了」按鈕收掉(純 UI 狀態,不寫 DB)
+
+這面板只是**提醒**,owner 點「我加好了」也只是關面板,系統不會去驗證 Notion 那邊真的加成功了。Notion 權限的真實來源永遠在 Notion 自己。
+
+#### 如果忘了在 Notion 加人會發生什麼
+
+- MeetKit 端:正常運作,歸檔照寫(寫入是 integration 的權限,跟個別 user 無關)
+- Notion 端:該 member 點歸檔頁的連結會看到「No access」 — 這時 owner 才回 Notion 補權限
+- 不會炸 — 只是 member 暫時看不到歸檔內容
+
 ---
 
 ## 4. 技術棧(實際現況)

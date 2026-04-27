@@ -881,6 +881,28 @@
       return <span style={{ width: 14, height: 14, border: `2px solid #ffffff44`, borderTopColor: '#fff', borderRadius: '50%', animation: 'spin 0.7s linear infinite', display: 'inline-block' }} />;
     }
 
+    // ─── 公司同事目錄(Home + Meeting 元件共用)───────────────────────────────────
+    // 排序:emmy → debby → leo → ring → maruo → ray → kevin → bow → howard → alice → qmore
+    // STATIC = 寫死的 11 位常駐;extraColleagues = 使用者用 + New 加進來的,存 localStorage
+    // 跨裝置不同步是有意的(Mac Studio / Windows 各自累積),要同步再升 Supabase 表
+    const COMPANY_DOMAIN = 'minimax.com.tw';
+    const STATIC_COMPANY_DIRECTORY = [
+      'emmy', 'debby', 'leo', 'ring', 'maruo', 'ray',
+      'kevin', 'bow', 'howard', 'alice', 'qmore',
+    ];
+    const EXTRA_COLLEAGUES_KEY = 'meetkit.extraColleagues';
+    function loadExtraColleagues() {
+      try {
+        const raw = localStorage.getItem(EXTRA_COLLEAGUES_KEY);
+        if (!raw) return [];
+        const arr = JSON.parse(raw);
+        return Array.isArray(arr) ? arr.filter(x => typeof x === 'string') : [];
+      } catch { return []; }
+    }
+    function saveExtraColleagues(list) {
+      try { localStorage.setItem(EXTRA_COLLEAGUES_KEY, JSON.stringify(list)); } catch {}
+    }
+
     // ─── HOME ────────────────────────────────────────────────────────────────────
     // 邀請制白名單模型(2026-04-25 起):
     //   - 進入 MeetKit 必須先 magic-link 登入(LoginGate 擋在外)
@@ -897,6 +919,11 @@
       const [inviteEmailsInput, setInviteEmailsInput] = useState('');
       const [creating, setCreating] = useState(false);
       const [sendMsg, setSendMsg] = useState('');
+      // 同事 chip-picker(2026-04-27):點 chip 把 email append 到 textarea
+      // 共用 module-level 的 STATIC_COMPANY_DIRECTORY + localStorage extraColleagues
+      const [extraColleagues, setExtraColleagues] = useState(loadExtraColleagues);
+      const [showNewPrefixHome, setShowNewPrefixHome] = useState(false);
+      const [newPrefixDraftHome, setNewPrefixDraftHome] = useState('');
       // 一頁顯示 5 個,超過用上下箭頭捲(每次 1 個 item)
       const PAGE_SIZE = 5;
       const [myOffset, setMyOffset] = useState(0);
@@ -987,6 +1014,38 @@
       };
 
       const parsedInvitees = parseInviteEmails(inviteEmailsInput).filter(e => e !== myEmail);
+
+      // chip / + New 共用:把 email append 到 textarea(已存在就跳過,用 newline 分隔保持可讀性)
+      const appendInviteEmail = (email) => {
+        const lc = (email || '').trim().toLowerCase();
+        if (!lc) return;
+        const existing = new Set(parseInviteEmails(inviteEmailsInput));
+        if (existing.has(lc)) return;
+        setInviteEmailsInput(prev => {
+          const trimmed = (prev || '').trim();
+          return trimmed ? `${trimmed}\n${lc}` : lc;
+        });
+      };
+
+      // + New 路徑:輸入前綴(或完整 email)→ 補 domain → append 到 textarea + 同 domain 存 localStorage
+      const addNewPrefixHome = () => {
+        const raw = newPrefixDraftHome.trim().toLowerCase();
+        if (!raw) return;
+        const email = raw.includes('@') ? raw : `${raw}@${COMPANY_DOMAIN}`;
+        if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return;
+        appendInviteEmail(email);
+        // 同 domain 才存 prefix 為常駐 label;異 domain 直接 append 不污染候選清單
+        if (email.endsWith(`@${COMPANY_DOMAIN}`)) {
+          const prefix = email.split('@')[0];
+          if (!STATIC_COMPANY_DIRECTORY.includes(prefix) && !extraColleagues.includes(prefix)) {
+            const next = [...extraColleagues, prefix];
+            setExtraColleagues(next);
+            saveExtraColleagues(next);
+          }
+        }
+        setNewPrefixDraftHome('');
+        setShowNewPrefixHome(false);
+      };
 
       const createProject = async () => {
         setCreating(true);
@@ -1242,9 +1301,107 @@
                     <label style={S.label}>
                       與會者 Email
                       <span style={{ fontSize: 11, color: C.textMut, fontWeight: 400 }}>
-                        每行一個,或用逗號/空白分隔;留空可之後再加
+                        點下面 chip 加入,或下方手動貼;留空可之後再加
                       </span>
                     </label>
+
+                    {/* 同事候選 chip-picker(2026-04-27)— 跟 Meeting 設定面板同款
+                        候選 = (STATIC + extras) 扣掉 myEmail 跟已在 textarea 的 email
+                        + New = 開內嵌前綴輸入框,加完同 domain 會存 localStorage 變常駐 label */}
+                    {(() => {
+                      const existing = new Set(parseInviteEmails(inviteEmailsInput));
+                      const allPrefixes = [...new Set([...STATIC_COMPANY_DIRECTORY, ...extraColleagues])];
+                      const candidates = allPrefixes
+                        .map(p => `${p}@${COMPANY_DOMAIN}`)
+                        .filter(e => e !== myEmail && !existing.has(e));
+                      return (
+                        <div style={{ padding: 10, background: C.bgInput, border: `1px solid ${C.border}`, borderRadius: 8, marginBottom: 8 }}>
+                          <div style={{ fontSize: 10, color: C.textMut, marginBottom: 6, fontWeight: 600 }}>
+                            💼 同事候選 · 點一下加入
+                          </div>
+                          <div style={{ display: 'flex', flexWrap: 'wrap', gap: 5 }}>
+                            {candidates.map(email => {
+                              const prefix = email.split('@')[0];
+                              return (
+                                <button
+                                  type="button"
+                                  key={email}
+                                  onClick={() => appendInviteEmail(email)}
+                                  title={`點一下加入 ${email}`}
+                                  style={{
+                                    padding: '3px 9px',
+                                    background: 'transparent',
+                                    border: `1px solid ${C.border}`,
+                                    borderRadius: 6,
+                                    fontSize: 11,
+                                    color: C.textSec,
+                                    cursor: 'pointer',
+                                    fontFamily: 'inherit',
+                                    lineHeight: 1.4,
+                                  }}
+                                >
+                                  + {prefix}
+                                </button>
+                              );
+                            })}
+                            {!showNewPrefixHome ? (
+                              <button
+                                type="button"
+                                onClick={() => setShowNewPrefixHome(true)}
+                                title="加入新同事(輸入 email 前綴)"
+                                style={{
+                                  padding: '3px 9px',
+                                  background: 'transparent',
+                                  border: `1px dashed ${C.accent}66`,
+                                  borderRadius: 6,
+                                  fontSize: 11,
+                                  color: C.accent,
+                                  cursor: 'pointer',
+                                  fontFamily: 'inherit',
+                                  lineHeight: 1.4,
+                                }}
+                              >
+                                + New
+                              </button>
+                            ) : (
+                              <div style={{ display: 'inline-flex', alignItems: 'center', gap: 4, padding: '2px 4px', background: C.bgPanel, border: `1px solid ${C.accent}66`, borderRadius: 6 }}>
+                                <input
+                                  type="text"
+                                  autoFocus
+                                  value={newPrefixDraftHome}
+                                  onChange={e => setNewPrefixDraftHome(e.target.value)}
+                                  onKeyDown={e => {
+                                    if (e.key === 'Enter') { e.preventDefault(); addNewPrefixHome(); }
+                                    else if (e.key === 'Escape') { setShowNewPrefixHome(false); setNewPrefixDraftHome(''); }
+                                  }}
+                                  placeholder="email 前綴"
+                                  style={{ background: 'transparent', border: 'none', outline: 'none', color: C.text, fontSize: 11, fontFamily: 'inherit', width: 90, padding: '2px 4px' }}
+                                />
+                                <span style={{ fontSize: 10, color: C.textMut }}>@{COMPANY_DOMAIN}</span>
+                                <button
+                                  type="button"
+                                  onClick={addNewPrefixHome}
+                                  disabled={!newPrefixDraftHome.trim()}
+                                  title="加入"
+                                  style={{ background: C.accent, border: 'none', color: '#fff', borderRadius: 4, fontSize: 10, padding: '2px 7px', cursor: 'pointer', fontFamily: 'inherit', opacity: !newPrefixDraftHome.trim() ? 0.4 : 1 }}
+                                >
+                                  ✓
+                                </button>
+                                <button
+                                  type="button"
+                                  onClick={() => { setShowNewPrefixHome(false); setNewPrefixDraftHome(''); }}
+                                  title="取消"
+                                  style={{ background: 'none', border: 'none', color: C.textMut, fontSize: 11, padding: 0, cursor: 'pointer', lineHeight: 1 }}
+                                >
+                                  ✕
+                                </button>
+                              </div>
+                            )}
+                          </div>
+                        </div>
+                      );
+                    })()}
+
                     <textarea
                       style={{ ...S.input, minHeight: 90, fontFamily: 'inherit', resize: 'vertical' }}
                       placeholder={`a@example.com\nb@example.com`}
@@ -1520,6 +1677,14 @@
       // 載入到已有 URL 時 = false,鎖 read-only + 顯示「修改」按鈕
       // 點「修改」 = true,變成編輯狀態 + 顯示「測試並儲存」按鈕
       const [notionEditing, setNotionEditing] = useState(false);
+      // Share-hint:跳一個面板提醒 owner 到 Notion Share 面板加與會者
+      // (Notion 公開 API 不支援程式分享 page 給個別 user,只能由人類在 Notion 那頁手動加)
+      //
+      // 兩個觸發點:
+      //   1) 主動「測試並儲存」Notion 連結成功 → emails 列出 owner + 全部既有 members
+      //   2) 已設好連結後又新增 member(commitMembers 成功) → emails 累積「這輪新加的」
+      // 收起方式:按「我加好了」/「修改」/「✕」,emails 也清空(下次重新累積)
+      const [notionShareHint, setNotionShareHint] = useState({ visible: false, emails: [] });
       // 邀請白名單:此專案的 owner + members
       const [projectOwnerEmail, setProjectOwnerEmail] = useState('');
       const [members, setMembers] = useState([]);
@@ -1527,24 +1692,8 @@
       const [membersMsg, setMembersMsg] = useState('');
       // 重寄邀請中的 email(避免同一列 double-click;一次只寄一封,UI 顯示「…」)
       const [resendingEmail, setResendingEmail] = useState('');
-      // 公司同事目錄 — 靜態 base(11 位常駐)+ 動態擴充(localStorage)
-      // 排序:emmy → debby → leo → ring → maruo → ray → kevin → bow → howard → alice → qmore
-      // 用 + New 加進來的新同事前綴存 localStorage,下次自動列出來
-      // 跨裝置不同步是有意的(Mac Studio / Windows 各自累積),要同步再升 Supabase 表
-      const COMPANY_DOMAIN = 'minimax.com.tw';
-      const STATIC_COMPANY_DIRECTORY = [
-        'emmy', 'debby', 'leo', 'ring', 'maruo', 'ray',
-        'kevin', 'bow', 'howard', 'alice', 'qmore',
-      ];
-      const EXTRA_COLLEAGUES_KEY = 'meetkit.extraColleagues';
-      const [extraColleagues, setExtraColleagues] = useState(() => {
-        try {
-          const raw = localStorage.getItem(EXTRA_COLLEAGUES_KEY);
-          if (!raw) return [];
-          const arr = JSON.parse(raw);
-          return Array.isArray(arr) ? arr.filter(x => typeof x === 'string') : [];
-        } catch { return []; }
-      });
+      // 同事目錄(常數 + helper 提到模組層級,Home 元件也共用)
+      const [extraColleagues, setExtraColleagues] = useState(loadExtraColleagues);
       // + New 內嵌輸入框的 state(預設收起,點 + New 才展開)
       const [showNewInput, setShowNewInput] = useState(false);
       const [newPrefix, setNewPrefix] = useState('');
@@ -1751,6 +1900,14 @@
             : ',邀請信寄送中';
           setMembersMsg(`✓ 已新增 ${newOnes.length} 位成員${whenMsg}`);
           loadMembers();
+          // 已設好 Notion 連結時:把這輪新加的 email 累積進 share-hint,提醒 owner 去 Notion 同步權限
+          // (Notion API 不支援程式分享 page 給個別 user — 詳見 notionShareHint state 註解)
+          if (notionTarget && !notionEditing) {
+            setNotionShareHint(prev => ({
+              visible: true,
+              emails: Array.from(new Set([...(prev.emails || []), ...newOnes])),
+            }));
+          }
           return true;
         } catch (e) {
           setMembersMsg(`❌ ${e.message || '新增失敗'}`);
@@ -1904,6 +2061,14 @@
           setNotionTargetTitle(testData.title || '');
           setNotionMsg(`✓ 已連到「${testData.title || pageId}」,之後歸檔會同步到這頁底下`);
           setNotionEditing(false); // 儲存成功 → 切回 read-only,按鈕變「修改」
+          // 跳出「請到 Notion Share 加人」提示(API 不支援自動分享)
+          // 列出當下所有已知與會者 — 這是「設定連結」當下的一次性同步清單
+          {
+            const all = [projectOwnerEmail, ...members.map(m => m.member_email)]
+              .map(e => (e || '').trim().toLowerCase())
+              .filter(e => e && e.includes('@'));
+            setNotionShareHint({ visible: true, emails: Array.from(new Set(all)) });
+          }
         } catch (e) {
           setNotionMsg(`❌ ${e.message || '連線失敗'}`);
         } finally {
@@ -1915,6 +2080,7 @@
         setNotionTarget('');
         setNotionTargetTitle('');
         setNotionMsg('');
+        setNotionShareHint({ visible: false, emails: [] }); // 連結都拿掉了,提示也收起 + 清空累積
         setNotionEditing(true); // 清掉後直接進入編輯模式,讓使用者能立刻貼新 URL
         await db(`projects?id=eq.${projectId}`, {
           method: 'PATCH',
@@ -2241,7 +2407,7 @@
                   ) : (
                     <button
                       style={{ ...btn('ghost'), padding: '6px 12px', fontSize: 12, flexShrink: 0 }}
-                      onClick={() => setNotionEditing(true)}
+                      onClick={() => { setNotionEditing(true); setNotionShareHint({ visible: false, emails: [] }); }}
                       title="重新輸入 Notion URL"
                     >
                       ✏️ 修改
@@ -2262,6 +2428,73 @@
                     {notionMsg}
                   </div>
                 )}
+                {/* Notion Share 提示面板:兩個觸發點(設定連結成功 + 加新 member 成功)共用
+                    Notion 公開 API 沒有「程式分享 page 給個別 user」的 endpoint,只能 owner 手動到 Notion 加
+                    emails 來源由觸發點決定:設定連結 = owner+全 members;加人 = 累積「這輪新加的」
+                    一鍵複製 + 連結直達 Notion,壓低手動成本(從「逐個輸入」縮成「一次貼上」) */}
+                {notionShareHint.visible && !notionEditing && notionTarget && (() => {
+                  const uniq = (notionShareHint.emails || []).filter(e => e && e.includes('@'));
+                  if (uniq.length === 0) return null; // 沒 email 就不顯示(避免空面板)
+                  return (
+                    <div style={{
+                      marginLeft: 82,
+                      padding: '10px 12px',
+                      background: 'rgba(240, 160, 32, 0.08)',
+                      border: `1px solid ${C.warn}55`,
+                      borderRadius: 8,
+                      display: 'flex',
+                      flexDirection: 'column',
+                      gap: 8,
+                    }}>
+                      <div style={{ fontSize: 12, color: C.text, lineHeight: 1.55 }}>
+                        ⚠ <b>別忘了</b>:到 Notion 那頁右上「Share」把以下{uniq.length === 1 ? '這位' : `${uniq.length} 位`}與會者加進去 — Notion API 不開放程式自動分享,沒加的人點歸檔連結會被擋。
+                      </div>
+                      <div style={{
+                        fontSize: 11,
+                        fontFamily: "'SF Mono', Consolas, monospace",
+                        color: C.text,
+                        background: C.bgInput,
+                        padding: '6px 8px',
+                        borderRadius: 6,
+                        wordBreak: 'break-all',
+                        lineHeight: 1.6,
+                        border: `1px solid ${C.border}`,
+                      }}>
+                        {uniq.join(', ')}
+                      </div>
+                      <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'center' }}>
+                        <button
+                          style={{ ...btn('primary'), padding: '5px 10px', fontSize: 11 }}
+                          onClick={async () => {
+                            try {
+                              await navigator.clipboard.writeText(uniq.join(', '));
+                              showToast(`✓ 已複製 ${uniq.length} 個 email,到 Notion Share 面板貼上`);
+                            } catch {
+                              showToast('複製失敗,請手動選取');
+                            }
+                          }}
+                        >
+                          📋 複製 {uniq.length} 個 email
+                        </button>
+                        <a
+                          href={notionTarget}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          style={{ ...btn('ghost'), padding: '5px 10px', fontSize: 11, textDecoration: 'none' }}
+                        >
+                          ↗ 開啟 Notion 那頁
+                        </a>
+                        <button
+                          style={{ ...btn('ghost'), padding: '5px 10px', fontSize: 11, color: C.textMut, marginLeft: 'auto' }}
+                          onClick={() => setNotionShareHint({ visible: false, emails: [] })}
+                          title="收起此提示(下次加人會重新累積)"
+                        >
+                          ✓ 我加好了
+                        </button>
+                      </div>
+                    </div>
+                  );
+                })()}
                 <div style={{ fontSize: 10, color: C.textMut, paddingLeft: 82, lineHeight: 1.5 }}>
                   留空 = 寫到預設 MeetKit 資料庫。
                   先到 Notion 把該頁「⋯ → Add connections → MeetKit」分享給 integration,才能寫入。
